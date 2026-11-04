@@ -415,12 +415,16 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   const { cause, native, category } = providerFailureCategory(error)
   // Preserve only fixed original exception facts when a startup guard is not a
   // known category. Never persist its message, path, stack or arbitrary fields.
-  const detail = (cause instanceof Error ? cause : error instanceof Error ? error : undefined) as
+  // The prelease wrapper retains the original setup failure even if profile cleanup failed.
+  // Read only fixed error facts; cleanup uncertainty remains the primary category.
+  const prelease = error instanceof AggregateError && error.message === 'provider_catalog_prelease_cleanup_unknown'
+    ? error.cause : undefined
+  const detail = (cause instanceof Error ? cause : prelease instanceof Error ? prelease : error instanceof Error ? error : undefined) as
     { name?: unknown; code?: unknown; syscall?: unknown } | undefined
   const name = ['Error', 'TypeError', 'ReferenceError', 'RangeError', 'AbortError'].find(value => value === detail?.name)
   const errno = ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'].find(value => value === detail?.code)
   const syscall = ['realpath', 'open', 'read', 'lstat', 'stat'].find(value => value === detail?.syscall)
-  const failure = phase === 'execution-host-startup' && (name || errno || syscall)
+  const failure = (phase === 'execution-host-startup' || phase.startsWith('provider-model-catalog-')) && (name || errno || syscall)
     ? { ...(name ? { name } : {}), ...(errno ? { errno } : {}), ...(syscall ? { operation: syscall } : {}) } : undefined
   const operation = readOpenCodeV2ProviderWireFailure(error)
   const catalog = error !== null && typeof error === 'object' ? catalogFailures.get(error) : undefined

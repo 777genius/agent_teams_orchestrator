@@ -255,3 +255,126 @@ for (const source of ['project-config', 'imported-config', 'project-default', 'g
     }
   }, 20_000)
 }
+
+test('public V2 model catalog refusal keeps a finite profile stage and a private sanitized record', async () => {
+  const script = `
+    import { mock } from 'bun:test'
+    import assert from 'node:assert/strict'
+    import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+    import { tmpdir } from 'node:os'
+    import path from 'node:path'
+    const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-catalog-stage-'))
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+    const identityPath = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/compatibility/OpenCodeNativeIdentity.ts'))}
+    const identity = await import(identityPath)
+    mock.module(identityPath, () => ({ ...identity, inspectOpenCodeReadSelection: async () => ({
+      policy: { generation: 'v2', version: '2.1.4' },
+      native: { generation: 'v2', version: '2.1.4' },
+    }) }))
+    const profilePath = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/OpenCodeProfileManager.ts'))}
+    const profile = await import(profilePath)
+    const secret = 'TEST-SECRET-private-provider-error'
+    mock.module(profilePath, () => ({ ...profile,
+      resolveOpenCodeV2CatalogProfileScope: async () => { throw Object.assign(Error(secret), { code: 'EACCES', syscall: 'open', path: secret }) },
+    }))
+    const { OpenCodeProviderManagementAdapter } = await import(${JSON.stringify(import.meta.resolve('./OpenCodeProviderManagementAdapter.ts'))})
+    try {
+      const adapter = new OpenCodeProviderManagementAdapter({ catalogOverallTimeoutMs: 2000 })
+      const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'opencode', projectPath: root })
+      assert.equal(result.ok, false)
+      assert.equal(result.error.code, 'runtime-unhealthy')
+      assert.match(result.error.message, /stage: profile, category: provider_operation_unknown/)
+      assert(!JSON.stringify(result).includes(secret), 'Private provider exception escaped into the public DTO')
+      const folder = path.join(root, 'opencode/v2/provider-diagnostics')
+      const names = await readdir(folder)
+      assert.equal(names.length, 1)
+      const bytes = await readFile(path.join(folder, names[0]), 'utf8')
+      assert(!bytes.includes(secret), 'Private provider exception escaped into diagnostics')
+      const observation = JSON.parse(bytes)
+      assert.equal(observation.phase, 'provider-model-catalog-profile')
+      assert.equal(observation.category, 'provider_operation_unknown')
+      assert.deepEqual(observation.failure, { name: 'Error', errno: 'EACCES', operation: 'open' })
+      assert.equal(observation.retainedOriginal, true)
+    } finally { mock.restore(); await rm(root, { recursive: true, force: true }) }
+  `
+  const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe', env: { ...process.env, NODE_ENV: 'test' } })
+  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
+  expect({ code, output: stdout + stderr }).toEqual({ code: 0, output: '' })
+}, 20_000)
+
+test('V2 model-list failure preserves models phase when lease retirement succeeds', async () => {
+  const script = `
+    import { mock } from 'bun:test'
+    import assert from 'node:assert/strict'
+    import { mkdtemp, mkdir, rm, readdir, readFile } from 'node:fs/promises'
+    import { tmpdir } from 'node:os'
+    import path from 'node:path'
+    const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-catalog-model-failure-'))
+    const project = path.join(root, 'project')
+    await mkdir(project)
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+    const secret = 'TEST-SECRET-native-model-list'
+    let retired = 0, unregistered = 0
+    const p = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/OpenCodeProfileManager.ts'))}
+    const profile = await import(p)
+    mock.module(p, () => ({ ...profile, canonicalizeOpenCodeProjectPath: async () => project,
+      resolveOpenCodeV2CatalogProfileScope: async () => ({ scopeToken: 'TEST-scope' }),
+      materializeOpenCodeV2CatalogScope: async () => ({ provider: {}, authPath: path.join(root, 'auth.json'), preferredModel: null }),
+    }))
+    const r = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/profile/OpenCodeV2ExecutionReceipt.ts'))}
+    const receipt = await import(r)
+    mock.module(r, () => ({ ...receipt, createOpenCodeV2ExecutionReceipt: async () => ({ graph: { delivery: null } }) }))
+    const h = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/host/OpenCodeV2ExecutionHost.ts'))}
+    const host = await import(h)
+    const authority = { pin: '2.1.4', directory: project }
+    mock.module(h, () => ({ ...host,
+      acquireOpenCodeV2CatalogLease: async (_native, profile) => ({ authority, close: async () => {
+        retired++; await rm(profile.root, { recursive: true, force: true })
+      } }),
+      requireExecutionEndpoint: () => ({ baseUrl: 'http://127.0.0.1:1', password: 'TEST-only', signal: new AbortController().signal }),
+      registerExecutionDisposer: () => () => { unregistered++ },
+    }))
+    const w = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/transport/OpenCodeV2ProviderWire.ts'))}
+    const providerWire = await import(w)
+    let disposed = 0
+    mock.module(w, () => ({ ...providerWire, OpenCodeV2ProviderWire: class {
+      fetch = async () => { throw Error('TEST-unexpected-provider-fetch') }
+      async dispose() { disposed++ }
+    } }))
+    const m = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/transport/OpenCodeV2ClientModule.ts'))}
+    const client = await import(m)
+    mock.module(m, () => ({ ...client, resolveOpenCodeV2ClientEntry: async () => 'TEST-entry',
+      importOpenCodeV2ClientModule: async () => ({ wire: 'current', module: { OpenCode: {
+        make: () => ({ model: { list: async () => { throw Error(secret) } } }),
+      } } }),
+    }))
+    const { loadOpenCodeV2ProviderModels } = await import(${JSON.stringify(import.meta.resolve('./OpenCodeV2ProviderManagement.ts'))})
+    const { OpenCodeV2CatalogReadBudget } = await import(${JSON.stringify(import.meta.resolve('./OpenCodeV2CatalogReadBudget.ts'))})
+    try {
+      const budget = new OpenCodeV2CatalogReadBudget(5000)
+      const selected = { policy: { generation: 'v2', version: '2.1.4' }, native: { generation: 'v2', version: '2.1.4' } }
+      const result = await budget.run(current => loadOpenCodeV2ProviderModels({
+        runtimeId: 'opencode', providerId: 'opencode', projectPath: project,
+      }, selected, current))
+      assert.equal(result.ok, false)
+      assert.match(result.error.message, /stage: models, category: provider_operation_unknown/)
+      assert(!JSON.stringify(result).includes(secret))
+      assert.equal(retired, 1)
+      assert.equal(disposed, 1)
+      assert.equal(unregistered, 1)
+      const directory = path.join(root, 'opencode/v2/provider-diagnostics')
+      const names = await readdir(directory)
+      assert.equal(names.length, 1)
+      const bytes = await readFile(path.join(directory, names[0]), 'utf8')
+      assert(!bytes.includes(secret))
+      const row = JSON.parse(bytes)
+      assert.equal(row.phase, 'provider-model-catalog-models')
+      assert.equal(row.category, 'provider_operation_unknown')
+    } finally { mock.restore(); await rm(root, { recursive: true, force: true }) }
+  `
+  const child = Bun.spawn([process.execPath, '-e', script], {
+    stdout: 'pipe', stderr: 'pipe', env: { ...process.env, NODE_ENV: 'test' },
+  })
+  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
+  expect({ code, output: stdout + stderr }).toEqual({ code: 0, output: '' })
+}, 20_000)

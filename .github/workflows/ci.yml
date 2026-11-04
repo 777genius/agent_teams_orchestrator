@@ -274,6 +274,8 @@ jobs:
           src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2DefaultModelsRefresh.test.ts
           src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2FreeModels.test.ts
           src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ModelPagination.test.ts
+          src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2CatalogReadBudget.test.ts
+          src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2CatalogReadBudget.integration.test.ts
           src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.project-identity.test.ts
           src/services/opencode/catalog/OpenCodeV2ReadStatus.test.ts
           src/services/opencode/catalog/OpenCodeV2RuntimeStatus.test.ts
@@ -551,6 +553,68 @@ jobs:
           if [[ "$CANDIDATE_PLATFORM" == win32-* ]]; then
             "$shipped_bun" --no-install --no-env-file scripts/opencode-v2/packaged-pty-smoke.ts "$extracted/runtime" "$extracted/support" "packaged-pty-smoke-$CANDIDATE_PLATFORM.json" "$CANDIDATE_PLATFORM"
           fi
+      - name: Read real OpenCode V2 catalog through packaged Windows runtime
+        if: runner.os == 'Windows'
+        # This step runs two independent bounded catalog reads in sequence.
+        timeout-minutes: 12
+        shell: pwsh
+        env:
+          CANDIDATE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = Join-Path $env:RUNNER_TEMP 'TEST-packaged-server-smoke'
+          $runtime = Join-Path $package 'runtime/claude-multimodel.exe'
+          $bun = Join-Path $package 'runtime/bun/bun.exe'
+          $root = Join-Path $env:RUNNER_TEMP "TEST-v2-models-$env:CANDIDATE_PLATFORM"
+          foreach ($name in @('home', 'project', 'tmp', 'appdata', 'localappdata', 'config', 'cache', 'state')) {
+            New-Item -ItemType Directory -Force (Join-Path $root $name) | Out-Null
+          }
+          if (-not (Test-Path $runtime) -or -not (Test-Path $bun)) { throw 'Packaged runtime is missing' }
+          $support = Join-Path $root 'support-cache'
+          & $bun --no-install --no-env-file scripts/opencode-v2/stage-support-fixture.ts (Join-Path $package 'runtime') (Join-Path $package 'support') $support
+          if ($LASTEXITCODE -ne 0) { throw 'V2 support fixture staging failed' }
+          $env:HOME = Join-Path $root 'home'
+          $env:USERPROFILE = $env:HOME
+          $env:APPDATA = Join-Path $root 'appdata'
+          $env:LOCALAPPDATA = Join-Path $root 'localappdata'
+          $env:XDG_CONFIG_HOME = Join-Path $root 'config'
+          $env:XDG_DATA_HOME = Join-Path $root 'home/data'
+          $env:XDG_CACHE_HOME = Join-Path $root 'cache'
+          $env:XDG_STATE_HOME = Join-Path $root 'state'
+          $env:TEMP = Join-Path $root 'tmp'
+          $env:TMP = $env:TEMP
+          # The native runtime must create its data root with its own Windows ACL.
+          $env:CLAUDE_MULTIMODEL_DATA_HOME = Join-Path $root 'runtime-data'
+          $env:CLAUDE_MULTIMODEL_OPENCODE_V2_SUPPORT_ROOT = $support
+          $env:CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = $env:V2_NATIVE_CLI
+          $env:OPENCODE_DISABLE_AUTOUPDATE = '1'
+          $env:OPENCODE_DISABLE_MODELS_FETCH = '1'
+          $env:NO_COLOR = '1'
+          $env:CI = '1'
+          $out = "native-v2-models-$env:CANDIDATE_PLATFORM.json"
+          $err = "native-v2-models-$env:CANDIDATE_PLATFORM.stderr"
+          & $runtime runtime providers models --runtime opencode --provider opencode --project-path (Join-Path $root 'project') --limit 5 --json 1> $out 2> $err
+          if ($LASTEXITCODE -ne 0) { Get-Content $err -ErrorAction SilentlyContinue; throw 'Packaged V2 catalog command failed' }
+          $result = Get-Content $out -Raw | ConvertFrom-Json
+          if ($result.error -or -not $result.models -or -not @($result.models.models | Where-Object { $_.providerId -eq 'opencode' }).Count) {
+            throw 'Packaged V2 catalog did not return genuine OpenCode model rows'
+          }
+          Write-Output "Native V2 catalog read passed ($env:CANDIDATE_PLATFORM)"
+          # The desktop's global Providers view omits --project-path and --limit.
+          # Its CLI uses HOME as cwd; exercise that exact command as well.
+          $defaultOut = Join-Path (Get-Location).Path "native-v2-models-default-$env:CANDIDATE_PLATFORM.json"
+          $defaultErr = Join-Path (Get-Location).Path "native-v2-models-default-$env:CANDIDATE_PLATFORM.stderr"
+          Push-Location $env:HOME
+          try {
+            & $runtime runtime providers models --runtime opencode --provider opencode --json 1> $defaultOut 2> $defaultErr
+            $defaultCode = $LASTEXITCODE
+          } finally { Pop-Location }
+          if ($defaultCode -ne 0) { Get-Content $defaultErr -ErrorAction SilentlyContinue; throw 'Global V2 catalog command failed' }
+          $default = Get-Content $defaultOut -Raw | ConvertFrom-Json
+          if ($default.error -or -not $default.models -or -not @($default.models.models | Where-Object { $_.providerId -eq 'opencode' }).Count) {
+            throw 'Global V2 catalog did not return native OpenCode models'
+          }
+          Write-Output "Native V2 no-project catalog read passed ($env:CANDIDATE_PLATFORM)"
       - name: Prove native Windows V2 source launch, MCP readiness and physical stop
         if: runner.os == 'Windows'
         timeout-minutes: 8
@@ -578,6 +642,10 @@ jobs:
             packaged-server-smoke-${{ matrix.platform }}.json.progress.ndjson
             packaged-pty-smoke-${{ matrix.platform }}.json
             native-v2-cli-${{ matrix.platform }}.json
+            native-v2-models-${{ matrix.platform }}.json
+            native-v2-models-${{ matrix.platform }}.stderr
+            native-v2-models-default-${{ matrix.platform }}.json
+            native-v2-models-default-${{ matrix.platform }}.stderr
             native-v2-execution-${{ matrix.platform }}.json
           if-no-files-found: warn
           retention-days: 7
