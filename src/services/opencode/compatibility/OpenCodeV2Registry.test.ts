@@ -3,12 +3,13 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import {
-  resolveOpenCodeV2EngineVersion, openCodeV2EngineVersion,
+  openCodeV2Delivered, resolveOpenCodeV2EngineVersion, openCodeV2EngineVersion,
   assertOpenCodeV2Launchable, classifyOpenCodeV2Version, isOpenCodeV2Identity, openCodeV2Dialect,
   openCodeV2GraphPackages, openCodeV2LaunchRefusal, openCodeV2Qualification, openCodeV2QualifiedVersions,
   openCodeV2ReleaseContract, openCodeV2StagedVersions, openCodeV2Wire, parseOpenCodeV2GraphAlias, type OpenCodeV2Pin,
 } from './OpenCodeV2Registry.js'
 import { validateRunLaunchPlan } from '../bridge/OpenCodeV2RunOwner.js'
+import { openCodeV2KeyIntegration, openCodeV2KeyIntegrations } from '../catalog/OpenCodeV2KeyIntegrations.js'
 import type { RunLaunchPlan } from '../bridge/OpenCodeV2RunTypes.js'
 
 const manifest = JSON.parse(readFileSync(path.join(import.meta.dir, '../../../../package.json'), 'utf8')) as {
@@ -159,4 +160,20 @@ test('persisted run plans retain their original engine across a newer default wi
   expect(openCodeV2EngineVersion(retained.members[0]!.native)).toBe('2.0.32')
   Object.assign(retained.members[0]!.native, { engineVersion: '2.0.40', dialect: 'v2-2.0.40' })
   expect(() => validateRunLaunchPlan(retained)).toThrow('opencode_v2_version_unqualified')
+})
+
+test('compiled runtime without V2 refuses team launch and hides key integrations', () => {
+  expect(openCodeV2Delivered()).toBe(true)
+  expect(openCodeV2KeyIntegrations('2.1.4').length).toBeGreaterThan(0)
+  Reflect.set(globalThis, 'OPENCODE_V2_DELIVERED', false)
+  try {
+    expect(openCodeV2Delivered()).toBe(false)
+    expect(openCodeV2LaunchRefusal('2.1.4', 'linux-x64')).toBe('opencode_v2_version_unqualified')
+    expect(openCodeV2LaunchRefusal('3.0.0', 'linux-x64')).toBe('opencode_v2_version_out_of_range')
+    expect(openCodeV2KeyIntegrations('2.1.4')).toEqual([])
+    expect(openCodeV2KeyIntegration('kimi-code-plan-cn')).toBeNull()
+  } finally {
+    Reflect.deleteProperty(globalThis, 'OPENCODE_V2_DELIVERED')
+  }
+  expect(openCodeV2Delivered()).toBe(true)
 })
