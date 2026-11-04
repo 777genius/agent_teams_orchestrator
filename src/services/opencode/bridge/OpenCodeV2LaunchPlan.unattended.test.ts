@@ -231,7 +231,7 @@ test('controller entries refuse directories, missing and non-absolute targets be
   await expect(inspectOpenCodeV2SourceAvailability(envelope())).rejects.toThrow('controller_entry_not_absolute')
   expect(receiptControllers).toEqual([])
 })
-for (const version of ['2.1.4'] as const) test(`${version} admits Linux and Darwin selection but fences unsupported hosts before identity reads`, async () => {
+for (const version of ['2.1.4'] as const) test(`${version} admits qualified Linux x64 and Darwin ARM64 selection but fences unsupported hosts before identity reads`, async () => {
   pin = version
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
   const arch = Object.getOwnPropertyDescriptor(process, 'arch')!
