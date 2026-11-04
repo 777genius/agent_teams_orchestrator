@@ -255,3 +255,48 @@ for (const source of ['project-config', 'imported-config', 'project-default', 'g
     }
   }, 20_000)
 }
+
+test('public V2 model catalog refusal keeps a finite profile stage and a private sanitized record', async () => {
+  const script = `
+    import { mock } from 'bun:test'
+    import assert from 'node:assert/strict'
+    import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+    import { tmpdir } from 'node:os'
+    import path from 'node:path'
+    const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-catalog-stage-'))
+    process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+    const identityPath = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/compatibility/OpenCodeNativeIdentity.ts'))}
+    const identity = await import(identityPath)
+    mock.module(identityPath, () => ({ ...identity, inspectOpenCodeReadSelection: async () => ({
+      policy: { generation: 'v2', version: '2.1.4' },
+      native: { generation: 'v2', version: '2.1.4' },
+    }) }))
+    const profilePath = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/OpenCodeProfileManager.ts'))}
+    const profile = await import(profilePath)
+    const secret = 'TEST-SECRET-private-provider-error'
+    mock.module(profilePath, () => ({ ...profile,
+      resolveOpenCodeV2CatalogProfileScope: async () => { throw Error(secret) },
+    }))
+    const { OpenCodeProviderManagementAdapter } = await import(${JSON.stringify(import.meta.resolve('./OpenCodeProviderManagementAdapter.ts'))})
+    try {
+      const adapter = new OpenCodeProviderManagementAdapter({ catalogOverallTimeoutMs: 2000 })
+      const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'opencode', projectPath: root })
+      assert.equal(result.ok, false)
+      assert.equal(result.error.code, 'runtime-unhealthy')
+      assert.match(result.error.message, /stage: profile, category: provider_operation_unknown/)
+      assert(!JSON.stringify(result).includes(secret), 'Private provider exception escaped into the public DTO')
+      const folder = path.join(root, 'opencode/v2/provider-diagnostics')
+      const names = await readdir(folder)
+      assert.equal(names.length, 1)
+      const bytes = await readFile(path.join(folder, names[0]), 'utf8')
+      assert(!bytes.includes(secret), 'Private provider exception escaped into diagnostics')
+      const observation = JSON.parse(bytes)
+      assert.equal(observation.phase, 'provider-model-catalog-profile')
+      assert.equal(observation.category, 'provider_operation_unknown')
+      assert.equal(observation.retainedOriginal, true)
+    } finally { mock.restore(); await rm(root, { recursive: true, force: true }) }
+  `
+  const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe', env: { ...process.env, NODE_ENV: 'test' } })
+  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
+  expect({ code, output: stdout + stderr }).toEqual({ code: 0, output: '' })
+}, 20_000)
