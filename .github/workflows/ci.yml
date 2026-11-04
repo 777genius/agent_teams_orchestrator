@@ -555,7 +555,8 @@ jobs:
           fi
       - name: Read real OpenCode V2 catalog through packaged Windows runtime
         if: runner.os == 'Windows'
-        timeout-minutes: 8
+        # This step runs two independent bounded catalog reads in sequence.
+        timeout-minutes: 12
         shell: pwsh
         env:
           CANDIDATE_PLATFORM: ${{ matrix.platform }}
