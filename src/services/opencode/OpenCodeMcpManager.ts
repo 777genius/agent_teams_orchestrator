@@ -691,12 +691,16 @@ function appMcpConfigMatchesRequiredRuntime(
     }
   }
 
+  const candidates = [entry, asRecord(entry?.config), asRecord(entry?.server), asRecord(entry?.options)]
+  const headerSets = candidates.map(candidate => asStringRecord(candidate?.headers)).filter(Boolean)
   if (desiredConfig.headers?.Authorization) {
-    const candidates = [entry, asRecord(entry?.config), asRecord(entry?.server), asRecord(entry?.options)]
-    const headers = candidates.map(candidate => asStringRecord(candidate?.headers)).find(Boolean)
+    const headers = headerSets[0]
     if (!headers || Object.keys(headers).length !== 1 || remoteMcpIdentity({ url: getEntryUrl(entry) ?? undefined, headers }) !== remoteMcpIdentity(desiredConfig)) {
       return { ok: false, reason: 'existing app MCP authorization does not match current launch identity' }
     }
+  } else if (headerSets.some(headers => Object.keys(headers).some(key => key.toLowerCase() === 'authorization'))) {
+    // Rotating to headerless must not retain a previous bearer in any exposed entry shape.
+    return { ok: false, reason: 'existing app MCP authorization does not match current launch identity' }
   }
 
   return { ok: true, reason: null }

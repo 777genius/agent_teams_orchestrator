@@ -36,6 +36,13 @@ test('publishes a private first config and replacement without changing legacy c
   expect(await readdir(credentialDirectory())).toEqual(['opencode.json'])
 })
 
+test.skipIf(process.platform !== 'win32')('accepts a case-only Windows state-root spelling with original ACL checks', async () => {
+  const alternate = path.join(path.dirname(root), path.basename(root).toUpperCase())
+  const file = await publishPrivateCursorMcpConfig(alternate, secretConfig)
+  expect(JSON.parse(await readFile(file, 'utf8'))).toEqual(secretConfig)
+  assertPrivateWindowsAcl(file)
+})
+
 test.skipIf(process.platform === 'win32')('rejects an existing broad file without chmod or secret writes', async () => {
   await mkdir(credentialDirectory(), { mode: 0o700 })
   await writeFile(credentialFile(), 'unsafe sentinel', { mode: 0o644 })
