@@ -6,6 +6,18 @@ const waitForAbort = (signal: AbortSignal) => new Promise<never>((_resolve, reje
   else signal.addEventListener('abort', () => reject(signal.reason), { once: true })
 })
 
+test('diagnostic stages retain the original read failure, but failed retirement takes precedence', () => {
+  const budget = new OpenCodeV2CatalogReadBudget()
+  try {
+    budget.enter('models')
+    budget.noteFailure()
+    budget.retiring()
+    expect(budget.diagnosticPhase).toBe('models')
+    budget.noteFailure('retirement')
+    expect(budget.diagnosticPhase).toBe('retirement')
+  } finally { budget.deadline.dispose() }
+})
+
 test('one catalog budget includes preparation instead of restarting at acquisition', async () => {
   const budget = new OpenCodeV2CatalogReadBudget(30)
   const events: string[] = []
