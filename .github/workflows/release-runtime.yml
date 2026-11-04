@@ -395,13 +395,19 @@ jobs:
           Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
 
       - name: Stage qualified support and source sidecars
+        id: staged-support
         env:
           RUNTIME_OPENCODE_V2: ${{ steps.opencode-v2.outputs.delivery }}
+          RELEASE_PLATFORM: ${{ matrix.platform }}
         shell: bash
-        run: bun --no-install ./scripts/opencode-v2/delivery.ts stage-release '${{ matrix.platform }}'
+        run: |
+          set -euo pipefail
+          bun --no-install ./scripts/opencode-v2/delivery.ts stage-release "$RELEASE_PLATFORM"
+          qualified="$(bun --no-install -e 'import { releaseOpenCodeV2Contract } from "./scripts/opencode-v2/release-delivery.ts"; const versions = releaseOpenCodeV2Contract().qualified[process.env.RELEASE_PLATFORM]; if (!Array.isArray(versions)) throw new Error("Unknown release platform"); console.log(versions.length > 0)')"
+          echo "qualified=$qualified" >> "$GITHUB_OUTPUT"
 
       - name: Serve every staged V2 graph from the release archive
-        if: runner.os != 'Windows' && steps.opencode-v2.outputs.delivery == 'bundled'
+        if: runner.os != 'Windows' && steps.staged-support.outputs.qualified == 'true'
         timeout-minutes: 10
         shell: bash
         env:
@@ -433,7 +439,7 @@ jobs:
           retention-days: 7
 
       - name: Prove native Windows V2 server and PTY from the release archives
-        if: runner.os == 'Windows' && steps.opencode-v2.outputs.delivery == 'bundled'
+        if: runner.os == 'Windows' && steps.staged-support.outputs.qualified == 'true'
         timeout-minutes: 10
         shell: pwsh
         env:
