@@ -15,12 +15,16 @@ export class OpenCodeV2CatalogReadTimeout extends Error {
 export class OpenCodeV2CatalogReadBudget {
   readonly deadline: OpenCodeRuntimeDeadline
   private phase: OpenCodeV2CatalogReadPhase = 'selection'
+  private failedPhase: OpenCodeV2CatalogReadPhase | undefined
   private expiredPhase: OpenCodeV2CatalogReadPhase | undefined
   constructor(timeoutMs = OPEN_CODE_V2_CATALOG_READ_BUDGET_MS) {
     this.deadline = new OpenCodeRuntimeDeadline(timeoutMs)
     this.deadline.signal.addEventListener('abort', () => { this.expiredPhase = this.phase }, { once: true })
   }
   get signal(): AbortSignal { return this.deadline.signal }
+  /** Keep the failed stage when normal retirement runs; cleanup failure takes precedence. */
+  get diagnosticPhase(): OpenCodeV2CatalogReadPhase { return this.failedPhase ?? this.phase }
+  noteFailure(phase: OpenCodeV2CatalogReadPhase = this.phase): void { this.failedPhase = phase }
   remainingMs(): number { return this.deadline.remainingMs() }
   enter(phase: OpenCodeV2CatalogReadPhase): void { this.check(); this.phase = phase }
   check(): void { this.deadline.throwIfExpired() }
