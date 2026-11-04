@@ -69,28 +69,28 @@ if (openCodeV2ReleaseDelivery() === 'off') {
   build(process.execPath, ['--compile', '--without-opencode-v2'])
   if (!existsSync('./dist/cursor-managed')) throw new Error('Managed Cursor assets missing')
   console.log(`Prepared compiled runtime without OpenCode V2 for ${platform}`)
-  process.exit(0)
+} else {
+  const binary = await pinnedBinary(pins.assets[platform]!, args.includes('--bun-archive') ? option('--bun-archive') : undefined)
+  const shipped = await stageBinary('./dist/bun', platform, binary)
+  // The physical delivery is parsed by its platform pin. A newer compiler's minifier may
+  // emit syntax it cannot parse, so build that JS with the exact shipped version.
+  // Cross-compiled assets use the same pinned version's runnable host executable.
+  const host = `${process.platform}-${process.arch}`
+  if (!Object.hasOwn(pins.assets, host)) throw new Error('Unsupported runtime release build host')
+  const jsBuilder = host === platform ? shipped :
+    await stageBinary('./dist/build-bun', host, await pinnedBinary(pins.assets[host]!))
+  
+  const qualified = openCodeV2ReleaseContract().qualified[platform as keyof ReturnType<typeof openCodeV2ReleaseContract>['qualified']]
+  if (qualified?.length) {
+    build(jsBuilder, ['--opencode-v2-support', '--portable-graph', `--release-platform=${platform}`])
+    await packageOpenCodeV2Delivery({ root: './dist/opencode-v2-support', outputDirectory: './dist',
+      runtimeVersion: metadata.version, sourceCommit, platformKey: platform })
+  }
+  build(jsBuilder, ['--base-delivery', `--release-platform=${platform}`])
+  const [targetPlatform, arch] = platform.split('-')
+  const identity = validatePackagedOpenCodeIdentity({ schema: 1, platform: targetPlatform, arch,
+    bunVersion: openCodeBunVersion(targetPlatform), bunSha256: sha(binary), entrySha256: sha(await readFile('./dist/local-cli/cli.js')) })
+  await writeFile('./dist/opencode-delivery.json', JSON.stringify(identity, null, 2) + '\n')
+  build(process.execPath, ['--compile', '--packaged-delivery', '--base-delivery', `--release-platform=${platform}`])
+  console.log(`Prepared graph-free base${qualified?.length ? ' and separate qualified V2 support' : ''} for ${platform}`)
 }
-const binary = await pinnedBinary(pins.assets[platform]!, args.includes('--bun-archive') ? option('--bun-archive') : undefined)
-const shipped = await stageBinary('./dist/bun', platform, binary)
-// The physical delivery is parsed by its platform pin. A newer compiler's minifier may
-// emit syntax it cannot parse, so build that JS with the exact shipped version.
-// Cross-compiled assets use the same pinned version's runnable host executable.
-const host = `${process.platform}-${process.arch}`
-if (!Object.hasOwn(pins.assets, host)) throw new Error('Unsupported runtime release build host')
-const jsBuilder = host === platform ? shipped :
-  await stageBinary('./dist/build-bun', host, await pinnedBinary(pins.assets[host]!))
-
-const qualified = openCodeV2ReleaseContract().qualified[platform as keyof ReturnType<typeof openCodeV2ReleaseContract>['qualified']]
-if (qualified?.length) {
-  build(jsBuilder, ['--opencode-v2-support', '--portable-graph', `--release-platform=${platform}`])
-  await packageOpenCodeV2Delivery({ root: './dist/opencode-v2-support', outputDirectory: './dist',
-    runtimeVersion: metadata.version, sourceCommit, platformKey: platform })
-}
-build(jsBuilder, ['--base-delivery', `--release-platform=${platform}`])
-const [targetPlatform, arch] = platform.split('-')
-const identity = validatePackagedOpenCodeIdentity({ schema: 1, platform: targetPlatform, arch,
-  bunVersion: openCodeBunVersion(targetPlatform), bunSha256: sha(binary), entrySha256: sha(await readFile('./dist/local-cli/cli.js')) })
-await writeFile('./dist/opencode-delivery.json', JSON.stringify(identity, null, 2) + '\n')
-build(process.execPath, ['--compile', '--packaged-delivery', '--base-delivery', `--release-platform=${platform}`])
-console.log(`Prepared graph-free base${qualified?.length ? ' and separate qualified V2 support' : ''} for ${platform}`)

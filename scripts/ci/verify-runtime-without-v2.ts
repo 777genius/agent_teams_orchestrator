@@ -25,16 +25,21 @@ if (version.status !== 0 || version.stdout.trim() !== '2.777.777 (Claude Code)')
 // The compiled runtime answers `runtime status` itself, in an empty profile without OpenCode on PATH.
 const home = mkdtempSync(path.join(tmpdir(), 'TEST-runtime-without-v2-'))
 try {
-  const status = run(['runtime', 'status', '--provider', 'opencode', '--json'], {
+  const env = {
     PATH: process.platform === 'win32' ? path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32') : '',
     ...(process.platform === 'win32' ? { SystemRoot: process.env.SystemRoot, ComSpec: process.env.ComSpec, WINDIR: process.env.SystemRoot } : {}),
     HOME: home, USERPROFILE: home, APPDATA: path.join(home, 'appdata'), LOCALAPPDATA: path.join(home, 'local-appdata'),
     XDG_CONFIG_HOME: path.join(home, '.config'), XDG_CACHE_HOME: path.join(home, '.cache'), XDG_DATA_HOME: path.join(home, '.local', 'share'),
     CLAUDE_CONFIG_DIR: path.join(home, '.claude'), ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
-  })
+  }
+  const status = run(['runtime', 'status', '--provider', 'opencode', '--json'], env)
   if (status.status !== 0) fail(`runtime status exited ${status.status}: ${status.stderr.slice(-2000)}`)
   const payload = JSON.parse(status.stdout) as { schemaVersion?: unknown; providers?: Record<string, unknown> }
   if (payload.schemaVersion !== 2 || !payload.providers || !('opencode' in payload.providers)) fail('unexpected runtime status payload')
+  const models = run(['model', 'list', '--provider', 'opencode', '--json'], env)
+  if (models.status !== 0) fail(`model list exited ${models.status}: ${models.stderr.slice(-2000)}`)
+  const modelPayload = JSON.parse(models.stdout) as { schemaVersion?: unknown; providers?: Record<string, unknown> }
+  if (modelPayload.schemaVersion !== 1 || !modelPayload.providers || !('opencode' in modelPayload.providers)) fail('unexpected model list payload')
 } finally {
   rmSync(home, { recursive: true, force: true })
 }
