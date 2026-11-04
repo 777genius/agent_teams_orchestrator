@@ -69,23 +69,33 @@ export async function qualifyNativeColdRecovery(options: {
     // earlier asynchronous operation eventually finishes.
     options.parentSignal.throwIfAborted()
     // Only the sentinel consumes control input; A/B exit from their finite role.
+    let exited = false, exitCode: number | null = null, exitSignal: string | null = null, waitFailed = false
+    let resolveExit!: (code: number | null) => void
+    const exitReceipt = new Promise<number | null>(resolve => { resolveExit = resolve })
     const child = Bun.spawn([process.execPath, '--no-env-file', controllerFile, role, configFile], {
       cwd: project, env: { PATH: '/usr/bin:/bin', HOME: profile.homePath, USERPROFILE: profile.homePath,
         TMPDIR: profile.tmpPath, TZ: 'Etc/UTC' }, stdin: role === 'sentinel' ? 'pipe' : 'ignore', stdout: 'pipe', stderr: 'pipe',
+      // onExit is the native child wait callback. Observe its status directly
+      // instead of depending on a secondary .exited promise after Stop.
+      onExit(_process, code, signal, error) {
+        waitFailed = error !== undefined
+        exited = !waitFailed
+        exitCode = Number.isSafeInteger(code) ? code : null
+        exitSignal = signal == null ? null : ['SIGABRT', 'SIGALRM', 'SIGBUS', 'SIGFPE', 'SIGHUP', 'SIGILL', 'SIGINT',
+          'SIGKILL', 'SIGPIPE', 'SIGQUIT', 'SIGSEGV', 'SIGTERM', 'SIGTRAP', 'SIGUSR1', 'SIGUSR2', 'SIGXCPU', 'SIGXFSZ']
+          .includes(String(signal)) ? String(signal) : 'other'
+        resolveExit(exitCode)
+      },
     })
-    let exited = false, exitCode: number | null = null, exitSignal: string | null = null
     const progress: ColdProgress[] = []
     const stdoutDrain = drainColdOutput(child.stdout), stderrDrain = drainColdOutput(child.stderr, line => {
       captureColdProgress(line, caseId, role, progress)
     })
-    const observation = Promise.all([child.exited.then(code => {
-      exited = true; exitCode = Number.isSafeInteger(code) ? code : null
-      const signal = child.signalCode
-      exitSignal = signal == null ? null : ['SIGABRT', 'SIGALRM', 'SIGBUS', 'SIGFPE', 'SIGHUP', 'SIGILL', 'SIGINT',
-        'SIGKILL', 'SIGPIPE', 'SIGQUIT', 'SIGSEGV', 'SIGTERM', 'SIGTRAP', 'SIGUSR1', 'SIGUSR2', 'SIGXCPU', 'SIGXFSZ'].includes(signal) ? signal : 'other'
-      return code
-    }), stdoutDrain.result, stderrDrain.result])
-      .then(([code, stdout, stderr]) => ({ code, signal: child.signalCode ?? null, stdout, stderr }))
+    const observation = Promise.all([exitReceipt, stdoutDrain.result, stderrDrain.result])
+      .then(([code, stdout, stderr]) => {
+        if (waitFailed) throw new Error('TEST_cold_controller_wait_failed')
+        return { code, signal: exitSignal, stdout, stderr }
+      })
     // Keep one observation and one exact original handle. Never rediscover or
     // signal a numeric PID, and never relaunch a controller after uncertainty.
     void observation.catch(() => undefined)

@@ -2,7 +2,7 @@ import { afterEach, expect, spyOn, test } from 'bun:test'
 import { createServer, type Server, type Socket } from 'node:net'
 import { Client } from 'undici/index.js'
 import * as custody from './OpenCodeNativeCustody.js'
-import { fetchNativeOpenCode } from './OpenCodeNativeRequestLease.js'
+import { fetchNativeOpenCode, nativeRequestFailureGate } from './OpenCodeNativeRequestLease.js'
 import { OpenCodeClientFactory, OpenCodeHttpError } from '../OpenCodeClientFactory.js'
 
 const servers = new Set<Server>(), sockets = new Set<Socket>()
@@ -56,6 +56,38 @@ test('Bun sends zero HTTP/Basic bytes until the exact connected socket passes pe
     expect(checks).toHaveLength(1)
     expect(Buffer.concat(e.received).toString()).toContain('authorization: Basic VEVTVDozMjBiaXRz')
   })
+})
+
+test('transient pending accept is rechecked on one connected socket without early Basic bytes', async () => {
+  const e = await endpoint(ok)
+  let checks = 0
+  await withAuthority(e.baseUrl, async () => {
+    checks++
+    expect(Buffer.concat(e.received).length).toBe(0)
+    if (checks === 1) throw new Error('TEST-accept-pending')
+  }, async (owner, _change, authorityChecks) => {
+    const response = await fetchNativeOpenCode(e.baseUrl + '/config', { signal: AbortSignal.timeout(2000) }, owner)
+    expect(await response.text()).toBe('{}')
+    expect(checks).toBe(2)
+    expect(authorityChecks).toHaveLength(1)
+    expect(Buffer.concat(e.received).toString()).toContain('authorization: Basic VEVTVDozMjBiaXRz')
+  })
+})
+
+test('persistent foreign peer refusal emits zero HTTP bytes even after bounded rechecks', async () => {
+  const e = await endpoint(ok)
+  let attempts = 0
+  await withAuthority(e.baseUrl, async () => { attempts++; throw new Error('TEST-foreign-peer') },
+    async (owner, _change, checks) => {
+      const failure = await fetchNativeOpenCode(e.baseUrl + '/config', { signal: AbortSignal.timeout(2000) }, owner)
+        .then(() => null, error => error)
+      expect(failure).toBeInstanceOf(Error)
+      expect(failure.message).toBe('native_custody_unavailable')
+      expect(nativeRequestFailureGate(failure)).toBe('peer')
+      expect(attempts).toBe(4)
+      expect(checks).toHaveLength(0)
+      expect(Buffer.concat(e.received).length).toBe(0)
+    })
 })
 
 test('stale A-to-new B handoff after peer proof cannot adopt B by its reused URL', async () => {

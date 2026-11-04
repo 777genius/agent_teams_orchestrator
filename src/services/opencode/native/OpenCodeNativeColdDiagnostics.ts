@@ -1,6 +1,6 @@
 // Diagnostic-only finite telemetry. Never grants native admission or child-death authority.
 export const coldFailureCodes = new Set(['TEST_cold_contract', 'TEST_cold_publication_incomplete',
-        'TEST_cold_observation_timeout', 'TEST_cold_receipt_timeout', 'native_custody_unavailable',
+        'TEST_cold_observation_timeout', 'TEST_cold_receipt_timeout', 'TEST_cold_controller_wait_failed', 'native_custody_unavailable',
         'native_custody_cancelled', 'native_custody_reconnect_refused', 'native_custody_response_failed',
         'native_custody_protocol', 'native_custody_timeout', 'native_custody_receipt_close_failed',
         'native_custody_helper_cleanup_unconfirmed', 'native_custody_asset_unavailable', 'native_custody_authority_unknown', 'native_custody_image_mismatch'])

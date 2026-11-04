@@ -10,7 +10,7 @@ import { OpenCodeClientFactory } from '../OpenCodeClientFactory.js'
 import { launchNativeCustody, recoverNativeCustody, nativeCustodyForEndpoint, bindNativeRequestOwner, type NativeCustody } from './OpenCodeNativeCustody.js'
 import { OpenCodeHostManager } from '../OpenCodeHostManager.js'
 import type { OpenCodePreparedProfile } from '../types.js'
-import { fetchNativeOpenCode } from './OpenCodeNativeRequestLease.js'
+import { fetchNativeOpenCode, nativeRequestFailureGate } from './OpenCodeNativeRequestLease.js'
 import { failureDiagnostic } from './fixtures/OpenCodeNativeColdController.js'
 import { qualifyNativeColdRecovery } from './OpenCodeNativeColdRecovery.js'
 import { nativeAuthorityPath, readNativeAuthority } from './OpenCodeNativeAuthority.js'
@@ -295,7 +295,7 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
       expect(await new OpenCodeClientFactory().create(sentinel.reference.baseUrl, undefined, bindNativeRequestOwner({}, sentinel)).getConfig()).toMatchObject({ marker: 'A' })
     } catch (error) {
       console.error('TEST_NATIVE_SAME_PATH_FAILURE', JSON.stringify({ protocol: 1, subphase,
-        failure: failureDiagnostic('native-same-path', error) }))
+        failure: failureDiagnostic('native-same-path', error), gate: nativeRequestFailureGate(error) }))
       throw error
     }
   }, 20000)

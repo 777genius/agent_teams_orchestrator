@@ -4,6 +4,14 @@ import { Client, type Dispatcher } from 'undici/index.js'
 import { connect, type Socket } from 'node:net'
 import { nativeCustodyForRequest, recheckNativeRequestAuthority } from './OpenCodeNativeCustody.js'
 
+// Diagnostics are local to the original error identity; no URLs, headers or
+// raw exceptions are attached to a public error or written to stdout/stderr.
+type RequestGate = 'connected' | 'peer' | 'authority' | 'http'
+const failedGate = new WeakMap<Error, RequestGate>()
+export function nativeRequestFailureGate(error: unknown): RequestGate | null {
+  return error instanceof Error ? failedGate.get(error) ?? null : null
+}
+
 /** One admitted socket and one dispatch; neither redirects nor reconnects replay a request. */
 export async function fetchNativeOpenCode(input: RequestInfo | URL, init?: RequestInit, owner?: object): Promise<Response> {
   const request = new Request(input, init), url = new URL(request.url)
@@ -11,6 +19,7 @@ export async function fetchNativeOpenCode(input: RequestInfo | URL, init?: Reque
     throw new Error('native_custody_unavailable')
   const custody = nativeCustodyForRequest(owner, url.origin)
   let attempted = false, socket: Socket | undefined
+  let gate: RequestGate = 'connected'
   const client = new Client(url.origin, {
     pipelining: 0,
     connect(_options, callback) {
@@ -33,12 +42,26 @@ export async function fetchNativeOpenCode(input: RequestInfo | URL, init?: Reque
         try {
           request.signal.throwIfAborted()
           if (!socket?.localPort || socket.destroyed) throw new Error('native_custody_unavailable')
-          await custody.verifyPeer(socket.localPort)
+          // A just-connected socket may precede its server-side accept entry in
+          // /proc/net/tcp. Recheck that SAME socket before any HTTP bytes, with
+          // no new connection, HTTP retry, or weaker ownership criterion.
+          gate = 'peer'
+          for (let attempt = 0; attempt < 4; attempt++) {
+            request.signal.throwIfAborted()
+            if (socket.destroyed) throw new Error('native_custody_unavailable')
+            try { await custody.verifyPeer(socket.localPort); break }
+            catch {
+              if (attempt === 3) throw new Error('native_custody_unavailable')
+              await new Promise<void>(resolve => setTimeout(resolve, 25))
+            }
+          }
           request.signal.throwIfAborted()
+          gate = 'authority'
           await recheckNativeRequestAuthority(custody)
           request.signal.throwIfAborted()
           if (socket.destroyed) throw new Error('native_custody_unavailable')
           // Only now may Undici see the exact socket and flush its private headers.
+          gate = 'http'
           finish(null)
         } catch { finish(new Error('native_custody_unavailable')) }
       })() })
@@ -101,7 +124,9 @@ export async function fetchNativeOpenCode(input: RequestInfo | URL, init?: Reque
   } catch {
     void dispose()
     // Transport errors may retain request headers; never expose their cause.
-    throw new Error(request.signal.aborted ? 'native_custody_cancelled' : 'native_custody_unavailable')
+    const failure = new Error(request.signal.aborted ? 'native_custody_cancelled' : 'native_custody_unavailable')
+    failedGate.set(failure, gate)
+    throw failure
   }
 }
 
