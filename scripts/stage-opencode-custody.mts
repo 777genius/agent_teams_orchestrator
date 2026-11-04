@@ -4,7 +4,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { promisify } from 'node:util'
-import { verifyStaticPieCustodyElf } from './lib/opencode-custody-artifact.js'
+import { verifyStaticPieCustodyElf, verifyLinuxCustodyArtifact } from './lib/opencode-custody-artifact.js'
 
 // Qualification builds the host's actual native seam. Cross-platform publication
 // must carry an independently compiled/qualified artifact, never a renamed binary.
@@ -15,6 +15,13 @@ const output = path.join(root, 'dist', 'native', 'opencode-custody', `linux-${pr
 const source = path.join(root, 'native', 'opencode-custody', 'linux.c')
 const sourceBytes = await readFile(source)
 const sourceSha256 = createHash('sha256').update(sourceBytes).digest('hex')
+// Source CLI and standard builds use one checksum/ELF-verified helper. Rebuild
+// only when absent or different from the physical Linux custody source.
+const alreadyStaged = (() => {
+  try { verifyLinuxCustodyArtifact(path.join(root, 'dist', 'native'), `linux-${process.arch}`, source); return true }
+  catch { return false }
+})()
+if (!alreadyStaged) {
 await mkdir(path.dirname(output), { recursive: true })
 const temporary = await mkdtemp(path.join(path.dirname(output), '.custody-source-'))
 try {
@@ -34,3 +41,5 @@ try {
   await rename(executable, output)
   await rename(manifest, `${output}.json`)
 } finally { await rm(temporary, { recursive: true, force: true }) }
+
+}

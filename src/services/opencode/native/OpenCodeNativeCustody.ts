@@ -347,6 +347,17 @@ export function nativeCustodyForEndpoint(baseUrl: string): NativeCustody {
 }
 export function nativeCustodyForChild(child: ChildProcess): NativeCustody | undefined { return byChild.get(child) }
 
+/** A Linux boot boundary is stronger than any stale PID: no process from the
+ * old kernel instance can still be running. Require the exact persisted epoch
+ * identity, never consult an unrelated process with the same numeric PID. */
+export function nativePreviousBootConfirmed(authority: NativeAuthority, currentBootId: string): boolean {
+  const reference = authority.reference
+  const boot = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/
+  return !!reference && boot.test(currentBootId) && boot.test(reference.bootId) &&
+    currentBootId !== reference.bootId && reference.epoch === authority.images.epoch &&
+    reference.profileRoot === authority.profileRoot && reference.scopeDigest === authority.scopeDigest
+}
+
 export async function launchNativeCustody(input: {
   helper: Readonly<{ path: string; sha256: string }>; selectedBinary: string; profileRoot: string; hostKey: string; scope: unknown
   cwd: string; baseUrl: string; args: string[]; env: NodeJS.ProcessEnv; persistent: boolean
@@ -363,8 +374,17 @@ export async function launchNativeCustody(input: {
     let previous: NativeAuthority | null = null
     try { previous = await readNativeAuthority(file) }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
-    if (previous && previous.phase !== 'dead' && await nativeExitConfirmed(previous)) {
-      previous = { ...previous, phase: 'dead' }; await writeNativeAuthority(file, previous)
+    if (previous && previous.phase !== 'dead') {
+      let terminal = await nativeExitConfirmed(previous)
+      if (!terminal && previous.reference) {
+        // A durable native exit FD may never be written after a power failure.
+        // Kernel boot ID is an epoch boundary, not a PID heuristic.
+        const currentBootId = (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim()
+        terminal = nativePreviousBootConfirmed(previous, currentBootId)
+      }
+      if (terminal) {
+        previous = { ...previous, phase: 'dead' }; await writeNativeAuthority(file, previous)
+      }
     }
     fact(!previous || previous.phase === 'dead')
     const password = randomBytes(32).toString('hex')
