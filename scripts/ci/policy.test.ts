@@ -184,6 +184,31 @@ test('aggregate independently rejects required failures/cancellation/skips and c
   assert.throws(() => aggregate({}))
 })
 
+test('same-tree reuse still requires a fresh smoke and skips every original heavy job', () => {
+  const input = needs('true')
+  const reused: Record<string, { result: string; outputs?: Record<string, string> }> = {}
+  for (const [name] of Object.entries(input)) reused[name] = { result: name === 'scope' ? 'success' : 'skipped' }
+  reused.scope = { result: 'success', outputs: { native: 'true', v2_linux: 'true', reason: 'TEST decision', reuse: 'true' } }
+  reused['post-merge-smoke'] = { result: 'success' }
+  assert.equal(aggregate(reused), 'TEST decision')
+  for (const name of Object.keys(reused).filter(name => name !== 'scope')) {
+    const previous = reused[name]!
+    for (const result of ['failure', 'cancelled', 'unknown']) {
+      reused[name] = { result }
+      assert.throws(() => aggregate(reused), name)
+    }
+    reused[name] = previous
+  }
+  delete reused['post-merge-smoke']
+  assert.throws(() => aggregate(reused), /post-merge-smoke/)
+  reused['post-merge-smoke'] = { result: 'success' }
+  delete reused['opencode-v2-linux']
+  assert.throws(() => aggregate(reused), /opencode-v2-linux/)
+  // An omitted reuse field cannot convert missing E2E into accepted skips.
+  delete reused.scope!.outputs!.reuse
+  assert.throws(() => aggregate(reused))
+})
+
 test('actual Node CLI emits outputs and fails closed without Git access or valid needs', () => {
   assert.ok(process.env.TMPDIR, 'TEST TMPDIR must be explicitly isolated')
   const root = mkdtempSync(join(process.env.TMPDIR, 'TEST-ci-policy-'))
