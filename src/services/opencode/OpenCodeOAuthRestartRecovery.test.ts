@@ -1,6 +1,6 @@
 // Offline restart regression fixtures: synthetic credentials and canonical native history.
 // No provider process, credential discovery, or network transport.
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
@@ -452,12 +452,28 @@ async function fixture(options: { session?: boolean, purpose?: 'launch_runtime' 
         } },
       }))
     }
-    await manager.withOwnedOAuthRefresh({ profile, assertHostOwnership: async () => {},
-      operation: async (armSession, armProbe) => {
-        if (sessionOwner) await armSession(sessionOwner)
-        else await armProbe(native)
-      },
-      isNativeSettled: () => false, allowNativeContinuation: true })
+    // Session ARM creates a fresh manager internally. Keep its real registry,
+    // lease/run/project/birth checks on this fixture's explicit offline port.
+    // Synthetic writer JSON is never a Linux native custody receipt.
+    let endpointSpy: { mockRestore(): void } | undefined
+    if (sessionOwner) {
+      const { OpenCodeHostManager } = await import('./OpenCodeHostManager.js')
+      const endpoints = new OpenCodeHostManager({
+        persistentRegistryPath: path.join(path.dirname(global), 'host-registry.json'),
+        fetchJson: async () => { throw new Error('AUDIT synthetic registry forbids HTTP') },
+      })
+      const sessionEndpoint = OpenCodeHostManager.prototype.resolveOwnedSessionEndpoint
+      endpointSpy = spyOn(OpenCodeHostManager.prototype, 'resolveOwnedSessionEndpoint')
+        .mockImplementation((...args) => sessionEndpoint.apply(endpoints, args))
+    }
+    try {
+      await manager.withOwnedOAuthRefresh({ profile, assertHostOwnership: async () => {},
+        operation: async (armSession, armProbe) => {
+          if (sessionOwner) await armSession(sessionOwner)
+          else await armProbe(native)
+        },
+        isNativeSettled: () => false, allowNativeContinuation: true })
+    } finally { endpointSpy?.mockRestore() }
     await writeFile(profile.managedAuthPath, JSON.stringify({ xai: options.successor ?? c1 }))
     const db = new Database(path.join(path.dirname(profile.managedAuthPath), 'opencode.db'))
     try {

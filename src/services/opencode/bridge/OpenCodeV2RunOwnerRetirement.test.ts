@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import * as controls from './OpenCodeV2RunControl.js'
 import type { RunControlRecord, RunProcessIdentity } from './OpenCodeV2RunTypes.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
+import { openCodeV2LaunchRefusal } from '../compatibility/OpenCodeV2Registry.js'
 
 // Real owner processes and kernel process reads. Only the status transport is
 // replaced where a mid-measurement failure must be reproduced deterministically.
@@ -89,7 +90,7 @@ for (const [kind, { argument, failure: expected }] of Object.entries(ownerFailur
     } finally { await stopTestChild(owner); await rm(root, { recursive: true, force: true }) }
   }, 120_000)
 
-test.skipIf(!posix)('a requested stop during initialization is not recorded as the owner failure', async () => {
+test.skipIf(!posix || openCodeV2LaunchRefusal('2.1.4') !== null)('a requested stop during initialization is not recorded as the owner failure', async () => {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-owner-stopped-')))
   const directory = await controls.reserveRunControlDirectory(root, binding, 'a'.repeat(64))
   const owner = spawn(process.execPath, [peer, 'serve-delayed', root, JSON.stringify(binding)], { stdio: ['ignore', 'pipe', 'pipe'] })

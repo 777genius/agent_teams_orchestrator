@@ -8,11 +8,13 @@ import { recordOpenCodeV2ProviderFailure, retainOpenCodeV2CatalogServerFailure }
 import type { ExecutionAuthority, ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { awaitOpenCodeV2CatalogReadiness } from './OpenCodeV2ExecutionClientFactory.js'
 import { OpenCodeV2ExecutionFetch } from './OpenCodeV2ExecutionFetch.js'
+import { openCodeV2LaunchRefusal } from '../compatibility/OpenCodeV2Registry.js'
 
 // Synthetic transport only. The genuine selected Promise decoder and installed
 // client/schema/protocol bytes are exercised; no host, native process or model.
+const qualifiedTest = openCodeV2LaunchRefusal('2.1.4') === null ? test : test.skip
 for (const phase of ['client-setup', 'info', 'location', 'integration-ready', 'cleanup', 'http-401', 'http-500', 'status-low', 'status-high', 'status-fraction', 'server-location'] as const)
-test(`catalog refusal retains ${phase} with original thrown identity and bounded cause`, async () => {
+qualifiedTest(`catalog refusal retains ${phase} with original thrown identity and bounded cause`, async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-catalog-phase-'))
   const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
   process.env.CLAUDE_MULTIMODEL_DATA_HOME = root

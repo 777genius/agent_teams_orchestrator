@@ -1,5 +1,8 @@
-import { existsSync, readdirSync, statSync, type Dirent } from 'node:fs'
+import { existsSync, readdirSync, realpathSync, statSync, type Dirent } from 'node:fs'
 import path from 'node:path'
+
+import { detectOpenCodeNativeFacts } from './OpenCodeNativePlatform.js'
+import { compareOpenCodeNativeVersions, getOpenCodeNativePackages, type OpenCodeNativeFacts } from './OpenCodeNativePolicy.js'
 
 function isExecutableCandidate(value: string | null | undefined): value is string {
   if (!value?.trim()) {
@@ -16,20 +19,39 @@ function isExecutableCandidate(value: string | null | undefined): value is strin
   }
 }
 
-export function resolveOpenCodeBinaryPath(): string | null {
+let capturedSelection: { key: string; path: string | null } | null = null
+function selectionKey(): string {
+  return JSON.stringify([process.platform, process.arch, process.cwd(), process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH, process.env.OPENCODE_BIN_PATH, process.env.PATH, process.env.APPDATA])
+}
+/** Timeout diagnostics may observe a completed selection but never start another native probe. */
+export function readCapturedOpenCodeBinaryPath(): string | null {
+  return capturedSelection?.key === selectionKey() && isExecutableCandidate(capturedSelection.path) ? capturedSelection.path : null
+}
+
+export async function resolveOpenCodeBinaryPath(signal?: AbortSignal): Promise<string | null> {
+  signal?.throwIfAborted()
+  const key = selectionKey()
+  const capture = (value: string | null): string | null => {
+    if (selectionKey() === key) capturedSelection = { key, path: value }
+    return value
+  }
   const envCandidates = [
     process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH,
     process.env.OPENCODE_BIN_PATH,
   ]
   for (const candidate of envCandidates) {
     if (isExecutableCandidate(candidate)) {
-      return path.resolve(candidate.trim())
+      return capture(path.resolve(candidate.trim()))
     }
   }
-  return Bun.which('opencode') ?? resolveAppManagedOpenCodeBinaryPath()
+  const selected = Bun.which('opencode') ?? resolveAppManagedOpenCodeBinaryPath(await detectOpenCodeNativeFacts(signal))
+  signal?.throwIfAborted()
+  return capture(selected)
 }
 
-function resolveAppManagedOpenCodeBinaryPath(): string | null {
+export function resolveAppManagedOpenCodeBinaryPath(facts: OpenCodeNativeFacts): string | null {
+  const packages = getOpenCodeNativePackages(facts)
+  if (!packages.length) return null
   const appData = process.env.APPDATA?.trim()
   if (!appData) {
     return null
@@ -46,24 +68,26 @@ function resolveAppManagedOpenCodeBinaryPath(): string | null {
     return null
   }
 
-  const candidates: Array<{ version: string; binaryPath: string; mtimeMs: number }> = []
+  const candidates: Array<{ version: string; binaryPath: string; mtimeMs: number; packageRank: number }> = []
   for (const versionEntry of readDirectoryEntries(versionsDir)) {
-    if (!versionEntry.isDirectory()) {
+    if (!versionEntry.isDirectory() || compareOpenCodeNativeVersions(versionEntry.name, versionEntry.name) === null) {
       continue
     }
     const versionPath = path.join(versionsDir, versionEntry.name)
     for (const platformEntry of readDirectoryEntries(versionPath)) {
-      if (!platformEntry.isDirectory()) {
+      const packageRank = packages.indexOf(platformEntry.name)
+      if (!platformEntry.isDirectory() || packageRank < 0) {
         continue
       }
-      for (const binaryName of ['opencode.exe', 'opencode']) {
+      for (const binaryName of [facts.platform === 'win32' ? 'opencode.exe' : 'opencode']) {
         const binaryPath = path.join(versionPath, platformEntry.name, binaryName)
         if (!isExecutableCandidate(binaryPath)) {
           continue
         }
         candidates.push({
           version: versionEntry.name,
-          binaryPath,
+          binaryPath: realpathSync(binaryPath),
+          packageRank,
           mtimeMs: getMtimeMs(binaryPath),
         })
       }
@@ -71,9 +95,10 @@ function resolveAppManagedOpenCodeBinaryPath(): string | null {
   }
 
   candidates.sort((left, right) => (
-    compareVersionLabels(right.version, left.version) ||
+    compareOpenCodeNativeVersions(right.version, left.version)! ||
+    left.packageRank - right.packageRank ||
     right.mtimeMs - left.mtimeMs ||
-    right.binaryPath.localeCompare(left.binaryPath)
+    left.binaryPath.localeCompare(right.binaryPath)
   ))
   return candidates[0]?.binaryPath ?? null
 }
@@ -92,11 +117,4 @@ function getMtimeMs(filePath: string): number {
   } catch {
     return 0
   }
-}
-
-function compareVersionLabels(left: string, right: string): number {
-  return left.localeCompare(right, undefined, {
-    numeric: true,
-    sensitivity: 'base',
-  })
 }

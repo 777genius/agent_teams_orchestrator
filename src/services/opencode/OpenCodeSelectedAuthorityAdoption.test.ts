@@ -8,6 +8,9 @@ import { buildOpenCodeExpectedBehaviorEvidence } from './OpenCodeExpectedBehavio
 import { OpenCodeProfileManager, resolveOpenCodeProfileScope, buildManagedConfigFingerprint } from './OpenCodeProfileManager.js'
 import { OpenCodeHostManager } from './OpenCodeHostManager.js'
 import { OpenCodeSessionBridge } from './OpenCodeSessionBridge.js'
+import { OpenCodeClientFactory } from './OpenCodeClientFactory.js'
+import { OpenCodeMcpManager } from './OpenCodeMcpManager.js'
+import { OpenCodePreviewObserver } from './OpenCodePreviewObserver.js'
 import type { OpenCodeSessionRecord } from './types.js'
 
 function fixtureProviders(value: unknown): Record<string, unknown> {
@@ -136,12 +139,27 @@ test('selected persistent host adopts through real HTTP authority and remains st
         return new Response('Unexpected endpoint', { status: 404 });
       } });
     `)
+    // This fake binary has no native custody. Keep all HTTP on its exact TEST origins.
+    const fixtureOrigins = new Set<string>()
+    const fixtureFetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      if (!fixtureOrigins.has(url.origin)) throw new Error('Foreign fixture HTTP origin')
+      return fetch(input, { ...init, redirect: 'error' })
+    }
+    const clientFactory = new OpenCodeClientFactory({ fetchImpl: fixtureFetch })
+    const mcpManager = new OpenCodeMcpManager({ clientFactory })
+    const previewObserver = new OpenCodePreviewObserver({ fetchImpl: fixtureFetch })
+    const fetchJson = async (url: string, init?: RequestInit) => {
+      const response = await fixtureFetch(url, init)
+      return { status: response.status, data: await response.json() }
+    }
     const registryPath = path.join(root, 'registry.json')
     const managers = () => new OpenCodeHostManager({
       prepareProfile: async () => profile,
-      persistentRegistryPath: registryPath,
+      persistentRegistryPath: registryPath, fetchJson,
       readProcessStartTimeMs,
       spawnHostProcess: (_profile, port) => {
+        fixtureOrigins.add(`http://127.0.0.1:${port}`)
         // Explicit allowlist: the child cannot inherit user credentials/config.
         const child = spawn(process.execPath, [serverFile, String(port), stateFile], {
           cwd: project, env: { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE,
@@ -161,7 +179,7 @@ test('selected persistent host adopts through real HTTP authority and remains st
       saved = record; writes++; return 'created' as const
     }, markStale: async () => { throw new Error('unexpected stale write') } }
     const bridgeFor = (hostManager: OpenCodeHostManager) => new OpenCodeSessionBridge({
-      prepareProfile: async () => profile, hostManager, sessionStore: store,
+      prepareProfile: async () => profile, hostManager, sessionStore: store, clientFactory, mcpManager, previewObserver,
       oauthRefreshCoordinator: { ensureFreshForPrompt: (async () => ({ refreshed: false })) as never },
     })
     const evidence = await buildOpenCodeExpectedBehaviorEvidence({ profile, fullModelId: selectedModel,

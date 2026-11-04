@@ -60,6 +60,11 @@ augment_launcher_path
 normalize_source_node_env
 BUN_BIN="$(resolve_bun)" || exit $?
 
+# Source OpenCode must stage the same verified native helper as packaged Linux.
+if [[ "$(uname -s)" == "Linux" ]]; then
+  "$BUN_BIN" --no-install "$SCRIPT_DIR/scripts/stage-opencode-custody.mts"
+fi
+
 if [[ "${1-}" == "runtime" && "${2-}" == "opencode-command" ]]; then
   exec "$BUN_BIN" "$SCRIPT_DIR/src/entrypoints/opencodeCommand.ts" "${@:3}"
 fi

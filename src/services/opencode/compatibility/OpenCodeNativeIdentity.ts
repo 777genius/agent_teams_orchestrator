@@ -83,10 +83,10 @@ export async function hashOpenCodeFile(file: string, signal?: AbortSignal): Prom
   } finally { await handle.close() }
 }
 
-export function selectedOpenCodeReadPath(): string | null {
+export async function selectedOpenCodeReadPath(signal?: AbortSignal): Promise<string | null> {
   // Keep the legacy resolver's blank/stale override fallback, then bind the
   // one resolved executable to the same strict generation and native checks.
-  const selected = resolveOpenCodeBinaryPath()
+  const selected = await resolveOpenCodeBinaryPath(signal)
   for (const explicit of [process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH, process.env.OPENCODE_BIN_PATH]) {
     if (explicit?.trim() && !path.isAbsolute(explicit.trim())) throw new Error('identity_mismatch')
     if (explicit?.trim() && path.resolve(explicit.trim()) === selected) break
@@ -99,7 +99,7 @@ export async function inspectOpenCodeReadSelection(signal?: AbortSignal, onAcqui
   path: string | null; policy: OpenCodeReadGeneration; native: OpenCodeV2NativeIdentity | null; fingerprint: string | null
 }> {
   signal?.throwIfAborted()
-  const selected = selectedOpenCodeReadPath()
+  const selected = await selectedOpenCodeReadPath(signal)
   if (!selected) return { path: null, policy: { generation: 'unsupported', version: null }, native: null, fingerprint: null }
   onAcquisitionStarted?.()
   signal?.throwIfAborted()

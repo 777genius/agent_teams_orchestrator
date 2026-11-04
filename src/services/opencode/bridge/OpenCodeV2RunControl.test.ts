@@ -7,6 +7,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { discoverOpenCodeV2Run, awaitOpenCodeV2RunMemberReadiness, isTransientOpenCodeV2ControlRead, parseRunControlRequest, readOpenCodeV2RunStop, readRunProcessIdentity, requestOpenCodeV2Run, reserveRunControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
+import { openCodeV2LaunchRefusal } from '../compatibility/OpenCodeV2Registry.js'
 import type { RunControlRecord, RunUnixControlRecord } from './OpenCodeV2RunTypes.js'
 
 function requireUnixControl(record: RunControlRecord | null): asserts record is RunUnixControlRecord {
@@ -14,6 +15,7 @@ function requireUnixControl(record: RunControlRecord | null): asserts record is 
 }
 
 const peer = fileURLToPath(new URL('./fixtures/OpenCodeV2RunControlPeer.ts', import.meta.url))
+const qualifiedPeerTest = openCodeV2LaunchRefusal('2.1.4') === null ? test : test.skip
 const binding = { teamId: 'TEST-team', runId: 'TEST-run', controllerInstanceId: 'controller', ownerId: 'owner' }
 const execute = promisify(execFile)
 test('readiness retries only proven read transport failures and preserves fatal custody errors', () => {
@@ -128,7 +130,7 @@ describe('private run control with separate synthetic CLI processes', () => {
       expect(JSON.parse(result.stdout)).toEqual({ sentinel: 'TEST foreign sentinel', socketGone: true })
     } finally { await rm(root, { recursive: true, force: true }) }
   })
-  test('long durable path authenticates fresh CLI and scoped stop retires the same socket without touching a foreign sentinel', async () => {
+  qualifiedPeerTest('long durable path authenticates fresh CLI and scoped stop retires the same socket without touching a foreign sentinel', async () => {
     const parent = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-ctl-')))
     const root = path.join(parent, 'long-durable-data-root-'.repeat(7))
     await mkdir(root, { mode: 0o700 })
@@ -224,7 +226,7 @@ describe('private run control with separate synthetic CLI processes', () => {
       await rm(root, { recursive: true, force: true })
     }
   })
-  test('published control waits for the same delayed native member before its sole original admission', async () => {
+  qualifiedPeerTest('published control waits for the same delayed native member before its sole original admission', async () => {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r261-ready-')))
     const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
     const owner = spawn(process.execPath, [peer, 'serve-delayed', root, JSON.stringify(binding)], { stdio: ['ignore', 'pipe', 'pipe'] })
@@ -255,7 +257,7 @@ describe('private run control with separate synthetic CLI processes', () => {
       expect(JSON.parse(await readFile(path.join(directory, 'synthetic-effects.json'), 'utf8'))).toEqual({ prompted: 1, closed: 1 })
     } finally { await stopTestChild(owner); await rm(root, { recursive: true, force: true }) }
   }, 120_000)
-  test('permanent starting and original stop never authorize admission', async () => {
+  qualifiedPeerTest('permanent starting and original stop never authorize admission', async () => {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r261-ready-')))
     const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
     const owner = spawn(process.execPath, [peer, 'serve-delayed', root, JSON.stringify(binding)], { stdio: ['ignore', 'pipe', 'pipe'] })
@@ -277,7 +279,7 @@ describe('private run control with separate synthetic CLI processes', () => {
       await expect(lstat(path.join(directory, 'synthetic-effects.json'))).rejects.toMatchObject({ code: 'ENOENT' })
     } finally { await stopTestChild(owner); await rm(root, { recursive: true, force: true }) }
   }, 120_000)
-  test('changed socket/owner binding or public challenge permissions cannot authorize a stop', async () => {
+  qualifiedPeerTest('changed socket/owner binding or public challenge permissions cannot authorize a stop', async () => {
     const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-ctl-')))
     const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
     const owner = spawn(process.execPath, [peer, 'serve', root, JSON.stringify(binding)], { stdio: ['ignore', 'pipe', 'pipe'] })

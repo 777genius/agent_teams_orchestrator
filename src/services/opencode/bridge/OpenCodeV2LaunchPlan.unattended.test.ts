@@ -10,7 +10,7 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeF
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
+import { openCodeV2EngineVersion, openCodeV2LaunchRefusal } from '../compatibility/OpenCodeV2Registry.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import * as profiles from '../OpenCodeProfileManager.js'
@@ -720,7 +720,7 @@ function countLaunches() {
   return counter
 }
 
-test.skipIf(!posix)('an owner-retired unsubmitted probe settles with the owner cause; without a fresh request only one replacement starts', async () => {
+test.skipIf(!posix || openCodeV2LaunchRefusal('2.1.4') !== null)('an owner-retired unsubmitted probe settles with the owner cause; without a fresh request only one replacement starts', async () => {
   const f = await originalProbe(false)
   const runDirectory = await retiredOwner(f.dataRoot, f.binding)
   const counter = countLaunches()
@@ -756,7 +756,7 @@ test.skipIf(!posix)('an owner-retired unsubmitted probe settles with the owner c
     submitted: false, failure: null, automaticReplacementUsed: true })
 }, 180_000)
 
-test.skipIf(!posix)('a submitted probe whose owner retired is never settled as unsubmitted or replaced', async () => {
+test.skipIf(!posix || openCodeV2LaunchRefusal('2.1.4') !== null)('a submitted probe whose owner retired is never settled as unsubmitted or replaced', async () => {
   const f = await originalProbe(true)
   await retiredOwner(f.dataRoot, f.binding)
   const counter = countLaunches()
@@ -798,7 +798,7 @@ test.skipIf(!posix)('an unsubmitted probe with a live starting owner stays pendi
   } finally { await control.close() }
 }, 90_000)
 
-test.skipIf(!posix)('a fresh request keeps its own settled owner failure while another request or Connect readback never replays it', async () => {
+test.skipIf(!posix || openCodeV2LaunchRefusal('2.1.4') !== null)('a fresh request keeps its own settled owner failure while another request or Connect readback never replays it', async () => {
   const f = await originalProbe(false, { freshExecutionProofRequestId: 'TEST-fresh-A' })
   await claimOpenCodeV2FreshProofRequest(path.dirname(f.file), f.sourceKey, 'TEST-fresh-A')
   await retiredOwner(f.dataRoot, f.binding)

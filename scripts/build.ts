@@ -27,6 +27,13 @@ const compile = args.includes('--compile')
 const dev = args.includes('--dev')
 const compileTarget = process.env.BUN_COMPILE_TARGET?.trim() || 'bun'
 const supportDelivery = args.includes('--opencode-v2-support')
+// Package-runtime already stages the helper; standalone source/dev/compiled
+// builds must not depend on a prior package-runtime invocation.
+if (process.platform === 'linux' && !supportDelivery && !args.includes('--base-delivery') && !args.includes('--packaged-delivery')) {
+  const staged = Bun.spawnSync({ cmd: [process.execPath, '--no-install', './scripts/stage-opencode-custody.mts'],
+    stdout: 'inherit', stderr: 'inherit' })
+  if (staged.exitCode !== 0) throw new Error('Linux native custody staging failed')
+}
 const defaultBaseDelivery = !compile && !supportDelivery && !args.includes('--base-delivery')
 const baseDelivery = args.includes('--base-delivery') || defaultBaseDelivery
 const portablePlatform = args.find(arg => arg.startsWith('--release-platform='))?.slice('--release-platform='.length) ??

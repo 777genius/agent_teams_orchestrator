@@ -9,7 +9,7 @@ test.skipIf(process.platform === 'win32')('blank and stale overrides retain the 
  try {
   const binary=path.join(root,'opencode');await writeFile(binary,`#!${process.execPath}\nconsole.log("1.18.34")\n`);await chmod(binary,0o700);
   process.env.OPENCODE_BIN_PATH=binary;
-  for(const override of ['',path.join(root,'missing')]){process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH=override;expect(selectedOpenCodeReadPath()).toBe(binary);const selected=await inspectOpenCodeReadSelection();expect(selected.path).toBe(binary);expect(selected.policy).toEqual({generation:'v1',version:'1.18.34'});expect(selected.native).toBeNull()}
+  for(const override of ['',path.join(root,'missing')]){process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH=override;expect(await selectedOpenCodeReadPath()).toBe(binary);const selected=await inspectOpenCodeReadSelection();expect(selected.path).toBe(binary);expect(selected.policy).toEqual({generation:'v1',version:'1.18.34'});expect(selected.native).toBeNull()}
  }finally{process.env=env;await rm(root,{recursive:true,force:true})}
 })
 
@@ -33,9 +33,9 @@ test.skipIf(process.platform === 'win32')('valid primary override ignores a lowe
  try {
   const binary=path.join(root,'opencode');await writeFile(binary,`#!${process.execPath}\nconsole.log("1.18.34")\n`);await chmod(binary,0o700);
   process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH=binary;process.env.OPENCODE_BIN_PATH='relative/unused-opencode';
-  expect(selectedOpenCodeReadPath()).toBe(binary);
+  expect(await selectedOpenCodeReadPath()).toBe(binary);
   const selection=await inspectOpenCodeReadSelection();expect(selection.path).toBe(binary);expect(selection.policy).toEqual({generation:'v1',version:'1.18.34'});
   process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH=path.join(root,'missing');
-  expect(()=>selectedOpenCodeReadPath()).toThrow('identity_mismatch');
+  await expect(selectedOpenCodeReadPath()).rejects.toThrow('identity_mismatch');
  } finally {process.env=env;await rm(root,{recursive:true,force:true})}
 })
