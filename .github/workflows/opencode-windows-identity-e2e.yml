@@ -58,6 +58,7 @@ jobs:
         shell: pwsh
         env:
           PLATFORM: ${{ matrix.platform }}
+          RUNTIME_OPENCODE_V2: bundled
         run: |
           bun install --frozen-lockfile --linker hoisted
           if ($LASTEXITCODE -ne 0) { throw 'Dependency install failed' }
