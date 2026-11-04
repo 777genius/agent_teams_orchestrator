@@ -6,7 +6,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { privateOpenCodeReadEnvironment } from '../profile/OpenCodeV2ManagedConfig.js'
 import { boundOpenCodeRead } from './OpenCodeBoundedFetch.js'
-import { openCodeV2Wire } from '../compatibility/OpenCodeV2Registry.js'
+import { openCodeV2LaunchRefusal, openCodeV2Wire } from '../compatibility/OpenCodeV2Registry.js'
 import { OpenCodeV2ExecutionFetch, ExecutionTransportFailure, executionWasNotSubmitted, executionSessionIsMissing } from './OpenCodeV2ExecutionFetch.js'
 
 // Retired wire dialects remain identifiable for historical reads, but no new transport can acquire them.
@@ -22,9 +22,13 @@ test('historical V2 wire identification does not re-admit retired engines', () =
   }
 })
 
+// No version is launch-qualified on some platforms. Historical refusal stays tested,
+// while real transport behavior runs only with an admitted engine.
+const qualifiedTest = openCodeV2LaunchRefusal('2.1.4') === null ? test : test.skip
+
 // These fail if loss triggers a replay, deadlines stop at headers, cleanup does
 // not cancel real response bodies, or a truncated SSE/foreign location is used.
-test('response loss retains one admission, original readback and actual socket cancellation', async () => {
+qualifiedTest('response loss retains one admission, original readback and actual socket cancellation', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-execution-node-peer-'))
   await Promise.all(['home', 'tmp', 'config', 'data', 'cache', 'state', 'appdata', 'localappdata'].map(name => mkdir(path.join(root, name))))
   const fixture = fileURLToPath(new URL('./OpenCodeV2ExecutionPeer.ts', import.meta.url))
@@ -111,7 +115,7 @@ test('response loss retains one admission, original readback and actual socket c
   }
 }, 20_000)
 
-test('forbidden mutation and exhausted context prove non-submission without physical requests', async () => {
+qualifiedTest('forbidden mutation and exhausted context prove non-submission without physical requests', async () => {
   let requests = 0
   const wire = new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', '2.1.4', '/TEST', 'TEST',
     { deadline: Date.now() + 1000 }, async () => { requests++; return Response.json({}) })
@@ -124,7 +128,7 @@ test('forbidden mutation and exhausted context prove non-submission without phys
 
 // A non-byte response must be rejected before byte accounting, while preserving
 // mutation uncertainty and cancelling/releasing the actual body reader.
-test('non-byte mutation response retains uncertainty and cancels its reader', async () => {
+qualifiedTest('non-byte mutation response retains uncertainty and cancels its reader', async () => {
   let requests = 0, cancellations = 0
   let signal: AbortSignal | undefined
   const body = new ReadableStream<string>({
@@ -152,7 +156,7 @@ test('non-byte mutation response retains uncertainty and cancels its reader', as
 
 // Neither a 404 status nor a public error-shaped object proves absence. Only a
 // completely consumed, validated native error for this exact GET can do so.
-test('session absence requires complete exact native 404 for qualified current wire', async () => {
+qualifiedTest('session absence requires complete exact native 404 for qualified current wire', async () => {
   const native = { _tag: 'SessionNotFoundError', sessionID: 'ses_original', message: 'private native detail' }
   const json = JSON.stringify(native)
   const cases = [
@@ -199,7 +203,7 @@ test('session absence requires complete exact native 404 for qualified current w
   expect(executionSessionIsMissing(new ExecutionTransportFailure('session_missing', 'unknown'), 'ses_original')).toBe(false)
 })
 
-test('qualified current wire config readback cannot widen filesystem or mutation authority', async () => {
+qualifiedTest('qualified current wire config readback cannot widen filesystem or mutation authority', async () => {
   let invoked = 0
   const wire = new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', '2.1.4', '/TEST/project', 'TEST',
     { deadline: Date.now() + 1000 }, async () => { invoked++; return Response.json([]) })
@@ -218,7 +222,7 @@ test('qualified current wire config readback cannot widen filesystem or mutation
 })
 
 // Advance only the wire's timers; no real wait or native/provider operation.
-test('location startup read shares owner budget; cancellation and other request caps retain uncertainty', async () => {
+qualifiedTest('location startup read shares owner budget; cancellation and other request caps retain uncertainty', async () => {
   const realNow = Date.now, realSetTimeout = globalThis.setTimeout, realClearTimeout = globalThis.clearTimeout
   let now = 1000, nextTimer = 0
   const timers = new Map<number, { at: number; run: () => void }>()
