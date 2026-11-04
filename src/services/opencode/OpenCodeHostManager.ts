@@ -2410,6 +2410,7 @@ export class OpenCodeHostManager {
           profileRootKey: entry.handle.profileRootKey,
           projectPath: entry.handle.projectPath,
           projectBehaviorFingerprint: entry.handle.projectBehaviorFingerprint,
+          managedConfigFingerprint: entry.handle.profile.managedConfigFingerprint,
           baseUrl: entry.handle.baseUrl,
           port: entry.handle.port,
           pid: entry.handle.pid,

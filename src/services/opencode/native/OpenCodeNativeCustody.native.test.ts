@@ -196,6 +196,21 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
       active.delete(custody)
       expect((await readNativeAuthority(nativeAuthorityPath(profileRoot, host.hostKey))).phase).toBe('dead')
       await manager.drainPendingLifecycleCleanups()
+      // A process-lifetime host has no persistent registry entry. Its fallback
+      // disposal authority must still carry the exact prepared config fingerprint.
+      const direct = await manager.ensureHost({ hostKey: 'TEST-native-process-direct', preparedProfile: prepared,
+        hostLifetime: 'process', resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false })
+      const directCustody = nativeCustodyForEndpoint(direct.baseUrl); active.add(directCustody); epochs.add(directCustody)
+      expect(await manager.disposeHost(direct.hostKey)).toBe(true)
+      active.delete(directCustody)
+      expect((await readNativeAuthority(nativeAuthorityPath(profileRoot, direct.hostKey))).phase).toBe('dead')
+      const automatic = await manager.ensureHost({ hostKey: 'TEST-native-process-automatic', preparedProfile: prepared,
+        hostLifetime: 'process', resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false })
+      const automaticCustody = nativeCustodyForEndpoint(automatic.baseUrl); active.add(automaticCustody); epochs.add(automaticCustody)
+      expect(await manager.disposeUnregisteredOwnedHosts()).toEqual({ disposed: 1, kept: 0, diagnostics: [] })
+      active.delete(automaticCustody)
+      expect((await readNativeAuthority(nativeAuthorityPath(profileRoot, automatic.hostKey))).phase).toBe('dead')
+      await manager.drainPendingLifecycleCleanups()
     } catch (error) { preserve = true; throw error }
     finally { for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value } }
   }, 30000)
