@@ -15,6 +15,24 @@ test('legacy provider fixture native-selection mock is isolated from real identi
   assert.match(workflow, /- name: Test provider identity, inventory, labels and HTTP deadlines\n\s+run: bun test src\/services\/opencode\/OpenCodeProviderIdentity\.test\.ts/)
 })
 
+test('post-merge reuse keeps the required check and cannot leak into unqualified jobs', () => {
+  const workflow = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8')
+  const job = (name: string) => {
+    const start = workflow.indexOf(`\n  ${name}:\n`)
+    assert.ok(start >= 0, name)
+    const text = workflow.slice(start + 1)
+    return text.split(/\n  [a-z][a-z-]*:\n/, 2)[0]
+  }
+  assert.match(job('scope'), /reuse: \$\{\{ steps\.reuse\.outputs\.reuse \}\}/)
+  for (const name of ['cursor-managed-plugin', 'task-change-ledger', 'windows-packaged-backfill',
+    'opencode-authority', 'opencode-conformance', 'packaged-delivery', 'opencode-v2-linux',
+    'opencode-v2-desktop-lifecycle', 'opencode-native-custody']) {
+    assert.match(job(name), /needs\.scope\.outputs\.reuse != 'true'/, name)
+  }
+  assert.match(job('post-merge-smoke'), /needs\.scope\.outputs\.reuse == 'true'/)
+  assert.match(job('required'), /needs: \[scope, post-merge-smoke,/)
+})
+
 test('routine source and documentation keep Linux coverage without native jobs', () => {
   for (const path of ['src/components/Button.tsx', 'src/utils/processUserInput/processTextPrompt.ts', 'src/services/opencode/OpenCodeLogProjector.ts', 'src/services/opencode/OpenCodeModelRef.ts', 'docs/guide.md', 'src/features/runtimeProviderManagement/ui/ProviderManagementDialog.tsx']) {
     const decision = classify([path])
