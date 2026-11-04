@@ -6,7 +6,7 @@ import {
   resolveOpenCodeV2EngineVersion, openCodeV2EngineVersion,
   assertOpenCodeV2Launchable, classifyOpenCodeV2Version, isOpenCodeV2Identity, openCodeV2Dialect,
   openCodeV2GraphPackages, openCodeV2LaunchRefusal, openCodeV2Qualification, openCodeV2QualifiedVersions,
-  openCodeV2ReleaseContract, openCodeV2StagedVersions, openCodeV2Wire, parseOpenCodeV2GraphAlias, type OpenCodeV2Pin,
+  openCodeV2ReleaseContract, openCodeV2StagedVersions, openCodeV2Wire, isOpenCodeV2ReadableEngine, parseOpenCodeV2GraphAlias, type OpenCodeV2Pin,
 } from './OpenCodeV2Registry.js'
 import { validateRunLaunchPlan } from '../bridge/OpenCodeV2RunOwner.js'
 import type { RunLaunchPlan } from '../bridge/OpenCodeV2RunTypes.js'
@@ -158,4 +158,11 @@ test('persisted run plans retain their original engine across a newer default wi
   expect(openCodeV2EngineVersion(retained.members[0]!.native)).toBe('2.0.32')
   Object.assign(retained.members[0]!.native, { engineVersion: '2.0.40', dialect: 'v2-2.0.40' })
   expect(() => validateRunLaunchPlan(retained)).toThrow('opencode_v2_version_unqualified')
+})
+
+test('historical V2 read compatibility never requalifies retired engines for launch', () => {
+  for (const version of ['2.0.0', '2.0.32', '2.1.4']) expect(isOpenCodeV2ReadableEngine(version)).toBe(true)
+  for (const version of ['2.0.99', '2.1.0', '3.0.0', '2.1.4-rc.1']) expect(isOpenCodeV2ReadableEngine(version)).toBe(false)
+  for (const retired of ['2.0.0', '2.0.32'])
+    expect(openCodeV2LaunchRefusal(retired, 'linux-x64')).toBe('opencode_v2_version_unqualified')
 })

@@ -3,7 +3,7 @@ import { isSuccessfulGroupCatalogResult } from '../OpenCodeCompletedNonResponse.
 import type { ControllerInboxBinding, ControllerInboxProof } from '../bridge/OpenCodeV2ControllerTools.js'
 import type { ExecutionLog, ExecutionLogEvent, ExecutionMessagePage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { canonicalExecutionJSON } from './OpenCodeV2ExecutionContracts.js'
-import { openCodeV2LaunchRefusal, openCodeV2Wire, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
+import { isOpenCodeV2ReadableEngine, openCodeV2Wire, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 
 export type OpenCodeV2ToolEffect = Readonly<{
   assistantMessageId: string; toolCallId: string; toolName: string
@@ -90,7 +90,8 @@ export function projectOpenCodeV2Turn(input: OpenCodeV2TurnCut): OpenCodeV2TurnP
   const unknown = (reason: string) => empty('unknown', reason)
   if (input.messages.previous !== null || input.messages.next !== null || input.log.synced !== true)
     return unknown('incomplete_native_cut')
-  if (openCodeV2LaunchRefusal(input.pin) !== null) return unknown('unqualified_projection_pin')
+  // Historical native lineage can be projected without readmitting its engine to a new run.
+  if (!isOpenCodeV2ReadableEngine(input.pin)) return unknown('unqualified_projection_pin')
   const events = input.log.events
   if (events.length > 4096 || input.messages.data.length > 1600 ||
       new Set(input.messages.data.map(message => message.id)).size !== input.messages.data.length)
