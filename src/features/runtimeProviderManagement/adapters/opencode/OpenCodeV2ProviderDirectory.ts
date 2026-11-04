@@ -1,5 +1,5 @@
 import type { OpenCodeInventorySnapshot } from '../../../../services/opencode/types.js'
-import { openCodeV2KeyIntegration } from '../../../../services/opencode/catalog/OpenCodeV2KeyIntegrations.js'
+import { isOpenCodeV1OnlyProviderId, openCodeV2KeyIntegration } from '../../../../services/opencode/catalog/OpenCodeV2KeyIntegrations.js'
 import { isRecommendedProvider } from '../../domain/providerOrdering.js'
 import type { ProviderActionDescriptor, ProviderDirectoryEntry } from '../../domain/types.js'
 
@@ -19,7 +19,7 @@ export function buildOpenCodeV2ProviderDirectoryEntries(inventory: OpenCodeInven
   const connected = new Set(inventory.connectedProviders.map(row => row.id))
   const providerIds = new Set([
     ...integrations.keys(), ...providers.keys(), ...inventory.availableProviders, ...connected,
-  ])
+  ].filter(providerId => !isOpenCodeV1OnlyProviderId(providerId)))
   const modelIdsByProviderId: Record<string, string[]> = Object.create(null)
   for (const model of read?.models ?? []) {
     (modelIdsByProviderId[model.providerId] ??= []).push(`${model.providerId}/${model.catalogId}`)

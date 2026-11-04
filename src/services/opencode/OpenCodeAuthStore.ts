@@ -1308,6 +1308,24 @@ export async function upsertOpenCodeApiAuth(
   })
 }
 
+/** Conditionally restore an app-managed credential after owned V2 rollback.
+ * The compare and write share the same auth-store coordination lock. */
+export async function restoreOpenCodeAuthCredentialIfUnchanged(input: {
+  authPath: string; providerId: string;
+  expected: OpenCodeAuthCredential | null; restore: OpenCodeAuthCredential | null;
+}): Promise<void> {
+  const providerId = normalizeProviderId(input.providerId)
+  if (!providerId) throw new Error('OpenCode provider id is invalid')
+  await withAuthStoreWriteLock(input.authPath, async () => {
+    const store = await readOpenCodeAuthStore(input.authPath)
+    if (!isDeepStrictEqual(store[providerId] ?? null, input.expected))
+      throw new Error('provider_rollback_publication_changed')
+    if (input.restore === null) delete store[providerId]
+    else store[providerId] = { ...input.restore }
+    await writeOpenCodeAuthStore(input.authPath, store)
+  })
+}
+
 export async function removeOpenCodeAuthCredential(input: {
   authPath: string
   providerId: string

@@ -116,6 +116,20 @@ test('full V2 status revalidates only owned current-model proof and never execut
       assert.equal(status.authenticated, false); assert.equal(status.capabilities.teamLaunch, false)
       assert.equal(status.capabilities.oneShot, false); assert.equal(status.modelCatalog.defaultLaunchModel, null)
       assert.equal(resolutions, 1); cases++
+      // Even a valid signed team-lifetime proof at an ordinary hint cannot
+      // extend passive status's 120s policy or begin source/native work.
+      const longProof = await buildOpenCodeExecutionProof({ selectedModel: proof.modelId,
+        capabilitySnapshotId: selected.capabilitySnapshotId, unattendedTeam: true,
+        snapshot: { profile, projectPath: project, hostHealthy: true,
+          host: { version: native.version, resolvedConfigFingerprint: 'f'.repeat(64) } } }, {
+        readCredential: async () => null, resolveBinaryPath: () => native.executablePath,
+        resolveBinaryIdentity: async () => 'a'.repeat(64),
+      })
+      await save({ ...record, proof: longProof })
+      const beforeLongInspections = inspections, beforeLongResolutions = resolutions
+      assert.equal(await readOpenCodeV2StatusProof(inventory), null)
+      assert.equal(inspections, beforeLongInspections); assert.equal(resolutions, beforeLongResolutions)
+      await save(record); cases++
       await resolveOriginal(unattendedEnvelope, unattendedSelected, true, { unattendedTeam: true })
       assert.equal((await readOpenCodeV2StatusProof(inventory)).proofHash, proof.proofHash,
         'A later team preflight must preserve the ordinary Test discovery hint')
@@ -233,5 +247,5 @@ test('full V2 status revalidates only owned current-model proof and never execut
       NODE_ENV: 'test', OPENCODE_DISABLE_MODELS_FETCH: '1', OPENCODE_DISABLE_AUTOUPDATE: '1' } })
   const [exit, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
   expect({ exit, stderr }).toEqual({ exit: 0, stderr: '' })
-  expect(JSON.parse(stdout)).toEqual({ cases: 22, inspections: 10, resolutions: 8, fixtureRemoved: true })
+  expect(JSON.parse(stdout)).toEqual({ cases: 23, inspections: 10, resolutions: 8, fixtureRemoved: true })
 }, 30_000)

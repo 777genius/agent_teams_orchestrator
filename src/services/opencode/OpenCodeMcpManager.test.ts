@@ -701,6 +701,33 @@ describe('OpenCodeMcpManager', () => {
     expect(JSON.stringify(first.summary)).not.toContain(oldAuthorization)
   })
 
+  test('reattaches the existing remote MCP without retaining a removed Authorization header', async () => {
+    const oldAuthorization = `Bearer ${'s'.repeat(48)}`
+    const url = 'http://127.0.0.1:41001/mcp'
+    let current: Record<string, Record<string, unknown>> = {
+      'agent-teams': { connected: true, type: 'remote', url, headers: { Authorization: oldAuthorization } },
+    }
+    const calls: unknown[] = []
+    const manager = new OpenCodeMcpManager({ env: {
+      CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL: url,
+    }, clientFactory: { create: () => ({
+      getMcp: async () => current,
+      getConfig: async () => ({ mcp: current }),
+      addMcp: async (_name, config) => {
+        calls.push(config.headers)
+        current = { 'agent-teams': { ...config, connected: true } }
+        return current
+      },
+    }) } })
+    const first = await manager.ensureAppMcp({ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true })
+    const second = await manager.ensureAppMcp({ baseUrl: 'http://127.0.0.1:4096', attachIfMissing: true })
+    expect(calls).toEqual([undefined])
+    expect(current['agent-teams']?.headers).toBeUndefined()
+    expect(first.summary.status).toBe('attached')
+    expect(second.summary.status).toBe('present')
+    expect(JSON.stringify(first.summary)).not.toContain(oldAuthorization)
+  })
+
   test('serializes concurrent credential rotation without deduping the new generation', async () => {
     const oldAuthorization = `Bearer ${'a'.repeat(48)}`
     const newAuthorization = `Bearer ${'b'.repeat(48)}`

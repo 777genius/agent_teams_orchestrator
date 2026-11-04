@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, mock, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
 import { EventEmitter } from 'node:events'
@@ -7,7 +7,24 @@ import type { ChildProcess } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
 
-import { OpenCodeProviderManagementAdapter } from './OpenCodeProviderManagementAdapter.js'
+// Run this suite alone: Bun mock.module can modify native-selection re-export
+// bindings within a process. The CI policy test enforces process isolation.
+// These legacy adapter fixtures supply their own inventory, auth and host doubles.
+// Their OpenCode CLI selection is a *valid selected V1*, not a missing binary.
+// The actual native-generation fail-closed boundary is exercised separately in
+// OpenCodeProviderManagementAdapter.v2-routing.test.ts (isolated test process).
+// Do not weaken production generation admission for these test-only stubs.
+const v2ProviderModule = await import('./OpenCodeV2ProviderManagement.js')
+mock.module('./OpenCodeV2ProviderManagement.js', () => ({
+  ...v2ProviderModule,
+  inspectOpenCodeReadSelection: async () => ({
+    path: '/TEST/opencode-v1',
+    policy: { generation: 'v1' as const, version: '1.19.5' },
+    native: null,
+    fingerprint: 'TEST-SELECTED-V1',
+  }),
+}))
+const { OpenCodeProviderManagementAdapter } = await import('./OpenCodeProviderManagementAdapter.js')
 import { planOpenCodeProfilePolicy } from '../../../../services/opencode/OpenCodeProfilePolicy.js'
 import { OpenCodeHostManager } from '../../../../services/opencode/OpenCodeHostManager.js'
 import { readCapturedOpenCodeBinaryPath } from '../../../../services/opencode/OpenCodeBinaryResolver.js'
@@ -330,7 +347,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const originalBinaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
     const originalFallbackPath = process.env.OPENCODE_BIN_PATH
     process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = process.execPath
-    // A stalled first probe has no completed binary selection, even with a configured CLI.
+    // No completed selection may be adopted from the unprobed fallback CLI.
     process.env.OPENCODE_BIN_PATH = `TEST-inventory-timeout-${randomUUID()}`
     let ensureHostCalled = false
     const probeOptions: Array<{
@@ -2058,6 +2075,33 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const paged = await adapter.loadDirectory({ ...input, limit: 2 })
     expect(paged.ok && paged.value.returnedCount).toBe(2)
     expect(paged.ok && paged.value.totalCount).toBe(result.value.totalCount)
+  })
+
+  test('V2 summary offers native Kimi integrations and excludes V1-only IDs without starting a host', async () => {
+    for (const generation of ['v1', 'v2'] as const) {
+      const adapter = new OpenCodeProviderManagementAdapter({
+        inventoryService: { probe: async () => inventory({ readGeneration: generation,
+          availableProviders: ['kimi-code-plan-global', 'kimi-code-plan-cn'],
+          connectedProviders: [{ id: 'kimi-for-coding', source: 'credentials', authHint: 'api' }],
+          models: [], modelMetadata: [] }) },
+        hostManager: { ensureHost: async () => { throw Error('TEST summary must not start a host') }, releaseHost: async () => {} },
+        clientFactory: { create: () => { throw Error('TEST summary must not read a live catalog') } },
+      })
+      const result = await adapter.loadDirectory({ runtimeId: 'opencode', summary: true, limit: 100 })
+      expect(result.ok).toBe(true)
+      if (!result.ok) continue
+      const entry = (id: string) => result.value.entries.find(value => value.providerId === id)
+      if (generation === 'v2') {
+        for (const [id, name] of [['kimi-code-plan-global', 'Kimi For Coding (kimi.ai)'], ['kimi-code-plan-cn', 'Kimi For Coding (kimi.com)']]) {
+          expect(entry(id)).toMatchObject({ displayName: name, state: 'not-connected', authMethods: ['api'], setupKind: 'connect-api-key' })
+        }
+        for (const id of ['kimi-for-coding', 'kiro', 'cursor-acp']) expect(entry(id)).toBeUndefined()
+      } else {
+        expect(entry('kimi-for-coding')).toMatchObject({ state: 'connected' })
+        expect(entry('kimi-code-plan-global')).toBeUndefined()
+        expect(entry('kiro')).toBeDefined()
+      }
+    }
   })
 
   test('allows slow summary profile preparation without starting a host or losing connections', async () => {

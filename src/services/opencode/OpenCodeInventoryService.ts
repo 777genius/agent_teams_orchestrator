@@ -1194,17 +1194,22 @@ export class OpenCodeInventoryService {
         if (this.v2CatalogReads.get(cacheKey) === readToken) this.v2CatalogReads.delete(cacheKey)
       }
     }
-    if (selection.path && selection.policy.generation !== 'v1') {
+    if (selection.policy.generation !== 'v1') {
+      // No selected executable is also an unsupported generation: do not enter
+      // V1 profile preparation, plugin prewarming or host discovery on absence.
       // Passive V2 reads still list the native key integrations and their completed connections.
       const v2 = selection.policy.generation === 'v2' ? selection.policy.version : null
       let connectedProviders: OpenCodeInventorySnapshot['connectedProviders'] = []
       if (v2) { try { connectedProviders = await readOpenCodeV2ConnectedProviders(resolvedProjectPath, v2) } catch { /* unknown is not connected */ } }
       return {
-        detected: true, binaryPath: selection.path, version: selection.policy.version, projectPath: resolvedProjectPath,
+        detected: selection.path !== null, binaryPath: selection.path, version: selection.policy.version, projectPath: resolvedProjectPath,
         profile: null, connectedProviders, availableProviders: v2 ? openCodeV2KeyIntegrations(v2).map(entry => entry.providerId) : [],
         models: [], agents: [], authStorePath: null,
-        probeError: 'This selected generation requires an explicit qualified V2 full catalog read.',
-        diagnostics: ['capabilities_pending'], readGeneration: selection.policy.generation,
+        probeError: selection.path
+          ? 'This selected generation requires an explicit qualified V2 full catalog read.'
+          : null,
+        diagnostics: [selection.path ? 'capabilities_pending' : 'OpenCode CLI not detected on PATH'],
+        readGeneration: selection.policy.generation,
       }
     }
     // Preserve the selected V2 full read above; only V1 settings avoids CLI sweeps.

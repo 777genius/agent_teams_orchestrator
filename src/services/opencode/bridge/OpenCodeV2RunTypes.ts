@@ -36,7 +36,7 @@ export type RunQualification = Readonly<{ capabilitySnapshotId: string | null; e
 export type RunLaunchPlan = Readonly<{
   qualification?: RunQualification
   dataRoot: string; binding: RunBinding; deadline: number; members: readonly RunMemberPlan[]
-  executionProbe?: Readonly<{ memberId: string; intent: QueueIntent; expectedText: string; prepared: OpenCodePreparedProfile; capabilitySnapshotId: string }>
+  executionProbe?: Readonly<{ memberId: string; intent: QueueIntent; expectedText: string; prepared: OpenCodePreparedProfile; capabilitySnapshotId: string; unattendedTeam?: boolean }>
   source: Readonly<{ entryPath: string; entrySha256: string; bunPath: string; bunSha256: string
     files: readonly Readonly<{ path: string; sha256: string }>[]; env: Readonly<Record<string, string>>; delivery?: OpenCodeV2DeliveryBinding }>
 }>
@@ -64,7 +64,7 @@ export type RunMemberStatus = Readonly<{
   controllerTools?: ControllerToolProof
 }>
 export type RunStopMember = Readonly<{ memberId: string; cleanup: ExecutionCleanupReceipt | null; errors: readonly string[] }>
-export type RunProbeFailure = 'native_execution_failed' | 'native_execution_cancelled'
+export type RunProbeFailure = 'native_execution_failed' | 'native_execution_cancelled' | 'provider_free_quota_exhausted'
 /** Closed facts of an owner's own initialization failure: a fixed category and the
  * provider wire stage. Never a message, body, path or credential. */
 export type RunOwnerFailure = Readonly<{ category: OpenCodeV2ProviderFailureCategory; operation?: OpenCodeV2ProviderWireFailure }>

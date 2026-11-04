@@ -1824,10 +1824,16 @@ function getOpenCodeConfigImportPaths(env: NodeJS.ProcessEnv): string[] {
 
 async function readSafeOpenCodeRuntimeConfigFile(
   filePath: string,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
+  if (signal?.aborted) throwOpenCodeAbortReason(signal)
   try {
-    return pickSafeOpenCodeRuntimeConfig(safeParseJSONC(await readFile(filePath, 'utf8')))
+    // A blocked OS read may ignore readFile's signal until it returns. Race only
+    // this pure read, never the scope resolution that publishes its snapshot.
+    const content = await raceOpenCodeAbortSignal(readFile(filePath, { encoding: 'utf8', signal }), signal)
+    return pickSafeOpenCodeRuntimeConfig(safeParseJSONC(content))
   } catch (error) {
+    if (signal?.aborted) throwOpenCodeAbortReason(signal)
     if (getErrnoCode(error) === 'ENOENT' || getErrnoCode(error) === 'ENOTDIR') {
       return {}
     }
@@ -1837,10 +1843,11 @@ async function readSafeOpenCodeRuntimeConfigFile(
 
 async function readSafeOpenCodeRuntimeConfigImport(
   env: NodeJS.ProcessEnv,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   let importedConfig: Record<string, unknown> = {}
   const importedFiles = await Promise.all(
-    getOpenCodeConfigImportPaths(env).map(readSafeOpenCodeRuntimeConfigFile),
+    getOpenCodeConfigImportPaths(env).map(filePath => readSafeOpenCodeRuntimeConfigFile(filePath, signal)),
   )
   for (const importedFile of importedFiles) {
     importedConfig = deepMergeOpenCodeConfig(
@@ -1857,11 +1864,11 @@ async function readSafeOpenCodeRuntimeConfigImport(
   return importedConfig
 }
 
-async function readProjectOpenCodeRuntimeConfig(projectPath: string): Promise<Record<string, unknown>> {
+async function readProjectOpenCodeRuntimeConfig(projectPath: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
   let config: Record<string, unknown> = {}
   const configs = await Promise.all(
     ['opencode.json', 'opencode.jsonc'].map(name =>
-      readSafeOpenCodeRuntimeConfigFile(path.join(projectPath, name))),
+      readSafeOpenCodeRuntimeConfigFile(path.join(projectPath, name), signal)),
   )
   for (const projectConfig of configs) {
     config = deepMergeOpenCodeConfig(
@@ -2404,6 +2411,20 @@ function scopeSourceEnvironment(inputEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv 
   return envSnapshot
 }
 
+/** The same V1 native credential sources for scoped profile reads and V2
+ * compatibility admission. Scoped env overrides are applied consistently. */
+export function resolveOpenCodeUserAuthSourcePaths(
+  inputEnv: NodeJS.ProcessEnv = process.env, homeOverride?: string,
+): string[] {
+  const env = scopeSourceEnvironment(inputEnv)
+  const home = homeOverride ?? (env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir())
+  const xdgDataHome = env.XDG_DATA_HOME?.trim() || path.join(home, '.local', 'share')
+  return Array.from(new Set([
+    path.join(xdgDataHome, 'opencode', 'auth.json'),
+    path.join(home, '.local', 'share', 'opencode', 'auth.json'),
+  ]))
+}
+
 export async function resolveOpenCodeProfileScope(input: OpenCodeScopeResolutionInput): Promise<OpenCodeProfileScope> {
   if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   await recoverOpenCodeScopedOAuth(input)
@@ -2623,8 +2644,8 @@ async function resolveOpenCodeProfileScopeInternal(
   }
   const imported = env[OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]
     ? pickSafeOpenCodeRuntimeConfig(safeParseJSONC(env[OPEN_CODE_SCOPE_CONFIG_CONTENT_ENV]))
-    : await readSafeOpenCodeRuntimeConfigImport(env)
-  const project = await readProjectOpenCodeRuntimeConfig(projectPath)
+    : await readSafeOpenCodeRuntimeConfigImport(env, input.abortSignal)
+  const project = await readProjectOpenCodeRuntimeConfig(projectPath, input.abortSignal)
   const mergedRuntimeConfig = deepMergeOpenCodeConfig(imported, project)
   await snapshotOpenCodeGatewayCredential(mergedRuntimeConfig, providerId, env)
   const importedRuntimeConfig = input.purpose === 'catalog' || input.purpose === 'launch_runtime'
@@ -3072,20 +3093,9 @@ export class OpenCodeProfileManager {
     return resolveClaudeMultimodelPaths()
   }
 
-  private getSourceAuthPaths(
-    env: NodeJS.ProcessEnv = process.env,
-    homePath = env.HOME?.trim() || env.USERPROFILE?.trim() || os.homedir(),
-  ): string[] {
-    const xdgDataHome =
-      env.XDG_DATA_HOME?.trim() || path.join(homePath, '.local', 'share')
-    return Array.from(new Set([
-      path.join(xdgDataHome, 'opencode', 'auth.json'),
-      // Bridge/live-test processes can intentionally set XDG_DATA_HOME to an
-      // isolated runtime directory. Always include the canonical user OpenCode
-      // auth store as the highest-priority source so a fresh `opencode auth`
-      // login can override stale app-global OAuth credentials.
-      path.join(homePath, '.local', 'share', 'opencode', 'auth.json'),
-    ]))
+  private getSourceAuthPaths(env: NodeJS.ProcessEnv = process.env): string[] {
+    // Apply persisted scoped HOME before choosing a V1 credential source.
+    return resolveOpenCodeUserAuthSourcePaths(env)
   }
 
   getGlobalAuthPath(dataPath = this.paths.data): string {
@@ -3405,7 +3415,6 @@ export class OpenCodeProfileManager {
     const snapshot = openCodeEffectiveConfigSnapshots.get(policy.scope.scopeToken)
     const managedPaths = snapshot?.managedPaths ?? this.paths
     const runtimeEnv = snapshot?.runtimeEnv ?? process.env
-    const snapshotHome = runtimeEnv.HOME?.trim() || runtimeEnv.USERPROFILE?.trim() || os.homedir()
     const profileRootKey = buildScopedProfileRootKey(projectPath, policy.scope)
     const managedAuthPath = path.join(
       managedPaths.data,
@@ -3418,7 +3427,7 @@ export class OpenCodeProfileManager {
     )
     const sourcePaths = Array.from(new Set([
       this.getGlobalAuthPath(managedPaths.data),
-      ...this.getSourceAuthPaths(runtimeEnv, snapshotHome),
+      ...this.getSourceAuthPaths(runtimeEnv),
     ]))
     const [source, managed, preferences] = await Promise.all([
       readSelectedAuthFromSources({
@@ -3541,7 +3550,6 @@ export class OpenCodeProfileManager {
     if (configSnapshot && attachmentRoot !== (runtimeEnv.CLAUDE_AGENT_TEAMS_ATTACHMENT_ROOT ?? null)) {
       throw new Error('OpenCode scoped profile canonical attachment root changed')
     }
-    const snapshotHome = runtimeEnv.HOME?.trim() || runtimeEnv.USERPROFILE?.trim() || os.homedir()
     // Verified staging is the only switch that turns on the managed Cursor path.
     // Anything unavailable keeps the upstream plugin and today's launch behaviour.
     const wantsCursorManagedAssets = options.profileScope
@@ -3719,7 +3727,7 @@ export class OpenCodeProfileManager {
     const globalAuthPath = this.getGlobalAuthPath(managedPaths.data)
     enterStep('fingerprint auth sources')
     const sourceAuthSources = await Promise.all(
-      this.getSourceAuthPaths(runtimeEnv, snapshotHome).map(async sourceAuthPath => {
+      this.getSourceAuthPaths(runtimeEnv).map(async sourceAuthPath => {
         const exists = await fileExists(sourceAuthPath)
         return {
           path: sourceAuthPath,
@@ -4013,7 +4021,8 @@ export async function readOpenCodeSelectedScopeMetadata(scope: OpenCodeProfileSc
 
 /** Exact catalog snapshot only; no execution model, MCP transport or ambient credential selection. */
 export async function materializeOpenCodeV2CatalogScope(scope: OpenCodeProfileScope, projectPath: string, targetAuthPath: string,
-  options: { includeSelectedApiKey?: boolean } = {}) {
+  options: { includeSelectedApiKey?: boolean; signal?: AbortSignal } = {}) {
+  options.signal?.throwIfAborted()
   const snapshot = openCodeEffectiveConfigSnapshots.get(scope.scopeToken)
   if (!snapshot || scope.purpose !== 'catalog' || await canonicalizeOpenCodeProjectPath(projectPath) !== snapshot.projectPath ||
     !isDeepStrictEqual(snapshot.scopeIdentity, buildScopeIdentity(planOpenCodeProfilePolicy(scope).scope))) throw new Error('OpenCode catalog scope changed')
@@ -4021,7 +4030,7 @@ export async function materializeOpenCodeV2CatalogScope(scope: OpenCodeProfileSc
   const declared = asRecord(provider.models) ?? {}, models: ExecutionProviderModels = {}
   if (Object.keys(declared).length > 2048) throw new Error('OpenCode selected catalog model budget exceeded')
   for (const [id, definition] of Object.entries(declared)) Object.assign(models, mapSelectedOpenCodeV2Model(id, definition))
-  const imported = await materializeOpenCodeSelectedScopeAuth(scope, projectPath, targetAuthPath, undefined)
+  const imported = await materializeOpenCodeSelectedScopeAuth(scope, projectPath, targetAuthPath, undefined, options.signal)
   // Fresh V2 databases do not import legacy auth.json. Model discovery can use
   // this exact already-materialized key in its private, hash-bound config without
   // creating a native connection or invoking authentication/model requests.
@@ -4029,14 +4038,15 @@ export async function materializeOpenCodeV2CatalogScope(scope: OpenCodeProfileSc
   const credential = snapshot.selectedAuthCredential
   const apiKey = options.includeSelectedApiKey && credential?.type === 'api' && typeof credential.key === 'string' &&
     Object.keys(credential).every(key => key === 'type' || key === 'key') ? credential.key : undefined
-  const defaults = await readOpenCodeManagedDefaultSelection(snapshot.projectPath)
+  const defaults = await readOpenCodeManagedDefaultSelection(snapshot.projectPath, options.signal)
+  options.signal?.throwIfAborted()
   const selected = defaults.defaultModel ?? snapshot.importedRuntimeConfig.model
   return { provider: { ...imported, ...(apiKey ? { apiKey } : {}), ...(Object.keys(models).length ? { models } : {}) },
     preferredModel: typeof selected === 'string' && selected.startsWith(scope.providerId + '/') ? selected : null,
     authPath: path.join(snapshot.managedPaths.data, 'opencode', 'auth.json') }
 }
 
-export async function resolveOpenCodeV2CatalogProfileScope(input: { projectPath?: string | null; providerId: string }) {
+export async function resolveOpenCodeV2CatalogProfileScope(input: { projectPath?: string | null; providerId: string; abortSignal?: AbortSignal }) {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,255}$/.test(input.providerId)) throw new Error('OpenCode catalog provider is invalid')
-  return resolveOpenCodeProfileScopeInternal({ projectPath: input.projectPath, purpose: 'catalog', selectedModel: '' }, undefined, undefined, undefined, input.providerId)
+  return resolveOpenCodeProfileScopeInternal({ projectPath: input.projectPath, purpose: 'catalog', selectedModel: '', abortSignal: input.abortSignal }, undefined, undefined, undefined, input.providerId)
 }

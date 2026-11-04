@@ -33,7 +33,9 @@ async function validateAncestry(root: string): Promise<void> {
     if (parent === cursor) break
     cursor = parent
   }
-  if (await realpath(root) !== root) throw unsafe()
+  const canonicalRoot = await realpath(root)
+  // Windows realpath may normalize directory lettercase without changing identity.
+  if ((process.platform === 'win32' ? canonicalRoot.toLowerCase() !== root.toLowerCase() : canonicalRoot !== root)) throw unsafe()
   if (process.platform === 'win32') assertWindowsMcpAncestry(ancestors)
 }
 
@@ -93,7 +95,7 @@ export async function publishPrivateCursorMcpConfig(stateRoot: string, config: u
     if (!sameFile(opened, await validatePrivate(file))) throw unsafe()
     return file
   } finally {
-    if (!closed) await handle.close()
+    if (!closed) await handle.close().catch(() => undefined)
     // Delete only our own remaining empty/staged inode, never a replacement object.
     try {
       if (sameFile(opened, await lstat(temporary))) await unlink(temporary)

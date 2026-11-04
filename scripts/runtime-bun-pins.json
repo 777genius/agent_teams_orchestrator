@@ -8,13 +8,15 @@
     },
     "darwin-arm64": {
       "file": "bun-darwin-aarch64.zip",
-      "sha256": "6f5a3467ed9caec4795bf78cd476507d9f870c7d57b86c945fcb338126772ffc",
-      "entry": "bun-darwin-aarch64/bun"
+      "sha256": "c240d7f0ccb90c263a849fcdb09b7ee62630d921348ed6aafda86b9d577bc510",
+      "entry": "bun-darwin-aarch64/bun",
+      "version": "1.4.4"
     },
     "darwin-x64": {
       "file": "bun-darwin-x64-baseline.zip",
-      "sha256": "fb6739b08bf54550edaa7c824cd5b2dca45b6a06afef408443087a63105f6f8d",
-      "entry": "bun-darwin-x64-baseline/bun"
+      "sha256": "d4a155adfbfd09155eb3ba05c9e3a544f39297d7a68616d3c7759f67ab5c47dc",
+      "entry": "bun-darwin-x64-baseline/bun",
+      "version": "1.4.4"
     },
     "win32-x64": {
       "file": "bun-windows-x64-baseline.zip",

@@ -1,11 +1,87 @@
-import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { test, expect } from 'bun:test'
-import { openCodeV2ModelTestMessage, openCodeV2ConnectProofFailureCode, openCodeV2ConnectFailureMessage, buildOpenCodeV2RuntimeProviderModel, openCodeV2ConnectionIDs, requireOpenCodeV2OwnedConnection, rollbackOpenCodeV2OwnedConnection, retireOpenCodeV2CatalogOwner, recordOpenCodeV2ProviderFailure } from './OpenCodeV2ProviderManagement.js'
+import { openCodeV2ModelTestMessage, openCodeV2ConnectProofFailureCode, openCodeV2ConnectFailureMessage, buildOpenCodeV2RuntimeProviderModel, openCodeV2ConnectionIDs, assertOpenCodeV2NativeV1AuthUnoccupied, assertOpenCodeV2SharedAuthMirrorSafe, requireOpenCodeV2OwnedConnection, rollbackOpenCodeV2OwnedConnection, retireOpenCodeV2CatalogOwner, recordOpenCodeV2ProviderFailure, openCodeV2CatalogFailureMessage } from './OpenCodeV2ProviderManagement.js'
+import { readOpenCodeV2ConnectIntent, removeOpenCodeV2ConnectIntentIfUnchanged, writeOpenCodeV2ConnectIntent } from './OpenCodeV2ProviderConnectIntent.js'
 import type { OpenCodeAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
 const empty = { id: 'groq', methods: [{ type: 'key' }], connections: [] }
 const connection = { ...empty, connections: [{ type: 'credential', id: 'cred_original', label: 'Groq' }] }
+test('V2 catalog failure messages contain only fixed phases and closed categories', () => {
+  const secret = 'TEST-SECRET-do-not-report'
+  const known = openCodeV2CatalogFailureMessage('models', new Error('provider_catalog_location_changed'))
+  expect(known).toContain('stage: models, category: provider_catalog_location_changed')
+  expect(known).toContain('no legacy CLI catalog command was invoked')
+  const unknown = openCodeV2CatalogFailureMessage('profile', new Error(`private ${secret}`))
+  expect(unknown).toContain('stage: profile, category: provider_operation_unknown')
+  expect(unknown).not.toContain(secret)
+  const cleanup = openCodeV2CatalogFailureMessage('retirement', new Error('provider_physical_cleanup_unknown', {
+    cause: new Error(secret),
+  }))
+  expect(cleanup).toContain('stage: retirement, category: provider_physical_cleanup_unknown')
+  expect(cleanup).not.toContain(secret)
+  // An arbitrary SDK Error can expose a failing cause getter. Diagnostics must
+  // not turn the original catalog refusal into a thrown exception.
+  const poisoned = new Error(secret)
+  Object.defineProperty(poisoned, 'cause', { get() { throw new Error(secret) } })
+  const safe = openCodeV2CatalogFailureMessage('models', poisoned)
+  expect(safe).toContain('stage: models, category: provider_operation_unknown')
+  expect(safe).not.toContain(secret)
+})
+
+test('V2 API-key admission preserves V1 OAuth and differing API credentials in the shared mirror', () => {
+  const next = { type: 'api' as const, key: 'TEST-new' }
+  expect(() => assertOpenCodeV2SharedAuthMirrorSafe(null, next)).not.toThrow()
+  expect(() => assertOpenCodeV2SharedAuthMirrorSafe({ ...next }, next)).not.toThrow()
+  for (const existing of [
+    { type: 'oauth', access: 'TEST-v1-access', refresh: 'TEST-v1-refresh', expires: 10 },
+    { type: 'api', key: 'TEST-original' },
+    { type: 'api', key: 'TEST-new', metadata: { region: 'us' } },
+  ]) {
+    expect(() => assertOpenCodeV2SharedAuthMirrorSafe(existing, next))
+      .toThrow('provider_shared_credential_conflict')
+  }
+  expect(openCodeV2ConnectFailureMessage(new Error('provider_shared_credential_conflict'), false))
+    .toContain('Existing V1 authentication was preserved')
+})
+
+test('V2 key connect cannot shadow native V1 API or OAuth auth stored outside the app mirror', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v1-native-auth-'))
+  const home = path.join(root, 'home'), xdg = path.join(root, 'xdg')
+  const homeAuth = path.join(home, '.local', 'share', 'opencode', 'auth.json')
+  const xdgAuth = path.join(xdg, 'opencode', 'auth.json')
+  const input = { authPath: path.join(root, 'managed', 'opencode', 'auth.json'),
+    providerId: 'groq', env: { HOME: home, XDG_DATA_HOME: xdg } }
+  const store = async (target: string, credential: Record<string, unknown>) => {
+    await mkdir(path.dirname(target), { recursive: true })
+    await writeFile(target, JSON.stringify({ groq: credential }))
+  }
+  try {
+    await assertOpenCodeV2NativeV1AuthUnoccupied(input)
+    await store(homeAuth, { type: 'api', key: 'TEST-v1-user-key' })
+    await expect(assertOpenCodeV2NativeV1AuthUnoccupied(input)).rejects.toThrow('provider_shared_credential_conflict')
+    expect(JSON.parse(await readFile(homeAuth, 'utf8'))).toEqual({ groq: { type: 'api', key: 'TEST-v1-user-key' } })
+    await rm(homeAuth)
+    await store(xdgAuth, { type: 'oauth', access: 'TEST-v1-access', refresh: 'TEST-v1-refresh' })
+    await expect(assertOpenCodeV2NativeV1AuthUnoccupied(input)).rejects.toThrow('provider_shared_credential_conflict')
+    await rm(xdgAuth)
+    // Even identical keys must not be newly mirrored: a future native V1 login
+    // would otherwise be hidden by the stale app-mirror key.
+    await store(homeAuth, { type: 'api', key: 'TEST-new' })
+    await expect(assertOpenCodeV2NativeV1AuthUnoccupied(input)).rejects.toThrow('provider_shared_credential_conflict')
+    await rm(homeAuth)
+    await assertOpenCodeV2NativeV1AuthUnoccupied(input)
+    // A retained generation-specific scope environment must select the same
+    // user stores used by real V1 profile resolution, not ambient HOME.
+    await store(xdgAuth, { type: 'api', key: 'TEST-scoped-xdg-v1' })
+    const scoped = { ...input, env: {
+      HOME: path.join(root, 'foreign-home'), XDG_DATA_HOME: path.join(root, 'foreign-xdg'),
+      CLAUDE_MULTIMODEL_OPENCODE_SCOPE_ENVIRONMENT: JSON.stringify({ HOME: home, XDG_DATA_HOME: xdg }),
+    } }
+    await expect(assertOpenCodeV2NativeV1AuthUnoccupied(scoped)).rejects.toThrow('provider_shared_credential_conflict')
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('V2 native model mapping carries array declarations without the legacy record interpretation or text fallback', () => {
   const row = { id: 'Novel/ExactCase', name: 'Novel model', limit: { context: 32000, output: 4000 } }
   const map = (capabilities?: unknown) => buildOpenCodeV2RuntimeProviderModel({ ...row, capabilities }, 'novel-provider', 'novel-provider/Novel/ExactCase')
@@ -35,6 +111,36 @@ function ports() {
       readConnections: async () => native, remove: async (id: string) => { removed.push(id); native = empty },
       readMirror: async () => mirror, restoreMirror: async (prior: OpenCodeAuthCredential | null) => { restores++; mirror = prior } } }
 }
+test('prepublication rollback removes the owned native ID without modifying V1 auth', async () => {
+  const p = ports(); p.setMirror(null)
+  await rollbackOpenCodeV2OwnedConnection({ ...p.input, expectedMirror: null })
+  expect(p.removed).toEqual(['cred_original'])
+  expect(p.restores).toBe(0)
+  expect(await p.input.readMirror()).toBeNull()
+})
+test('peer drift prevents prepublication native rollback', async () => {
+  const p = ports(); p.setMirror(null)
+  p.setNative({ ...connection, connections: [...connection.connections, { type: 'credential', id: 'cred_peer', label: 'Peer' }] })
+  await expect(rollbackOpenCodeV2OwnedConnection({ ...p.input, expectedMirror: null })).rejects.toThrow('provider_rollback_peer_changed')
+  expect(p.removed).toEqual([])
+  expect(p.restores).toBe(0)
+})
+test('owned pending marker is removed only with exact unchanged identity', async () => {
+  // Tests must use the canonical temp directory, including on Windows ARM64.
+  const dir = await realpath(await mkdtemp(path.join(tmpdir(), 'TEST-v2-connect-intent-')))
+  const file = path.join(dir, 'owned.json')
+  const pending = { schemaVersion: 2 as const, state: 'pending' as const, phase: 'credential-intent' as const,
+    providerId: 'groq', project: '/TEST/project', profileRoot: '/TEST/private', integrationID: 'groq' }
+  try {
+    await writeOpenCodeV2ConnectIntent(file, pending, true)
+    await expect(removeOpenCodeV2ConnectIntentIfUnchanged(file, { ...pending, providerId: 'foreign' }))
+      .rejects.toThrow('provider_original_intent_changed')
+    expect(await readOpenCodeV2ConnectIntent(file)).toMatchObject(pending)
+    await removeOpenCodeV2ConnectIntentIfUnchanged(file, pending)
+    expect(await readOpenCodeV2ConnectIntent(file)).toBeUndefined()
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
 test('owned empty-store rollback removes only the returned ID and restores the original absent mirror', async () => {
   const p = ports(); await rollbackOpenCodeV2OwnedConnection(p.input)
   expect(p.removed).toEqual(['cred_original']); expect(p.restores).toBe(1); expect(await p.input.readMirror()).toBeNull()
@@ -63,6 +169,35 @@ test('transport failure never skips physical catalog lease retirement', async ()
   await expect(retireOpenCodeV2CatalogOwner({ dispose: async () => { events.push('dispose'); throw new Error('TEST-wire') } },
     { close: async () => { events.push('retire') } }, () => { events.push('unregister') })).rejects.toThrow('provider_physical_cleanup_unknown')
   expect(events).toEqual(['dispose', 'unregister', 'retire'])
+})
+
+test('V2 catalog diagnostics preserve only allowlisted filesystem facts', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-catalog-errno-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  const secret = 'TEST-PRIVATE-FILE-PATH-AND-KEY'
+  process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+  try {
+    await recordOpenCodeV2ProviderFailure('provider-model-catalog-profile',
+      Object.assign(new Error(secret), { code: 'EACCES', syscall: 'open', path: secret }), true)
+    await recordOpenCodeV2ProviderFailure('provider-model-catalog-models',
+      Object.assign(new Error(secret), { code: 'EACCES-' + secret, syscall: 'open-' + secret, path: secret }), true)
+    const original = Object.assign(new Error(secret), { code: 'ENOENT', syscall: 'realpath', path: secret })
+    const cleanup = new AggregateError([original, new Error(secret)],
+      'provider_catalog_prelease_cleanup_unknown', { cause: original })
+    await recordOpenCodeV2ProviderFailure('provider-model-catalog-retirement', cleanup, true)
+    const directory = path.join(root, 'opencode/v2/provider-diagnostics')
+    const rows = await Promise.all((await readdir(directory)).map(async name => JSON.parse(await readFile(path.join(directory, name), 'utf8'))))
+    expect(rows.find(row => row.phase === 'provider-model-catalog-profile').failure).toEqual({ name: 'Error', errno: 'EACCES', operation: 'open' })
+    expect(rows.find(row => row.phase === 'provider-model-catalog-models').failure).toEqual({ name: 'Error' })
+    const uncertain = rows.find(row => row.phase === 'provider-model-catalog-retirement')
+    expect(uncertain.category).toBe('provider_operation_unknown')
+    expect(uncertain.failure).toEqual({ name: 'Error', errno: 'ENOENT', operation: 'realpath' })
+    expect(JSON.stringify(rows)).not.toContain(secret)
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('private failure diagnostics preserve finite control causes and redact arbitrary secrets', async () => {
@@ -138,7 +273,7 @@ test('model test distinguishes terminal failure from pending without exposing ra
   expect(openCodeV2ModelTestMessage(false, 'failed')).not.toContain('is pending')
   expect(openCodeV2ModelTestMessage(false, 'pending')).toContain('pending or unverified')
   expect(openCodeV2ModelTestMessage(false, 'available')).not.toContain('verified.')
-  expect(openCodeV2ModelTestMessage(true, 'available')).toContain('physical retirement verified')
+  expect(openCodeV2ModelTestMessage(true, 'available')).toBe('The model responded successfully.')
 })
 
 test('connect reports a settled model-verification failure without treating it as pending or bad authentication', () => {
@@ -171,4 +306,12 @@ test('connect preserves unresolved wording for cleanup uncertainty, pending prob
   expect(openCodeV2ConnectFailureMessage(new Error('provider_physical_cleanup_unknown'), true)).toContain('remains unresolved')
   expect(openCodeV2ConnectFailureMessage(new Error('provider_original_execution_failed TEST-PRIVATE'), true)).toContain('remains unresolved')
   expect(openCodeV2ConnectFailureMessage(new Error('provider_original_execution_failed'), false)).toContain('Existing credentials were preserved')
+})
+
+test('explains the confirmed OpenRouter free quota with an actionable next step', () => {
+  const message = openCodeV2ModelTestMessage(false, 'failed', 'provider_free_quota_exhausted')
+  expect(message).toContain('daily limit for free models')
+  expect(message).toContain('choose a paid model')
+  expect(openCodeV2ConnectProofFailureCode('failed', 'provider_free_quota_exhausted')).toBe('provider_original_execution_failed')
+  expect(openCodeV2ModelTestMessage(false, 'pending', 'provider_free_quota_exhausted')).not.toContain('daily limit')
 })
