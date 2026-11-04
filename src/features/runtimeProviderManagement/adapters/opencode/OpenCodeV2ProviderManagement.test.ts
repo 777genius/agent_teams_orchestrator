@@ -20,6 +20,13 @@ test('V2 catalog failure messages contain only fixed phases and closed categorie
   }))
   expect(cleanup).toContain('stage: retirement, category: provider_physical_cleanup_unknown')
   expect(cleanup).not.toContain(secret)
+  // An arbitrary SDK Error can expose a failing cause getter. Diagnostics must
+  // not turn the original catalog refusal into a thrown exception.
+  const poisoned = new Error(secret)
+  Object.defineProperty(poisoned, 'cause', { get() { throw new Error(secret) } })
+  const safe = openCodeV2CatalogFailureMessage('models', poisoned)
+  expect(safe).toContain('stage: models, category: provider_operation_unknown')
+  expect(safe).not.toContain(secret)
 })
 
 test('V2 API-key admission preserves V1 OAuth and differing API credentials in the shared mirror', () => {
