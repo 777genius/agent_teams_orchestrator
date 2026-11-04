@@ -385,11 +385,25 @@ jobs:
           extracted="$RUNNER_TEMP/TEST-release-server-smoke"
           rm -rf "$extracted"
           mkdir -p "$extracted"
+          echo "packaged-server-smoke: extract_base"
           tar -xzf "release/$ARCHIVE_NAME" -C "$extracted"
           support_archive="$(bun --no-install -e 'console.log(JSON.parse(await Bun.file("dist/opencode-v2-delivery.json").text()).archive.file)')"
           mkdir -p "$extracted/support"
+          echo "packaged-server-smoke: extract_support"
           unzip -q "release/$support_archive" -d "$extracted/support"
+          echo "packaged-server-smoke: start_harness"
           "$extracted/runtime/bun/bun" --no-install --no-env-file scripts/opencode-v2/packaged-server-smoke.ts "$extracted/runtime" "$extracted/support" "$RUNNER_TEMP/packaged-server-smoke.json"
+
+      - name: Preserve packaged server startup evidence
+        if: always() && runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-server-proof-${{ matrix.platform }}-${{ needs.prepare-release.outputs.source_commit }}
+          path: |
+            ${{ runner.temp }}/packaged-server-smoke.json
+            ${{ runner.temp }}/packaged-server-smoke.json.progress.ndjson
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Prove native Windows V2 server and PTY from the release archives
         if: runner.os == 'Windows'
