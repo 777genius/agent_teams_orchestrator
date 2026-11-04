@@ -42,6 +42,16 @@ export async function provePostMergeReuse(context: Context, read: Read): Promise
     const parents = fields(merged, 'parents')
     if (!hexSha(tree) || tree !== fields(fields(original, 'tree'), 'sha') ||
       !Array.isArray(parents) || !parents.length || fields(parents[0], 'sha') !== baseSha) return false
+    // The workflow run-name is evaluated from the PR's workflow file. If a PR
+    // changes that file, its title is not independent evidence of the target
+    // PR; fall back to full main validation rather than trust a forged title.
+    const workflow = '.github/workflows/ci.yml'
+    const [baselineWorkflow, testedWorkflow] = await Promise.all([
+      read(`${root}/contents/${workflow}?ref=${baseSha}`),
+      read(`${root}/contents/${workflow}?ref=${head}`),
+    ])
+    const baselineWorkflowSha = fields(baselineWorkflow, 'sha')
+    if (!hexSha(baselineWorkflowSha) || baselineWorkflowSha !== fields(testedWorkflow, 'sha')) return false
     const checks = fields(await read(`${root}/commits/${head}/check-runs?check_name=CI%20required&per_page=100`), 'check_runs')
     if (!Array.isArray(checks)) return false
     const candidates = checks.map(object).filter(check => check.name === 'CI required' && check.head_sha === head)

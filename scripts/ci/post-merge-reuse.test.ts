@@ -23,6 +23,8 @@ function evidence(overrides: Record<string, unknown> = {}) {
     [`repos/${repository}/commits/${head}/pulls?per_page=2`]: [pr],
     [`repos/${repository}/git/commits/${merge}`]: { tree: { sha: tree }, parents: [{ sha: base }] },
     [`repos/${repository}/git/commits/${head}`]: { tree: { sha: tree } },
+    [`repos/${repository}/contents/.github/workflows/ci.yml?ref=${base}`]: { sha: 'e'.repeat(40) },
+    [`repos/${repository}/contents/.github/workflows/ci.yml?ref=${head}`]: { sha: 'e'.repeat(40) },
     [`repos/${repository}/commits/${head}/check-runs?check_name=CI%20required&per_page=100`]: { check_runs: [check] },
     [`repos/${repository}/actions/runs/123`]: run,
     ...overrides,
@@ -127,5 +129,18 @@ test('merged base must match the first parent, even if the PR head tree matches'
   const url = `repos/${repository}/git/commits/${merge}`
   assert.equal(await provePostMergeReuse(context, evidence({
     [url]: { tree: { sha: tree }, parents: [{ sha: 'e'.repeat(40) }] },
+  })), false)
+})
+
+test('a PR cannot forge main CI provenance by changing its workflow run-name', async () => {
+  const url = `repos/${repository}/contents/.github/workflows/ci.yml?ref=${head}`
+  assert.equal(await provePostMergeReuse(context, evidence({
+    [url]: { sha: 'f'.repeat(40) },
+  })), false)
+  assert.equal(await provePostMergeReuse(context, evidence({
+    [url]: { sha: null },
+  })), false)
+  assert.equal(await provePostMergeReuse(context, evidence({
+    [url]: { sha: 'not-a-git-sha' },
   })), false)
 })
