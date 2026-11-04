@@ -37,6 +37,7 @@ const ENVIRONMENT_KEYS = [
   CLAUDE_MULTIMODEL_DATA_HOME_ENV, CLAUDE_MULTIMODEL_CACHE_HOME_ENV, CURSOR_MANAGED_ASSET_ROOT_ENV,
   'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME',
   'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL',
+  'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_HEADERS_JSON',
   'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND', 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON',
 ]
 
@@ -68,6 +69,7 @@ describe('Cursor App MCP live e2e', () => {
       // Stand in for the desktop app's MCP server through the supported override.
       delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_COMMAND
       delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_ARGS_JSON
+      delete process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_HEADERS_JSON
       process.env.CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_URL = `http://127.0.0.1:${appMcp.port}/mcp`
 
       const profileManager = new OpenCodeProfileManager()
@@ -75,7 +77,7 @@ describe('Cursor App MCP live e2e', () => {
         includeAppMcp: true, includeManagedSubscriptionPlugins: true, toolApprovalMode: 'auto',
       })
       // The bridge only discovers servers from a config file, so it must exist.
-      const configFile = path.join(profile.xdgConfigHome, 'opencode', 'opencode.json')
+      const configFile = profile.env.OPENCODE_CONFIG!
       expect(Object.keys(JSON.parse(await readFile(configFile, 'utf8')).mcp ?? {}))
         .toContain('agent-teams')
 

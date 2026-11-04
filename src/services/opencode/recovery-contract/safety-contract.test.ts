@@ -23,7 +23,9 @@ test('F2 contract late source replacement cannot release unproven session', asyn
   const f = await fixture({ session: true, terminal: 'incomplete' })
   const dataRoot = path.join(f.root, 'app-data')
   const bridge = new OpenCodeSessionBridge({ oauthRecoveryDataRoot: dataRoot,
-    hostManager: new OpenCodeHostManager({ persistentRegistryPath: path.join(dataRoot, 'opencode', 'host-registry.json') }),
+    hostManager: new OpenCodeHostManager({ persistentRegistryPath: path.join(dataRoot, 'opencode', 'host-registry.json'),
+      fetchJson: async () => { throw new Error('Synthetic safety fixture must not contact HTTP') },
+    }),
     sessionStore: new OpenCodeSessionStore(path.join(dataRoot, 'opencode', 'session-store.json')) })
   await expect(manager.finishOwnedOAuthBeforeSessionRelease(f.receipt.nativeSession.record, async owner => {
     expect(await bridge.isOwnedOAuthNativeSessionSettled(owner)).toBe(false)

@@ -246,6 +246,12 @@ async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
 async function main(): Promise<void> {
   const args = process.argv.slice(2)
 
+  // Desktop compatibility probe: keep it side-effect free and independent of provider startup.
+  if (args.length === 3 && args[0] === 'runtime' && args[1] === 'security-capabilities' && args[2] === '--json') {
+    process.stdout.write(`${JSON.stringify({ schemaVersion: 1, mcpHttpAuthorizationHeaders: true })}\n`)
+    return
+  }
+
   if (typeof PACKAGED_OPENCODE_DELIVERY !== 'undefined' &&
     (args[0] === 'runtime' || (args[0] === 'model' && args[1] === 'list'))) {
     const { runPackagedOpenCodeDelivery } = await import('../cli/packagedOpenCodeDelivery.js')
