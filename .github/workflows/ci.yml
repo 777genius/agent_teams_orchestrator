@@ -260,6 +260,8 @@ jobs:
       # identity/selection contract tests elsewhere in the same process.
       - name: Test V1 provider settings in isolated process
         run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.test.ts --timeout 30000
+      - name: Test platform Bun delivery pins
+        run: bun test src/constants/openCodeBunVersion.test.ts
       - name: Test provider identity, inventory, labels and HTTP deadlines
         run: bun test src/services/opencode/OpenCodeProviderIdentity.test.ts src/services/opencode/OpenCodeInventoryService.test.ts src/services/opencode/OpenCodeProviderLabelRegression.test.ts src/services/opencode/OpenCodeClientFactory.test.ts --timeout 30000
       - name: Test V2 provider catalogs, defaults and project identity
@@ -573,6 +575,7 @@ jobs:
           name: packaged-server-smoke-${{ matrix.platform }}-${{ github.event.pull_request.head.sha || github.sha }}
           path: |
             packaged-server-smoke-${{ matrix.platform }}.json
+            packaged-server-smoke-${{ matrix.platform }}.json.progress.ndjson
             packaged-pty-smoke-${{ matrix.platform }}.json
             native-v2-cli-${{ matrix.platform }}.json
             native-v2-execution-${{ matrix.platform }}.json

@@ -154,7 +154,8 @@ export async function main(baseArgument: string, supportArgument: string, receip
   const progress = (phase: string, detail: Row = {}) => {
     const row = { phase, ...detail, timestamp: new Date().toISOString() }
     // Incremental evidence survives step cancellation before the final receipt.
-    appendFileSync(`${receipt}.progress.ndjson`, JSON.stringify(row) + '\n')
+    try { appendFileSync(`${receipt}.progress.ndjson`, JSON.stringify(row) + '\n') }
+    catch { evidence.progressWriteFailed = true }
     console.log(JSON.stringify({ kind: 'packaged-server-smoke-progress', ...row }))
   }
   try {

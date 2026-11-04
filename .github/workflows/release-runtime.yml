@@ -456,6 +456,7 @@ jobs:
           path: |
             ${{ runner.temp }}/release-delivery-smoke.json
             ${{ runner.temp }}/packaged-server-smoke.json
+            ${{ runner.temp }}/packaged-server-smoke.json.progress.ndjson
             ${{ runner.temp }}/packaged-pty-smoke.json
           if-no-files-found: warn
           retention-days: 7
