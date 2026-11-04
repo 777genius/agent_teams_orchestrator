@@ -9,7 +9,7 @@ import { promisify } from 'node:util'
 const execFileAsync = promisify(execFile)
 
 export type PackagedOpenCodeDeliveryIdentity = Readonly<{
-  schema: 1; platform: string; arch: string; bunVersion: '1.3.11' | '1.4.3'
+  schema: 1; platform: string; arch: string; bunVersion: ReturnType<typeof openCodeBunVersion>
   bunSha256: string; entrySha256: string
 }>
 

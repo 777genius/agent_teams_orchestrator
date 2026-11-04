@@ -15,6 +15,16 @@ import { collectOpenCodeV2GraphFiles } from '../services/opencode/host/OpenCodeV
 
 // Separate process only. Credentials and the acquisition nonce arrive over private IPC.
 let started = false, closing = false, nonce: string | undefined
+const startupStarted = performance.now()
+// Fixed stage names only: never send config, paths, credentials or raw errors.
+type StartupStage = 'received_start' | 'verify_graph' | 'hash_graph' | 'hash_bun' |
+  'import_effect' | 'import_server' | 'scope' | 'start_server' | 'server_ready'
+function startupStage(stage: StartupStage): void {
+  try {
+    if (nonce && process.connected) process.send?.({ type: 'startup-stage', nonce, stage,
+      elapsedMs: Math.round(performance.now() - startupStarted) }, () => undefined)
+  } catch { /* Diagnostic delivery must not change startup or cleanup. */ }
+}
 const controller = new AbortController()
 let startup: Promise<void> | undefined
 let finalize: (() => Promise<void>) | undefined
@@ -43,6 +53,7 @@ process.once('disconnect', () => { void close() })
 process.once('SIGTERM', () => { void close() })
 
 async function start(input: Record<string, unknown>): Promise<void> {
+  startupStage('received_start')
   openCodeReadAssert(isOpenCodeV2Pin(input.pin), 'opencode_v2_version_out_of_range')
   openCodeReadAssert(typeof input.password === 'string' && input.password.length === 43)
   openCodeReadAssert(typeof input.root === 'string' && path.isAbsolute(input.root))
@@ -53,17 +64,23 @@ async function start(input: Record<string, unknown>): Promise<void> {
   openCodeReadAssert(!packaged || input.delivery !== undefined, 'opencode_v2_support_required')
   const binding = input.delivery as OpenCodeV2DeliveryBinding | undefined
   const delivery = binding ? await resolveOpenCodeV2Delivery(binding) : undefined
+  startupStage('verify_graph')
   const graph = await verifyOpenCodeV2ServerGraph(input.pin, delivery?.binding)
+  startupStage('hash_graph')
   if (delivery) await collectOpenCodeV2GraphFiles(input.pin, delivery.root, delivery.binding, controller.signal)
   controller.signal.throwIfAborted()
+  startupStage('hash_bun')
   const executableSha256 = await hashOpenCodeFile(process.execPath)
   controller.signal.throwIfAborted()
   openCodeReadAssert(graph.moduleSha256 === input.moduleSha256 && executableSha256 === input.executableSha256, 'identity_mismatch')
   // Resolve Effect from the selected official server graph; it remains child-local.
+  startupStage('import_effect')
   const effect: typeof import('effect') = await import(pathToFileURL(graph.effectPath).href)
   controller.signal.throwIfAborted()
+  startupStage('import_server')
   const runtime: typeof import('@opencode/server/process') = await import(pathToFileURL(graph.modulePath).href)
   controller.signal.throwIfAborted()
+  startupStage('scope')
   const { Effect, Scope, Exit } = effect
   const scope = await Effect.runPromise(Scope.make())
   finalize = () => Effect.runPromise(Scope.close(scope, Exit.void))
@@ -76,9 +93,11 @@ async function start(input: Record<string, unknown>): Promise<void> {
     models: { fetch: false, snapshot: true }, events: { persist: false },
     fs: { filewatcher: false, fff: false },
   } satisfies FloorOptions & CurrentOptions
+  startupStage('start_server')
   const server = await Effect.runPromise(runtime.start<never, never>(options).pipe(Effect.provideService(Scope.Scope, scope)), { signal: controller.signal })
   controller.signal.throwIfAborted()
   openCodeReadAssert(!closing)
+  startupStage('server_ready')
   const baseUrl = openCodeV2ServerLoopbackUrl(input.pin, server.address)
   clearTimeout(startupTimer)
   process.send?.({ type: 'ready', nonce, pid: process.pid, version: input.pin,

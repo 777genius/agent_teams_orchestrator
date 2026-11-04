@@ -11,7 +11,7 @@ const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/
 export const OPENCODE_V2_INSTANCE_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/
 
 type DeliveryIdentity = Readonly<{ schemaVersion: 1; runtimeVersion: string; sourceCommit: string; bridgeProtocol: 1;
-  platform: string; arch: string; requiredBunVersion: '1.3.11' | '1.4.3'; engineVersions: readonly string[] }>
+  platform: string; arch: string; requiredBunVersion: ReturnType<typeof openCodeBunVersion>; engineVersions: readonly string[] }>
 export type OpenCodeV2DeliveryFile = Readonly<{ path: string; bytes: number; sha256: string; executable: boolean }>
 export type OpenCodeV2DeliveryManifest = DeliveryIdentity & Readonly<{ files: readonly OpenCodeV2DeliveryFile[] }>
 export type OpenCodeV2DeliveryDescriptor = DeliveryIdentity & Readonly<{
