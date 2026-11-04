@@ -60,7 +60,9 @@ test(`catalog refusal retains ${phase} with original thrown identity and bounded
     if (phase === 'client-setup' || phase === 'cleanup') expect(caught).toBe(original)
     if (caught === null || typeof caught !== 'object') throw new Error('TEST expected catalog Error')
     const before = Object.getOwnPropertyDescriptors(caught)
-    const serverFailure = { operation: 'location', kind: 'Fail', tag: 'SqlError', reason: 'AuthorizationError', sqlCode: 'SQLITE_AUTH',
+    const expectedServerFailure = { operation: 'location', kind: 'Fail', tag: 'SqlError', reason: 'AuthorizationError', sqlCode: 'SQLITE_AUTH' }
+    // The realpath observation is deliberately rejected by the closed public diagnostic schema.
+    const serverFailure = { ...expectedServerFailure,
       realpath: { status: 2, operation: 18, win32: 5, anchorCount: 2, matchingAnchorIndex: 1 } }
     retainOpenCodeV2CatalogServerFailure(caught, { ...serverFailure, body: 'TEST-PRIVATE-CATALOG-PAYLOAD' })
     // Later observations cannot replace the first matching private fact.
@@ -74,7 +76,7 @@ test(`catalog refusal retains ${phase} with original thrown identity and bounded
     const catalog = JSON.parse(bytes).catalog
     const http = phase.startsWith('http-') || phase.startsWith('status-')
     expect(catalog).toEqual(phase === 'client-setup' ? { phase } : phase === 'server-location'
-      ? { phase: 'location', client: { reason: 'Transport' }, wireCode: 'http_failure', wireStatus: 500, serverFailure }
+      ? { phase: 'location', client: { reason: 'Transport' }, wireCode: 'http_failure', wireStatus: 500, serverFailure: expectedServerFailure }
       : { phase: phase === 'cleanup' || http ? 'info' : phase, client: { reason: 'Transport' }, wireCode: http ? 'http_failure' : 'media_type',
         ...(phase === 'http-401' ? { wireStatus: 401 } : phase === 'http-500' ? { wireStatus: 500 } : {}) })
   } finally {
