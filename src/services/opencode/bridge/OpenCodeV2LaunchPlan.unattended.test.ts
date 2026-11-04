@@ -38,7 +38,7 @@ import type { OpenCodePreparedProfile, OpenCodeProfileScope, OpenCodeProvisionin
 import type { ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionHost.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 
-let root: string, project: string, pin: '2.0.0' | '2.0.32' | '2.1.4' = '2.0.32'
+let root: string, project: string, pin: '2.0.0' | '2.0.32' | '2.1.4' = '2.1.4'
 let saved: NodeJS.ProcessEnv
 let nativeSelectionCalls = 0, nativeReceiptCalls = 0
 let receiptControllers: unknown[] = []
@@ -102,7 +102,9 @@ async function proof(prepared: OpenCodePreparedProfile, capabilitySnapshotId: st
   return buildOpenCodeExecutionProof({ selectedModel: 'provider/model', snapshot, capabilitySnapshotId, verifiedAt, unattendedTeam }, {
     resolveBinaryPath: () => native().executablePath, resolveBinaryIdentity: async () => 'TEST-native-identity', readCredential: async () => null, platform })
 }
-const titleVersions = process.platform === 'win32' ? ['2.1.4'] as const : ['2.0.0', '2.0.32', '2.1.4'] as const
+// Launch title qualification follows the currently admitted engine; floor/current wire
+// compatibility is covered by independent transport tests.
+const titleVersions = ['2.1.4'] as const
 for (const version of titleVersions) test(`${version} probe-owned session title prevents automatic title requests without changing team sessions`, async () => {
   pin = version
   const request = envelope()
@@ -294,7 +296,7 @@ test('team proof survives 126s source preparation without refreshing a probe and
   expect(await readdir(path.join(root, 'app-data/opencode/v2'))).not.toContain('runs')
 })
 
-for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} team launch requires the same unattended profile as its strict proof`, async () => {
+for (const version of ['2.1.4'] as const) test(`${version} team launch requires the same unattended profile as its strict proof`, async () => {
   pin = version
   const request = envelope(), selection = await inspectOpenCodeV2SourceAvailability(request)
   const parent = path.join(root, 'profiles'); await mkdir(parent)
@@ -324,9 +326,9 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} team launch
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
   const arch = Object.getOwnPropertyDescriptor(process, 'arch')!
   try {
-    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
-    Object.defineProperty(process, 'arch', { ...arch, value: 'arm64' })
-    // These older engines remain unqualified on Windows ARM64; refuse before process work.
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' })
+    Object.defineProperty(process, 'arch', { ...arch, value: 'x64' })
+    // V2 2.1.4 is not qualified on Intel macOS; refuse before process work.
     await expect(launchExplicitOpenCodeV2Run(plan)).rejects.toThrow('opencode_v2_version_unqualified')
     await expect(startOpenCodeV2RunSupervisor(plan, '/TEST-unqualified', 'TEST')).rejects.toThrow('opencode_v2_version_unqualified')
   } finally { Object.defineProperty(process, 'platform', platform); Object.defineProperty(process, 'arch', arch) }

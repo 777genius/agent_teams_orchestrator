@@ -9,12 +9,12 @@ function fixture(now = Date.now()) {
   const plan: RunLaunchPlan = {
     dataRoot: '/TEST-data', binding, deadline: now + 120_000,
     qualification: { capabilitySnapshotId: 'TEST-capability', expectedBehaviorFingerprint: 'a'.repeat(64),
-      binaryPath: '/TEST-opencode', binaryFingerprint: 'b'.repeat(64), version: '2.0.32' },
+      binaryPath: '/TEST-opencode', binaryFingerprint: 'b'.repeat(64), version: '2.1.4' },
     source: { entryPath: '/TEST-entry', entrySha256: 'c'.repeat(64), bunPath: '/TEST-bun',
       bunSha256: 'd'.repeat(64), files: [], env: {} },
     members: ['alice', 'bob'].map(memberId => ({
       memberId, laneId: 'primary', originalSessionId: `ses_TEST${memberId}`,
-      native: { generation: 'v2', version: '2.0.32', dialect: 'v2-2.0.32', executablePath: '/TEST-opencode',
+      native: { generation: 'v2', version: '2.1.4', dialect: 'v2-2.1.4', executablePath: '/TEST-opencode',
         executableSha256: 'b'.repeat(64), packageName: '@opencode/cli-darwin-arm64', runtimeMode: 'source',
         entrySha256: 'c'.repeat(64), bun: { path: '/TEST-bun', sha256: 'd'.repeat(64) }, graph: { files: [], sha256: 'e'.repeat(64) } },
       profile: { root: `/TEST-${memberId}`, epoch: `TEST-${memberId}`, directory: '/TEST-project',
@@ -32,7 +32,7 @@ function fixture(now = Date.now()) {
   const members: RunMemberStatus[] = plan.members.map((member, index) => ({
     memberId: member.memberId, laneId: 'primary', originalSessionId: member.originalSessionId,
     opencodeSessionId: member.originalSessionId, runtimeSessionId: member.originalSessionId,
-    selectedModel: 'TEST-provider/TEST-model', selectedVariant: 'default', pin: '2.0.32',
+    selectedModel: 'TEST-provider/TEST-model', selectedVariant: 'default', pin: '2.1.4',
     profileRoot: member.profile.root, profileEpoch: member.profile.epoch, runtimePid: 101 + index, state: 'accepted',
     bootstrap: { strategy: 'instruction-entry', verified: true, missingNativeMessageID: true, key: 'TEST-context',
       contextHash: 'a'.repeat(64), briefingHash: 'b'.repeat(64) },
@@ -164,7 +164,7 @@ async function missingReadinessFixture(urls: { target: string; factory: string; 
   const { mock } = await import('bun:test')
   const factory: typeof import('./OpenCodeRuntimeAdapterFactory.js') = await import(urls.factory)
   mock.module(urls.factory, () => ({ ...factory,
-    inspectOpenCodeRuntimeAdapterSelection: async () => ({ policy: { generation: 'v2', version: '2.0.32' } }),
+    inspectOpenCodeRuntimeAdapterSelection: async () => ({ policy: { generation: 'v2', version: '2.1.4' } }),
   }))
   let stage: 'source_availability' | 'execution_probe' = 'source_availability'
   let code = 'ENOENT', probes = 0
@@ -233,14 +233,14 @@ async function totalReadinessFixture(urls: { target: string; factory: string; pl
       await Bun.sleep(5); cleaned = true
       throw Error(scenario === 'selection-cleanup' ? 'opencode_version_probe_cleanup_unknown' : 'selection_unavailable')
     }
-    return { policy: { generation: 'v2', version: '2.0.32' } }
+    return { policy: { generation: 'v2', version: '2.1.4' } }
   } }))
   const planner = await import(urls.planner)
   mock.module(urls.planner, () => ({ ...planner, inspectOpenCodeV2SourceAvailability: async (_envelope: unknown, budget: { signal: AbortSignal; deadlineMs: number }) => {
     plans++; assert.equal(budget.deadlineMs, deadline); assert.ok(budget.signal instanceof AbortSignal)
     if (scenario === 'source-timeout') { clock = deadline + 1; throw Error('execution_timeout') }
     clock += 1000
-    return { model: { providerID: 'TEST', id: 'TEST' }, native: { version: '2.0.32', executablePath: '/TEST' } }
+    return { model: { providerID: 'TEST', id: 'TEST' }, native: { version: '2.1.4', executablePath: '/TEST' } }
   } }))
   const probeModule = await import(urls.probe)
   mock.module(urls.probe, () => ({ ...probeModule, resolveOpenCodeV2ExecutionProbe: async (_envelope: unknown, _selection: unknown, run: boolean,
