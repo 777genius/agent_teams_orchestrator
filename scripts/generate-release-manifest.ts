@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { openCodeBunVersion } from '../src/constants/openCodeBunVersion.js'
-import { openCodeV2ReleaseContract } from '../src/services/opencode/compatibility/OpenCodeV2Registry.js'
+import { releaseOpenCodeV2Contract } from './opencode-v2/release-delivery.js'
 import { validateOpenCodeV2DeliveryDescriptor, type OpenCodeV2DeliveryDescriptor } from '../src/services/opencode/host/OpenCodeV2DeliveryContract.js'
 import runtimeBunPins from './runtime-bun-pins.json' with { type: 'json' }
 
@@ -22,7 +22,7 @@ export function generateRuntimeReleaseManifest(options: {
   }
   const manifestFile = `agent-teams-runtime-manifest-v${runtimeVersion}.json`
   const checksumsFile = `agent-teams-runtime-SHA256SUMS-v${runtimeVersion}`
-  const qualification = openCodeV2ReleaseContract()
+  const qualification = releaseOpenCodeV2Contract()
   const manifest = {
     version: runtimeVersion, targetReleaseTag: options.targetReleaseTag, generatedAt: new Date().toISOString(),
     sourceRepository: options.sourceRepository, sourceRef: options.sourceRef, sourceCommit, bridgeProtocol: 1 as const,

@@ -88,6 +88,13 @@ Then dispatch `release-runtime.yml` for the same immutable source tag/version wi
 and runs `Verify public anonymous downloads` against the complete asset roster
 derived from that release's manifest, including its optional V2 support archives.
 
+Source releases follow the same readiness boundary. A tag creates a source draft;
+after a successful binary verification workflow, `Promote Verified Source Releases`
+automatically publishes matching source drafts. It verifies the stable public
+binary release, exact source commit, manifest/checksum consistency and anonymous
+asset URLs. Older drafts without a published stable delivery stay drafts. For
+reconciliation and recovery, see [source release publication](../scripts/release/README.md).
+
 Important:
 - the runtime tag creates a binary draft but does **not** publish it or update the UI lock automatically
 - if `claude_team` is still pinned to an older runtime in `runtime.lock.json`, users will keep bootstrapping that older binary

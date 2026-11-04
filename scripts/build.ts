@@ -248,6 +248,7 @@ const defines = {
   OPENCODE_V2_DELIVERY_DESCRIPTOR: externalDescriptor ? JSON.stringify(externalDescriptor) : 'undefined',
   OPENCODE_RUNTIME_SOURCE_COMMIT: sourceCommit ? JSON.stringify(sourceCommit) : 'undefined',
   OPENCODE_RUNTIME_VERSION: JSON.stringify(pkg.version),
+  OPENCODE_V2_DELIVERED: args.includes('--without-opencode-v2') ? 'false' : 'true',
   'process.env.USER_TYPE': JSON.stringify('external'),
   'process.env.CLAUDE_CODE_FORCE_FULL_LOGO': JSON.stringify('true'),
   ...(dev
@@ -458,6 +459,7 @@ if (compile) {
 
   console.log(`Built ${outfile}`)
   console.log(packagedDelivery ? 'Packaged OpenCode commands delegate to the verified physical JS delivery.' :
+    args.includes('--without-opencode-v2') ? 'Compiled runtime without OpenCode V2: commands run in process.' :
     'OpenCode V2 catalog acquisition is unsupported in compiled binaries; use the JS ./cli wrapper.')
 } else {
   const stagingOutdir = `${bundleOutdir}.staging-${process.pid}-${Date.now()}`

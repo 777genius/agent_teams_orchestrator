@@ -173,10 +173,17 @@ export function openCodeV2ReleaseContract(): Readonly<{
   return { cliVersionPolicy: 'stable-v2-qualified-engine', range: { ...OPENCODE_V2_SUPPORTED_RANGE }, qualified: qualified as Record<OpenCodeV2ReleasePlatform, OpenCodeV2Pin[]> }
 }
 
+// The compile-time constant is false only in the V2-free runtime binary.
+declare const OPENCODE_V2_DELIVERED: boolean | undefined
+export function openCodeV2Delivered(): boolean {
+  return typeof OPENCODE_V2_DELIVERED === 'undefined' || OPENCODE_V2_DELIVERED
+}
+
 export type OpenCodeV2LaunchRefusal = 'opencode_v2_version_out_of_range' | 'opencode_v2_version_unqualified'
 /** Launch admission: in range and qualified for team launch on this platform. Returns the coded refusal, or null. */
 export function openCodeV2LaunchRefusal(version: unknown, platform = openCodeV2CurrentPlatform()): OpenCodeV2LaunchRefusal | null {
   if (!isOpenCodeV2Pin(version)) return 'opencode_v2_version_out_of_range'
+  if (!openCodeV2Delivered()) return 'opencode_v2_version_unqualified'
   const record = qualifications.get(version)
   return record && record.scope === OPENCODE_V2_TEAM_LAUNCH_SCOPE &&
     (record.platforms as readonly string[]).includes(platform) ? null : 'opencode_v2_version_unqualified'

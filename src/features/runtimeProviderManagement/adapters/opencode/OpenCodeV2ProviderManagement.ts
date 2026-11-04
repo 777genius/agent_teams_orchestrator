@@ -35,7 +35,7 @@ import type { OpenCodeExecutionProof } from '../../../../services/opencode/types
 import type { BridgeEnvelope } from '../../../../services/opencode/bridge/OpenCodeBridgeProtocol.js'
 import type { ConnectProviderInput, LoadProviderModelsInput, LoadProviderSetupFormInput, TestProviderModelInput, ProviderConnection, RuntimeProviderModel, RuntimeProviderModelsView, ProviderModelTestResult, ProviderManagementResult, ProviderSetupForm } from '../../domain/types.js'
 import { OPENCODE_V2_NATIVE_KEY_OPTION_ID, openCodeV2KeyIntegration, openCodeV2ProviderConnectionsDirectory } from '../../../../services/opencode/catalog/OpenCodeV2KeyIntegrations.js'
-import type { OpenCodeV2Pin } from '../../../../services/opencode/compatibility/OpenCodeV2Registry.js'
+import { openCodeV2Delivered, type OpenCodeV2Pin } from '../../../../services/opencode/compatibility/OpenCodeV2Registry.js'
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../../..')
 const text = (value: unknown): string => { executionAssert(typeof value === 'string' && value.length > 0, 'provider_response_invalid'); return value }
@@ -57,6 +57,7 @@ type CatalogOwner = {
 }
 async function catalog<T>(input: { providerId: string; projectPath?: string | null }, use: (value: CatalogOwner) => Promise<T>,
   selectedRead?: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>, options?: { includeSelectedApiKey?: boolean; budget?: OpenCodeV2CatalogReadBudget }): Promise<T> {
+  executionAssert(openCodeV2Delivered(), 'opencode_v2_version_unqualified')
   // Reuse this request's generation decision; receipt/owner/child checks still revalidate the bytes.
   const budget = options?.budget
   budget?.enter('selection')
