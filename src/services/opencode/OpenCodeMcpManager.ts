@@ -692,7 +692,8 @@ function appMcpConfigMatchesRequiredRuntime(
   }
 
   const candidates = [entry, asRecord(entry?.config), asRecord(entry?.server), asRecord(entry?.options)]
-  const headerSets = candidates.map(candidate => asStringRecord(candidate?.headers)).filter(Boolean)
+  const headerSets = candidates.map(candidate => asStringRecord(candidate?.headers))
+    .filter((headers): headers is Record<string, string> => headers !== null)
   if (desiredConfig.headers?.Authorization) {
     const headers = headerSets[0]
     if (!headers || Object.keys(headers).length !== 1 || remoteMcpIdentity({ url: getEntryUrl(entry) ?? undefined, headers }) !== remoteMcpIdentity(desiredConfig)) {
