@@ -31,7 +31,7 @@ test('V2 execution, catalog and provider code selects the real Linux V2 lane', (
     'src/services/opencode/execution/OpenCodeV2ExecutionContracts.ts', 'src/services/opencode/catalog/OpenCodeV2RuntimeStatus.ts',
     'src/services/opencode/compatibility/opencode-v2-qualifications.json', 'src/services/opencode/bridge/OpenCodeV2TeamBridge.ts',
     'src/services/opencode/transport/OpenCodeV2ProviderWire.ts', 'src/services/opencode/profile/OpenCodeV2ExecutionReceipt.ts',
-    'src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.ts', 'src/entrypoints/opencodeV2ExecutionServer.ts',
+    'src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.ts', 'src/cli/runtimeTranscriptV2.ts', 'src/cli/runtimeTranscriptV2.test.ts', 'src/entrypoints/opencodeV2ExecutionServer.ts',
     'scripts/opencode-v2/stage.ts', 'scripts/opencode-v2-anonymous-native-e2e.ts', 'scripts/opencode-v2-team-native-e2e.ts', 'scripts/ci/opencode-v2-linux-execution.sh', 'patches/@opencode%2Fcore@2.0.32.patch', 'package.json']) {
     assert.equal(classify([path]).v2_linux, 'true', path)
   }
