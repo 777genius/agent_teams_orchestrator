@@ -420,7 +420,7 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   const name = ['Error', 'TypeError', 'ReferenceError', 'RangeError', 'AbortError'].find(value => value === detail?.name)
   const errno = ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'].find(value => value === detail?.code)
   const syscall = ['realpath', 'open', 'read', 'lstat', 'stat'].find(value => value === detail?.syscall)
-  const failure = phase === 'execution-host-startup' && (name || errno || syscall)
+  const failure = (phase === 'execution-host-startup' || phase.startsWith('provider-model-catalog-')) && (name || errno || syscall)
     ? { ...(name ? { name } : {}), ...(errno ? { errno } : {}), ...(syscall ? { operation: syscall } : {}) } : undefined
   const operation = readOpenCodeV2ProviderWireFailure(error)
   const catalog = error !== null && typeof error === 'object' ? catalogFailures.get(error) : undefined
