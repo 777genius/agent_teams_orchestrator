@@ -1,6 +1,7 @@
 import path from 'node:path'
 import { constants } from 'node:fs'
-import { lstat, open, readdir, realpath, rename } from 'node:fs/promises'
+import { lstat, open, readdir, realpath, rename, unlink } from 'node:fs/promises'
+import { isDeepStrictEqual } from 'node:util'
 import { randomUUID } from 'node:crypto'
 import { executionAssert, executionHash, executionRecord } from '../../../../services/opencode/execution/OpenCodeV2ExecutionContracts.js'
 import type { OpenCodeV2ProbeIntent } from '../../../../services/opencode/bridge/OpenCodeV2ExecutionProbe.js'
@@ -59,6 +60,22 @@ export async function writeOpenCodeV2ConnectIntent(file: string, value: unknown,
   const handle = await open(temporary, 'wx', 0o600)
   try { await handle.writeFile(bytes); await handle.sync() } finally { await handle.close() }
   if (!create) await rename(temporary, file)
+  if (!windows) {
+    const parent = await open(path.dirname(file), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+    try { await parent.sync() } finally { await parent.close() }
+  }
+}
+
+/** Only a completed owned native/mirror rollback may retire its pending marker. */
+export async function removeOpenCodeV2ConnectIntentIfUnchanged(
+  file: string, expected: OpenCodeV2ConnectIntent,
+): Promise<void> {
+  executionAssert(expected.state === 'pending', 'provider_original_intent_changed')
+  const current = await readOpenCodeV2ConnectIntent(file)
+  executionAssert(current !== undefined &&
+    isDeepStrictEqual(current, JSON.parse(JSON.stringify(expected))), 'provider_original_intent_changed')
+  await privatePath(file, 'file')
+  await unlink(file)
   if (!windows) {
     const parent = await open(path.dirname(file), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
     try { await parent.sync() } finally { await parent.close() }

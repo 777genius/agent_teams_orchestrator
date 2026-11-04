@@ -76,6 +76,26 @@ test('Windows ARM64 support binds its own architecture, Bun and exact engine ros
   } finally { await rm(f.root, { recursive: true, force: true }) }
 })
 
+test('macOS support binds Bun 1.4.4 and refuses the previous interpreter pins', async () => {
+  const f = await fixture()
+  try {
+    for (const arch of ['arm64', 'x64']) {
+      const engines = arch === 'arm64' ? ['2.0.0', '2.0.32', '2.1.4'] : ['2.0.0', '2.0.32']
+      await writeFile(path.join(f.local, 'opencode-v2-graphs.json'), JSON.stringify({
+        schema: 2, platform: 'darwin', arch,
+        graphs: engines.map(version => ({ version })),
+      }))
+      const descriptor = await packageOpenCodeV2Delivery({ ...f.options, platformKey: `darwin-${arch}` })
+      expect(descriptor.requiredBunVersion).toBe('1.4.4')
+      expect(descriptor.engineVersions).toEqual(engines)
+      expect(validateOpenCodeV2DeliveryDescriptor(descriptor)).toEqual(descriptor)
+      for (const requiredBunVersion of ['1.3.11', '1.4.3']) {
+        expect(() => validateOpenCodeV2DeliveryDescriptor({ ...descriptor, requiredBunVersion })).toThrow()
+      }
+    }
+  } finally { await rm(f.root, { recursive: true, force: true }) }
+})
+
 test('inventory refuses a linked graph file instead of archiving a followed dependency', async () => {
   if (process.platform === 'win32') return
   const f = await fixture()

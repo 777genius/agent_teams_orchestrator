@@ -11,12 +11,12 @@ const args = process.argv.slice(2)
 const option = (name: string) => args[args.indexOf(name) + 1]
 const platform = option('--platform')
 const pins = JSON.parse(await readFile(new URL('./runtime-bun-pins.json', import.meta.url), 'utf8')) as {
-  version: '1.3.11'; assets: Record<string, { file: string; sha256: string; entry: string; version?: '1.4.3' }>
+  version: '1.3.11'; assets: Record<string, { file: string; sha256: string; entry: string; version?: ReturnType<typeof openCodeBunVersion> }>
 }
 if (!args.includes('--platform') || !platform || !Object.hasOwn(pins.assets, platform) || pins.version !== '1.3.11') {
   throw new Error('Unsupported runtime release platform')
 }
-type Asset = { file: string; sha256: string; entry: string; version?: '1.4.3' }
+type Asset = { file: string; sha256: string; entry: string; version?: ReturnType<typeof openCodeBunVersion> }
 for (const [target, asset] of Object.entries(pins.assets)) {
   if ((asset.version ?? pins.version) !== openCodeBunVersion(target.split('-')[0])) {
     throw new Error('Runtime Bun platform pin mismatch')

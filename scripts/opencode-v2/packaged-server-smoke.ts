@@ -9,6 +9,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { appendFileSync } from 'node:fs'
 import { mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
@@ -71,9 +72,11 @@ function loadBashGrammar(core: string): string[] {
   return Object.keys(grammar).sort()
 }
 
-async function serveGraph(bundle: string, bun: string, executableSha256: string, version: string, delivery: OpenCodeV2DeliveryBinding) {
+async function serveGraph(bundle: string, bun: string, executableSha256: string, version: string, delivery: OpenCodeV2DeliveryBinding, progress: (stage: string, detail?: Row) => void) {
   assert(isOpenCodeV2Pin(version), 'Staged graph manifest invalid')
+  progress('verify_graph', { version })
   await collectOpenCodeV2GraphFiles(version, bundle, delivery)
+  progress('graph_verified', { version })
   const { server } = openCodeV2GraphPackages(version)
   const serverEntry = await realpath(Bun.resolveSync(`${server}/process`, bundle))
   const moduleSha256 = await sha(serverEntry)
@@ -84,8 +87,18 @@ async function serveGraph(bundle: string, bun: string, executableSha256: string,
   const project = await realpath(await mkdtemp(path.join(tmpdir(), 'TEST-v2-server-smoke-project-')))
   const nonce = randomUUID(), password = randomBytes(32).toString('base64url')
   const started = performance.now()
+  progress('spawn', { version })
   const child = spawn(bun, ['--no-install', path.join(bundle, 'opencodeV2Server.js')], { cwd: roots.root, env: roots.env,
     stdio: ['ignore', 'ignore', 'pipe', 'ipc'], windowsHide: true })
+  child.on('message', message => {
+    const row = message as Row | null
+    if (row?.type === 'startup-stage' && row.nonce === nonce && typeof row.stage === 'string' &&
+      /^[a-z_]{1,32}$/.test(row.stage) && typeof row.elapsedMs === 'number' && Number.isFinite(row.elapsedMs)) {
+      evidence.lastStartupStage = row.stage
+      evidence.lastStartupStageMs = row.elapsedMs
+      progress('child_startup', { version, stage: row.stage, elapsedMs: row.elapsedMs })
+    }
+  })
   let stderr = ''
   child.stderr!.on('data', chunk => { stderr = (stderr + String(chunk)).slice(-2000) })
   // 'exit' rather than 'close': a descendant holding stderr must not delay the result.
@@ -95,11 +108,13 @@ async function serveGraph(bundle: string, bun: string, executableSha256: string,
   })
   const next = messages(child, exited)
   try {
+    progress('send_start', { version })
     child.send({ type: 'start', nonce, pin: version, root: roots.root, password, executableSha256, moduleSha256, delivery })
     const ready = await next(row => row.nonce === nonce && (row.type === 'ready' || row.type === 'failed'), READY_MS, 'ready')
     assert.equal(ready.type, 'ready', 'Server child reported a failed start')
     assert(ready.pid === child.pid && ready.version === version && ready.moduleSha256 === moduleSha256 &&
       ready.executableSha256 === executableSha256, 'Server child identity mismatch')
+    progress('ready', { version })
     const baseUrl = String(ready.baseUrl)
     assert.match(baseUrl, /^http:\/\/127\.0\.0\.1:[1-9]\d*$/)
     evidence.readyMs = Math.round(performance.now() - started)
@@ -113,6 +128,7 @@ async function serveGraph(bundle: string, bun: string, executableSha256: string,
     const providers = await request(`${baseUrl}/api/provider?location%5Bdirectory%5D=${encodeURIComponent(project)}`, { authorization })
     assert.equal(providers.status, 200, `Provider route answered ${providers.status}`)
     assert.equal(typeof JSON.parse(providers.body), 'object')
+    progress('close', { version })
     child.send({ type: 'close', nonce })
     await next(row => row.type === 'closed' && row.nonce === nonce, CLOSE_MS, 'close acknowledgement')
     evidence.exitCode = await within(exited, CLOSE_MS, 'server exit')
@@ -128,16 +144,27 @@ async function serveGraph(bundle: string, bun: string, executableSha256: string,
     await roots.remove()
     await rm(project, { recursive: true, force: true })
   }
+  progress('graph_complete', { version, ok: evidence.ok })
   return evidence
 }
 
 export async function main(baseArgument: string, supportArgument: string, receipt: string): Promise<void> {
   const evidence: Row = { schemaVersion: 1, ok: false, platform: process.platform, arch: process.arch,
     bunVersion: Bun.version, graphs: [] }
+  const progress = (phase: string, detail: Row = {}) => {
+    const row = { phase, ...detail, timestamp: new Date().toISOString() }
+    // Incremental evidence survives step cancellation before the final receipt.
+    try { appendFileSync(`${receipt}.progress.ndjson`, JSON.stringify(row) + '\n') }
+    catch { evidence.progressWriteFailed = true }
+    console.log(JSON.stringify({ kind: 'packaged-server-smoke-progress', ...row }))
+  }
   try {
+    progress('load_support')
     const { delivery, descriptor, bun } = await loadPackagedOpenCodeV2Support(baseArgument, supportArgument)
     const bundle = delivery.root
+    progress('inventory')
     const staged = await inventory(path.join(bundle, 'node_modules'))
+    progress('inventory_complete', { files: staged.files })
     evidence.stagedFiles = staged.files
     evidence.stagedMegabytes = Math.round(staged.bytes / 1e5) / 10
     const manifest = JSON.parse(await readFile(path.join(bundle, 'opencode-v2-graphs.json'), 'utf8')) as {
@@ -146,7 +173,7 @@ export async function main(baseArgument: string, supportArgument: string, receip
     assert.deepEqual(manifest.graphs.map(row => row.version), descriptor.engineVersions, 'Support graph set differs from its platform descriptor')
     const executableSha256 = await sha(bun)
     for (const { version } of manifest.graphs) {
-      ;(evidence.graphs as Row[]).push(await serveGraph(bundle, bun, executableSha256, version, delivery.binding))
+      ;(evidence.graphs as Row[]).push(await serveGraph(bundle, bun, executableSha256, version, delivery.binding, progress))
     }
     evidence.ok = (evidence.graphs as Row[]).every(graph => graph.ok === true)
   } catch (error) {

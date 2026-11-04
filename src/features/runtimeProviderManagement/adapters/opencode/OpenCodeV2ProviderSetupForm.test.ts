@@ -21,7 +21,7 @@ test('native key setup scopes the catalog before real SDK reads without key or m
       executablePath: path.join(root, 'TEST-opencode'), executableSha256: 'a'.repeat(64), packageName: null }
     const selectedRead = { path: native.executablePath, native, policy: { generation: 'v2', version: pin }, fingerprint: null }
     const scope = { scopeToken: 'TEST-catalog-scope' }, requests = [], lifetime = new AbortController()
-    let profile, authPath, authority, registered = 0, unregistered = 0, closed = 0
+    let profile, authPath, authority, scopeSignal, registered = 0, unregistered = 0, closed = 0
     const endpoint = { baseUrl: 'http://127.0.0.1:1', password: 'TEST-private-transport', signal: lifetime.signal,
       async fetch(input, init) {
         const request = new Request(input, init), url = new URL(request.url)
@@ -39,10 +39,12 @@ test('native key setup scopes the catalog before real SDK reads without key or m
       } }
     const spies = [
       spyOn(profileModule, 'resolveOpenCodeV2CatalogProfileScope').mockImplementation(async input => {
-        assert.deepEqual(input, { projectPath: project, providerId }); return scope
+        assert.deepEqual(input, { projectPath: project, providerId, abortSignal: undefined })
+        scopeSignal = input.abortSignal; return scope
       }),
-      spyOn(profileModule, 'materializeOpenCodeV2CatalogScope').mockImplementation(async (actualScope, directory, target) => {
+      spyOn(profileModule, 'materializeOpenCodeV2CatalogScope').mockImplementation(async (actualScope, directory, target, options) => {
         assert.equal(actualScope, scope); assert.equal(directory, project); authPath = target
+        assert.deepEqual(options, { includeSelectedApiKey: undefined, signal: scopeSignal })
         return { provider: {}, preferredModel: null, authPath: target }
       }),
       spyOn(receiptModule, 'createOpenCodeV2ExecutionReceipt').mockImplementation(async (_sourceRoot, selected) => {

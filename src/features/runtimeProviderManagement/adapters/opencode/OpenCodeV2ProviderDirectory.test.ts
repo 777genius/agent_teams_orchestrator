@@ -97,3 +97,25 @@ for (const anonymousModelCount of [0, 1]) {
       metadata: { hasKnownModels: false }, actions: [{ id: 'use', enabled: true }] })
   })
 }
+
+
+test('full V2 discovery excludes exact V1-only IDs from every source while preserving native and custom aliases', () => {
+  const status = read(), legacy = ['kiro', 'cursor-acp', 'kimi-for-coding']
+  status.integrations.push(...legacy.map(id => ({ id, name: id, plainKey: true })))
+  status.providers = [...legacy.map(id => ({ id, integrationId: id, activation: 'enabled' as const })),
+    { id: 'custom-alias', integrationId: 'deepseek', activation: 'enabled' },
+    { id: 'custom-native', integrationId: null, activation: 'enabled' },
+    { id: 'kimi-code-plan-global', integrationId: 'kimi-code-plan-global', activation: 'enabled' }]
+  status.models = [...legacy, 'custom-alias', 'custom-native', 'kimi-code-plan-global'].map(providerId => ({
+    providerId, catalogId: 'TEST-model', upstreamModelId: 'TEST-model', variants: [], enabled: true,
+    status: 'active' as const, tools: true, input: ['text' as const], output: ['text' as const], context: 8192, outputTokens: 512 }))
+  const snapshot = openCodeV2InventorySnapshot(native, '/TEST/project', status, null,
+    legacy.map(id => ({ id, authHint: 'api', source: 'credentials' as const, credentialScopes: ['managed'] })))
+  snapshot.availableProviders.push(...legacy)
+  const { entries } = buildOpenCodeV2ProviderDirectoryEntries(snapshot)
+  for (const id of legacy) expect(entries.some(entry => entry.providerId === id)).toBe(false)
+  for (const id of ['custom-alias', 'custom-native', 'kimi-code-plan-global']) {
+    expect(entries.find(entry => entry.providerId === id)?.actions.some(action => action.id === 'use')).toBe(true)
+  }
+  expect(entries.find(entry => entry.providerId === 'custom-alias')?.displayName).toBe('DeepSeek')
+})

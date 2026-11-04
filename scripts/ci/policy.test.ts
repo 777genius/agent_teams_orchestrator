@@ -5,6 +5,16 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { aggregate, classify, diffArgs, parsePaths } from './policy.ts'
 
+test('legacy provider fixture native-selection mock is isolated from real identity tests in CI', () => {
+  const workflow = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8')
+  const target = 'src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.test.ts'
+  // Reject folded run scripts that silently combine the native-identity mock
+  // with other tests, even when the fixture path appears on a continuation line.
+  const references = workflow.split('\n').map(line => line.trim()).filter(line => line.includes(target))
+  assert.deepEqual(references, [`run: bun test ${target} --timeout 30000`])
+  assert.match(workflow, /- name: Test provider identity, inventory, labels and HTTP deadlines\n\s+run: bun test src\/services\/opencode\/OpenCodeProviderIdentity\.test\.ts/)
+})
+
 test('routine source and documentation keep Linux coverage without native jobs', () => {
   for (const path of ['src/components/Button.tsx', 'src/utils/processUserInput/processTextPrompt.ts', 'src/services/opencode/OpenCodeLogProjector.ts', 'src/services/opencode/OpenCodeModelRef.ts', 'docs/guide.md', 'src/features/runtimeProviderManagement/ui/ProviderManagementDialog.tsx']) {
     const decision = classify([path])
