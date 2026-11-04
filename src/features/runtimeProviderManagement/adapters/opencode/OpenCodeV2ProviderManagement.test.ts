@@ -174,10 +174,17 @@ test('V2 catalog diagnostics preserve only allowlisted filesystem facts', async 
       Object.assign(new Error(secret), { code: 'EACCES', syscall: 'open', path: secret }), true)
     await recordOpenCodeV2ProviderFailure('provider-model-catalog-models',
       Object.assign(new Error(secret), { code: 'EACCES-' + secret, syscall: 'open-' + secret, path: secret }), true)
+    const original = Object.assign(new Error(secret), { code: 'ENOENT', syscall: 'realpath', path: secret })
+    const cleanup = new AggregateError([original, new Error(secret)],
+      'provider_catalog_prelease_cleanup_unknown', { cause: original })
+    await recordOpenCodeV2ProviderFailure('provider-model-catalog-retirement', cleanup, true)
     const directory = path.join(root, 'opencode/v2/provider-diagnostics')
     const rows = await Promise.all((await readdir(directory)).map(async name => JSON.parse(await readFile(path.join(directory, name), 'utf8'))))
     expect(rows.find(row => row.phase === 'provider-model-catalog-profile').failure).toEqual({ name: 'Error', errno: 'EACCES', operation: 'open' })
     expect(rows.find(row => row.phase === 'provider-model-catalog-models').failure).toEqual({ name: 'Error' })
+    const uncertain = rows.find(row => row.phase === 'provider-model-catalog-retirement')
+    expect(uncertain.category).toBe('provider_operation_unknown')
+    expect(uncertain.failure).toEqual({ name: 'Error', errno: 'ENOENT', operation: 'realpath' })
     expect(JSON.stringify(rows)).not.toContain(secret)
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
