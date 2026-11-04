@@ -68,7 +68,7 @@ export async function provePostMergeReuse(context: Context, read: Read): Promise
       run.display_title === expectedTitle && run.head_branch === headBranch &&
       fields(run.head_repository, 'full_name') === headRepository
     return samePr && run.event === 'pull_request' && run.status === 'completed' && run.conclusion === 'success' &&
-      run.name === 'CI' && run.path === '.github/workflows/ci.yml' && run.head_sha === head &&
+      run.name === expectedTitle && run.path === '.github/workflows/ci.yml' && run.head_sha === head &&
       finishedBeforeMerge(run.updated_at)
   } catch { /* API errors and unavailable evidence always fall back to full CI. */ }
   return false

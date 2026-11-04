@@ -11,7 +11,8 @@ const check = { id: 456, name: 'CI required', head_sha: head, status: 'completed
   completed_at: '2026-11-04T19:59:00Z',
   app: { slug: 'github-actions' },
   details_url: `https://github.com/${repository}/actions/runs/123/job/456` }
-const run = { event: 'pull_request', status: 'completed', conclusion: 'success', name: 'CI',
+const run = { event: 'pull_request', status: 'completed', conclusion: 'success',
+  name: `CI PR=${pr.number} HEAD=${head} BASE=${base} TARGET=main`,
   path: '.github/workflows/ci.yml', head_sha: head, updated_at: '2026-11-04T19:59:00Z',
   head_branch: pr.head.ref, head_repository: { full_name: repository },
   display_title: `CI PR=${pr.number} HEAD=${head} BASE=${base} TARGET=main`,
@@ -95,6 +96,7 @@ test('a completed GitHub PR run with an empty pull_requests list still uses unam
     { display_title: `CI PR=${pr.number + 1} HEAD=${head} BASE=${base} TARGET=main` },
     { display_title: `CI PR=${pr.number} HEAD=${head} BASE=${'e'.repeat(40)} TARGET=main` },
     { display_title: '' },
+    { name: 'CI' },
   ]) {
     assert.equal(await provePostMergeReuse(context, evidence({ [url]: { ...run, ...changed } })), false)
   }
