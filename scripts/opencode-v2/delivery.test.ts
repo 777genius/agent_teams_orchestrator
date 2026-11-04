@@ -16,7 +16,7 @@ async function fixture() {
     await writeFile(path.join(local, `${entry}.js`), 'export const TEST = true\n')
   }
   await writeFile(path.join(local, 'opencode-v2-graphs.json'), JSON.stringify({ schema: 2, platform: 'linux', arch: 'x64',
-    graphs: ['2.0.0', '2.0.32', '2.1.4'].map(version => ({ version })) }))
+    graphs: ['2.1.4'].map(version => ({ version })) }))
   return { root, payload, local, options: { root: payload, outputDirectory: path.join(root, 'dist'),
     runtimeVersion: '0.0.999', sourceCommit: 'a'.repeat(40), platformKey: 'linux-x64' } }
 }
@@ -54,7 +54,7 @@ test('producer emits one independently readable, byte-bound ZIP without a duplic
 test('a payload with an unqualified or incomplete engine roster never publishes a descriptor', async () => {
   const f = await fixture()
   try {
-    await writeFile(path.join(f.local, 'opencode-v2-graphs.json'), JSON.stringify({ platform: 'linux', arch: 'x64', graphs: [{ version: '2.1.4' }] }))
+    await writeFile(path.join(f.local, 'opencode-v2-graphs.json'), JSON.stringify({ platform: 'linux', arch: 'x64', graphs: [{ version: '2.0.0' }] }))
     await expect(packageOpenCodeV2Delivery(f.options)).rejects.toThrow('graph roster mismatch')
     await expect(packageOpenCodeV2Delivery({ ...f.options, platformKey: 'win32-ia32' })).rejects.toThrow('not qualified')
   } finally { await rm(f.root, { recursive: true, force: true }) }
@@ -79,8 +79,8 @@ test('Windows ARM64 support binds its own architecture, Bun and exact engine ros
 test('macOS support binds Bun 1.4.4 and refuses the previous interpreter pins', async () => {
   const f = await fixture()
   try {
-    for (const arch of ['arm64', 'x64']) {
-      const engines = arch === 'arm64' ? ['2.0.0', '2.0.32', '2.1.4'] : ['2.0.0', '2.0.32']
+    for (const arch of ['arm64']) {
+      const engines = ['2.1.4']
       await writeFile(path.join(f.local, 'opencode-v2-graphs.json'), JSON.stringify({
         schema: 2, platform: 'darwin', arch,
         graphs: engines.map(version => ({ version })),
@@ -93,6 +93,7 @@ test('macOS support binds Bun 1.4.4 and refuses the previous interpreter pins', 
         expect(() => validateOpenCodeV2DeliveryDescriptor({ ...descriptor, requiredBunVersion })).toThrow()
       }
     }
+    await expect(packageOpenCodeV2Delivery({ ...f.options, platformKey: 'darwin-x64' })).rejects.toThrow('not qualified')
   } finally { await rm(f.root, { recursive: true, force: true }) }
 })
 
