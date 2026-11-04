@@ -40,7 +40,12 @@ export async function provePostMergeReuse(context: Context, read: Read): Promise
     const match = /^https:\/\/github\.com\/777genius\/agent_teams_orchestrator\/actions\/runs\/([1-9]\d*)\/job\/([1-9]\d*)$/.exec(url)
     if (!match) return false
     const run = object(await read(`${root}/actions/runs/${match[1]}`))
-    return run.event === 'pull_request' && run.status === 'completed' && run.conclusion === 'success' &&
+    // A different PR for the same commit may have passed a narrower scope.
+    // Only the run linked to the PR that actually merged is reusable.
+    const runPulls = fields(run, 'pull_requests')
+    const samePr = Number.isSafeInteger(pr.number) && Array.isArray(runPulls) &&
+      runPulls.length === 1 && fields(runPulls[0], 'number') === pr.number
+    return samePr && run.event === 'pull_request' && run.status === 'completed' && run.conclusion === 'success' &&
       run.name === 'CI' && run.path === '.github/workflows/ci.yml' && run.head_sha === head &&
       finishedBeforeMerge(run.updated_at)
   } catch { /* API errors and unavailable evidence always fall back to full CI. */ }

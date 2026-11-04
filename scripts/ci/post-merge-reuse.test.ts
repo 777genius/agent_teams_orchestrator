@@ -12,7 +12,8 @@ const check = { id: 456, name: 'CI required', head_sha: head, status: 'completed
   app: { slug: 'github-actions' },
   details_url: `https://github.com/${repository}/actions/runs/123/job/456` }
 const run = { event: 'pull_request', status: 'completed', conclusion: 'success', name: 'CI',
-  path: '.github/workflows/ci.yml', head_sha: head, updated_at: '2026-11-04T19:59:00Z' }
+  path: '.github/workflows/ci.yml', head_sha: head, updated_at: '2026-11-04T19:59:00Z',
+  pull_requests: [{ number: pr.number }] }
 function evidence(overrides: Record<string, unknown> = {}) {
   const table: Record<string, unknown> = {
     [`repos/${repository}/commits/${merge}/pulls?per_page=2`]: [pr],
@@ -70,6 +71,14 @@ test('a newer failed or queued gate cannot be bypassed using stale successful ch
   for (const newer of [{ ...check, id: 457, conclusion: 'failure' },
     { ...check, id: 458, status: 'queued', conclusion: null }]) {
     assert.equal(await provePostMergeReuse(context, evidence({ [url]: { check_runs: [check, newer] } })), false)
+  }
+})
+
+test('a successful run from another PR or ambiguous/missing PR association cannot grant reuse', async () => {
+  const url = `repos/${repository}/actions/runs/123`
+  for (const pulls of [[], [{ number: pr.number + 1 }],
+    [{ number: pr.number }, { number: pr.number + 1 }], null]) {
+    assert.equal(await provePostMergeReuse(context, evidence({ [url]: { ...run, pull_requests: pulls } })), false)
   }
 })
 
