@@ -65,7 +65,7 @@ function reportStartupFailure(reason: 'timeout' | 'failed', error?: unknown): vo
 // A source graph can legitimately take more than 30 seconds under concurrent
 // startup. The owner still enforces its original shared initialization deadline;
 // the start request replaces this local watchdog with that absolute deadline.
-let startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, process.platform === 'win32' ? 120_000 : 60_000)
+let startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, openCodeV2RunInitializationMs(process.platform))
 function close(): Promise<void> {
   return closeWork ??= (async () => {
     if (!runtimeReady) reportStartupFailure('failed')
@@ -108,7 +108,8 @@ async function start(input: Record<string, unknown>): Promise<void> {
     startupTimer = setTimeout(() => { reportStartupFailure('timeout'); void close() }, activationDeadline - Date.now())
   }
   enterStartupStage('delivery-resolution')
-  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution')
+  const delivery = await resolveOpenCodeV2ExecutionDelivery(import.meta.url, 'execution', native.graph.delivery)
+  executionAssert(native.runtimeMode !== 'packaged' || native.graph.delivery, 'execution_identity_mismatch')
   assertOpenCodeV2Launchable(openCodeV2EngineVersion(native))
   executionAssert(native.runtimeMode === delivery.runtimeMode && native.entrySha256 === delivery.entrySha256 &&
     native.generation === 'v2' && isOpenCodeV2Identity(openCodeV2EngineVersion(native), native.dialect) &&

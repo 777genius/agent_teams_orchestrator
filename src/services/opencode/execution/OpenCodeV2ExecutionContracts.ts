@@ -1,9 +1,10 @@
+import { OPEN_CODE_LOADING_TIMEOUT_MS } from '../OpenCodeLoadingBudget.js'
 import { createHash } from 'node:crypto'
 import { isOpenCodeV2Identity, isOpenCodeV2Pin, type OpenCodeV2Dialect, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 
 /** One absolute owner startup ceiling; callers may clip it to an earlier deadline. */
 export function openCodeV2RunInitializationMs(platform: NodeJS.Platform): number {
-  return platform === 'win32' ? 300_000 : platform === 'darwin' ? 300_000 : 90_000
+  return platform === 'win32' || platform === 'darwin' ? 300_000 : OPEN_CODE_LOADING_TIMEOUT_MS
 }
 /** The activation deadline a child accepts: the caller's deadline, clipped to the
  * platform ceiling counted from before the child was spawned. The entry refuses any

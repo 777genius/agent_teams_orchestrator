@@ -334,6 +334,7 @@ async function rememberObservedOAuthReplacement(
 export async function recoverOpenCodeOwnedOAuthSave(input: {
   globalAuthPath: string
   env?: NodeJS.ProcessEnv
+  abortSignal?: AbortSignal
   sourceAuthPaths: readonly string[]
   assertOwner: (owner: OpenCodeOAuthSaveOwner, predecessor: OpenCodeAuthCredential,
     managedAuthPath: string) => Promise<void>
@@ -346,10 +347,15 @@ export async function recoverOpenCodeOwnedOAuthSave(input: {
   isNativeProbeUnsubmitted?: (owner: OpenCodeOAuthNativeProbeOwner) => Promise<boolean>
   sessionToRelease?: OpenCodeSessionRecord
 }): Promise<boolean> {
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
   const receiptPath = oauthSaveReceiptPath(input.globalAuthPath)
   // Avoid creating a coordination database on ordinary read-only filesystem
   // sources when there has never been an owned pending publication.
-  if (await readOptionalJson(receiptPath) === null) return false
+  const pending = await readOptionalJson(receiptPath)
+  if (input.abortSignal?.aborted) throwOpenCodeAbortReason(input.abortSignal)
+  if (pending === null) return false
+  // Cancellation stops a queued recovery. Once admitted, keep the auth lease
+  // until the owned publication/retirement and its cleanup have settled.
   return withAuthStoreWriteLock(input.globalAuthPath, async () => {
     const raw = await readOptionalJson(receiptPath)
     if (raw === null) return false
@@ -604,7 +610,7 @@ export async function recoverOpenCodeOwnedOAuthSave(input: {
         entryAuthority, publicationAttempt, input.assertRetirementAuthority, error)
       throw error
     }
-  })
+  }, input.abortSignal)
 }
 
 async function withAuthStoreWriteLock<T>(
@@ -1299,6 +1305,24 @@ export async function upsertOpenCodeApiAuth(
       ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
     }
     await writeOpenCodeAuthStore(authPath, authStore)
+  })
+}
+
+/** Conditionally restore an app-managed credential after owned V2 rollback.
+ * The compare and write share the same auth-store coordination lock. */
+export async function restoreOpenCodeAuthCredentialIfUnchanged(input: {
+  authPath: string; providerId: string;
+  expected: OpenCodeAuthCredential | null; restore: OpenCodeAuthCredential | null;
+}): Promise<void> {
+  const providerId = normalizeProviderId(input.providerId)
+  if (!providerId) throw new Error('OpenCode provider id is invalid')
+  await withAuthStoreWriteLock(input.authPath, async () => {
+    const store = await readOpenCodeAuthStore(input.authPath)
+    if (!isDeepStrictEqual(store[providerId] ?? null, input.expected))
+      throw new Error('provider_rollback_publication_changed')
+    if (input.restore === null) delete store[providerId]
+    else store[providerId] = { ...input.restore }
+    await writeOpenCodeAuthStore(input.authPath, store)
   })
 }
 

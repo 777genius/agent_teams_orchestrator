@@ -45,17 +45,22 @@
     },
     {
       "version": "2.1.4",
-      "qualifiedAt": "2026-10-25",
+      "qualifiedAt": "2026-10-29",
       "scope": "team-launch",
       "platforms": [
         "darwin-arm64",
         "linux-x64",
-        "win32-x64"
+        "win32-x64",
+        "win32-arm64"
       ],
       "evidence": [
         {
           "kind": "e2e-report",
           "ref": "docs/opencode-v2-qualification/2.1.4.md"
+        },
+        {
+          "kind": "e2e-report",
+          "ref": "docs/opencode-v2-qualification/windows-arm64-2.1.4.md"
         }
       ]
     }

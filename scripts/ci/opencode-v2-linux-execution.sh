@@ -20,7 +20,11 @@ runtime="$OUT/runtime"
 mkdir -p "$runtime"
 cp "$DIST/cli" "$runtime/claude-multimodel"
 cp "$DIST/opencode-delivery.json" "$runtime/"
+cp "$DIST/opencode-v2-delivery.json" "$DIST/VERSION" "$DIST/COMMIT_SHA" "$runtime/"
 cp -R "$DIST/local-cli" "$DIST/bun" "$DIST/cursor-managed" "$runtime/"
+support_cache="$OUT/support-cache"
+"$runtime/bun/bun" --no-install --no-env-file "$REPO/scripts/opencode-v2/stage-support-fixture.ts" \
+  "$runtime" "$DIST/opencode-v2-support" "$support_cache"
 
 versions=$(node -e '
   const records = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).versions
@@ -42,6 +46,7 @@ for version in $versions; do
     XDG_CONFIG_HOME="$w/home/.config" XDG_DATA_HOME="$w/home/.local/share" \
     XDG_CACHE_HOME="$w/home/.cache" XDG_STATE_HOME="$w/home/.local/state" \
     CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH="$oc" \
+    CLAUDE_MULTIMODEL_OPENCODE_V2_SUPPORT_ROOT="$support_cache" \
     "$runtime/claude-multimodel" runtime providers models --runtime opencode --provider opencode \
       --project-path "$w/project" --limit 5 --json >"$w/models.json" 2>"$w/models.stderr"
   code=$?
@@ -64,6 +69,7 @@ for version in $versions; do
     XDG_CONFIG_HOME="$w/home/.config" XDG_DATA_HOME="$w/home/.local/share" \
     XDG_CACHE_HOME="$w/home/.cache" XDG_STATE_HOME="$w/home/.local/state" \
     CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH="$oc" \
+    CLAUDE_MULTIMODEL_OPENCODE_V2_SUPPORT_ROOT="$support_cache" \
     "$runtime/claude-multimodel" runtime status --provider opencode --json >"$w/status.json" 2>"$w/status.stderr")
   set -e
   if node -e '

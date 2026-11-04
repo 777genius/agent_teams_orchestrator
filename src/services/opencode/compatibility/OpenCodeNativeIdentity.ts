@@ -95,7 +95,7 @@ export function selectedOpenCodeReadPath(): string | null {
 }
 
 /** Execute only --version, in private roots, before any V1 profile/registry is opened. */
-export async function inspectOpenCodeReadSelection(signal?: AbortSignal, onAcquisitionStarted?: () => void): Promise<{
+export async function inspectOpenCodeReadSelection(signal?: AbortSignal, onAcquisitionStarted?: () => void, acquisitionDeadlineMs?: number): Promise<{
   path: string | null; policy: OpenCodeReadGeneration; native: OpenCodeV2NativeIdentity | null; fingerprint: string | null
 }> {
   signal?.throwIfAborted()
@@ -108,7 +108,7 @@ export async function inspectOpenCodeReadSelection(signal?: AbortSignal, onAcqui
   const executableSha256 = await hashOpenCodeFile(executablePath, signal)
   signal?.throwIfAborted()
   const roots = await createOpenCodeVersionReadRoots()
-  const output = await readOpenCodeOwnedVersion(executablePath, roots, signal)
+  const output = await readOpenCodeOwnedVersion(executablePath, roots, signal, acquisitionDeadlineMs)
   signal?.throwIfAborted()
   const policy = classifyOpenCodeReadGeneration(output)
   if (policy.generation !== 'v2') return { path: executablePath, policy, native: null, fingerprint: executableSha256 }

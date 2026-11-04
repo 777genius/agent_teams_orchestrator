@@ -163,6 +163,7 @@ import {
   getCodexNativeHistoryOperationErrorForTranscript,
 } from 'src/services/codexNative/conversationHistoryGuard.js'
 import { restoreCodexLeadConversationForFullResume } from 'src/services/codexNative/leadConversationResume.js'
+import { restoreResumedLeadTeam } from 'src/services/teamBootstrap/resumedLeadTeam.js'
 import { runSideQuestion } from 'src/utils/sideQuestion.js'
 import {
   processSessionStartHooks,
@@ -884,18 +885,23 @@ export async function runHeadless(
     return
   }
 
+  const resumeParams = {
+    isFullResume: Boolean(options.resume || options.continue) &&
+      !options.forkSession && !options.resumeSessionAt && !options.teleport,
+    getAppState,
+    setAppState,
+  }
   try {
-    await restoreCodexLeadConversationForFullResume({
-      isFullResume: Boolean(options.resume || options.continue) &&
-        !options.forkSession && !options.resumeSessionAt && !options.teleport,
-      getAppState,
-      setAppState,
-    })
+    await restoreCodexLeadConversationForFullResume(resumeParams)
   } catch (error) {
     emitLoadError(error instanceof Error ? error.message : 'Failed to restore the Codex lead identity', options.outputFormat)
     gracefulShutdownSync(1)
     return
   }
+  // Best effort: a lead that cannot be re-attached to its team still starts.
+  await restoreResumedLeadTeam(resumeParams).catch(error =>
+    logForDebugging(`[resumed-lead] team context not restored: ${errorMessage(error)}`),
+  )
 
   // When using SDK URL, always use stdio permission prompting to delegate to the SDK
   const effectivePermissionPromptToolName = options.sdkUrl

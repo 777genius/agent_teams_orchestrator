@@ -94,6 +94,19 @@ for (const [pin,cliVersion] of [['2.0.0','2.0.0'],['2.0.32','2.0.32'],['2.0.32',
           assert.deepEqual(result, { proof: null, failure })
           assert.ok(!JSON.stringify(result).includes('TEST_RAW_')); cases++
         }
+        const quota = fixture('failed')
+        const quotaError = { type: 'provider.rate-limit', status: 429, response: { body: JSON.stringify({
+          error: { code: 429, metadata: { limit_source: 'openrouter_free_tier_daily' } } }) } }
+        quota.log.events.find(event => event.type === 'session.execution.failed').data.error = quotaError
+        // The fixture provider is not OpenRouter: a provider-controlled error cannot impersonate it.
+        assert.deepEqual(await build(quota), { proof: null, failure: 'native_execution_failed' }); cases++
+        const providerID = authority.model.providerID
+        try {
+          authority.model.providerID = 'openrouter'
+          const openRouterQuota = fixture('failed')
+          openRouterQuota.log.events.find(event => event.type === 'session.execution.failed').data.error = quotaError
+          assert.deepEqual(await build(openRouterQuota), { proof: null, failure: 'provider_free_quota_exhausted' }); cases++
+        } finally { authority.model.providerID = providerID }
         const success = await build(fixture('succeeded'))
         assert.equal(success.failure, null); assert.equal(success.proof.modelId, 'test-provider/test-model')
         assert.equal(success.proof.projectPath, project); assert.equal(success.proof.opencodeVersion, cliVersion)
@@ -131,6 +144,6 @@ for (const [pin,cliVersion] of [['2.0.0','2.0.0'],['2.0.32','2.0.32'],['2.0.32',
     const [exit, stdout, stderr] = await Promise.all([child.exited,
       new Response(child.stdout).text(), new Response(child.stderr).text()])
     expect({ exit, stderr }).toEqual({ exit: 0, stderr: '' })
-    expect(JSON.parse(stdout)).toEqual({ pin, cases: pin === '2.0.32' ? 10 : 9, fixtureRemoved: true })
+    expect(JSON.parse(stdout)).toEqual({ pin, cases: pin === '2.0.32' ? 12 : 11, fixtureRemoved: true })
   }, 15_000)
 }

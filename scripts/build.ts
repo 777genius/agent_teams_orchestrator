@@ -13,6 +13,9 @@ import { dirname, join, relative, resolve } from 'path'
 import { stageCursorManagedAssets } from './cursor-plugin/stage.js'
 import { OPENCODE_V2_EXTERNALS, stageOpenCodeV2Graphs } from './opencode-v2/stage.js'
 import { validatePackagedOpenCodeIdentity } from '../src/cli/packagedOpenCodeDelivery.js'
+import { validateOpenCodeV2DeliveryDescriptor } from '../src/services/opencode/host/OpenCodeV2DeliveryContract.js'
+import { openCodeV2ReleaseContract } from '../src/services/opencode/compatibility/OpenCodeV2Registry.js'
+import { packageOpenCodeV2Delivery } from './opencode-v2/delivery.js'
 
 const pkg = await Bun.file(new URL('../package.json', import.meta.url)).json() as {
   name: string
@@ -23,7 +26,36 @@ const args = process.argv.slice(2)
 const compile = args.includes('--compile')
 const dev = args.includes('--dev')
 const compileTarget = process.env.BUN_COMPILE_TARGET?.trim() || 'bun'
-const portablePlatform = args.find(arg => arg.startsWith('--release-platform='))?.slice('--release-platform='.length)
+const supportDelivery = args.includes('--opencode-v2-support')
+const defaultBaseDelivery = !compile && !supportDelivery && !args.includes('--base-delivery')
+const baseDelivery = args.includes('--base-delivery') || defaultBaseDelivery
+const portablePlatform = args.find(arg => arg.startsWith('--release-platform='))?.slice('--release-platform='.length) ??
+  (baseDelivery || supportDelivery ? `${process.platform}-${process.arch}` : undefined)
+if ((baseDelivery && supportDelivery) || (compile && supportDelivery)) throw new Error('Conflicting runtime delivery build modes')
+if ((baseDelivery || supportDelivery) && !portablePlatform) throw new Error('Runtime delivery platform is required')
+const sourceCommit = process.env.RUNTIME_SOURCE_COMMIT?.trim() || runCommand(['git', 'rev-parse', 'HEAD'])
+if ((baseDelivery || supportDelivery) && !/^[a-f0-9]{40}$/.test(sourceCommit ?? '')) throw new Error('Runtime delivery source commit is required')
+if (defaultBaseDelivery) {
+  const qualified = openCodeV2ReleaseContract().qualified[portablePlatform as keyof ReturnType<typeof openCodeV2ReleaseContract>['qualified']]
+  if (!qualified) throw new Error('No runtime delivery is configured for this platform; use ./cli-source')
+  rmSync('./dist/opencode-v2-delivery.json', { force: true })
+  rmSync('./dist/opencode-v2-support', { recursive: true, force: true })
+  if (qualified.length) {
+    const child = Bun.spawnSync({ cmd: [process.execPath, '--no-install', import.meta.path, ...args,
+      '--opencode-v2-support', '--portable-graph', `--release-platform=${portablePlatform}`],
+    env: { ...process.env, RUNTIME_SOURCE_COMMIT: sourceCommit! }, stdout: 'inherit', stderr: 'inherit' })
+    if (child.exitCode !== 0) throw new Error('OpenCode V2 support build failed')
+    await packageOpenCodeV2Delivery({ root: './dist/opencode-v2-support', outputDirectory: './dist',
+      runtimeVersion: pkg.version, sourceCommit: sourceCommit!, platformKey: portablePlatform! })
+  }
+}
+const externalDescriptor = baseDelivery && existsSync('./dist/opencode-v2-delivery.json')
+  ? validateOpenCodeV2DeliveryDescriptor(JSON.parse(readFileSync('./dist/opencode-v2-delivery.json', 'utf8')))
+  : undefined
+if (baseDelivery && !externalDescriptor &&
+  openCodeV2ReleaseContract().qualified[portablePlatform as keyof ReturnType<typeof openCodeV2ReleaseContract>['qualified']]?.length) {
+  throw new Error('Qualified V2 support must be built before its graph-free base')
+}
 const packagedDelivery = compile && args.includes('--packaged-delivery')
   ? validatePackagedOpenCodeIdentity(JSON.parse(readFileSync('./dist/opencode-delivery.json', 'utf8')))
   : undefined
@@ -149,7 +181,7 @@ const outfile = compile
   : dev
     ? './cli-dev'
     : './cli'
-const bundleOutdir = dev ? './dist/local-cli-dev' : './dist/local-cli'
+const bundleOutdir = supportDelivery ? './dist/opencode-v2-support/local-cli' : dev ? './dist/local-cli-dev' : './dist/local-cli'
 const bundleEntrypoint = `${bundleOutdir}/cli.js`
 const buildTime = new Date().toISOString()
 // Internal snapshot version controls updater ordering and upstream feature gates.
@@ -195,6 +227,9 @@ function patchGeminiCliCoreWasmImports(): void {
 
 patchGeminiCliCoreWasmImports()
 
+if (externalDescriptor && (externalDescriptor.runtimeVersion !== pkg.version || externalDescriptor.sourceCommit !== sourceCommit ||
+  `${externalDescriptor.platform}-${externalDescriptor.arch}` !== portablePlatform)) throw new Error('OpenCode V2 delivery descriptor build mismatch')
+
 const externals = [
   '@ant/*',
   'audio-capture-napi',
@@ -205,11 +240,14 @@ const externals = [
   // JS delivery keeps each selected official graph physically distinct. The
   // compiled delivery is fenced before V2 acquisition and retains its existing
   // bundled dependencies for the rest of the CLI.
-  ...(!compile ? OPENCODE_V2_EXTERNALS : []),
+  ...(!compile && !baseDelivery ? OPENCODE_V2_EXTERNALS : []),
 ]
 
 const defines = {
   PACKAGED_OPENCODE_DELIVERY: packagedDelivery ? JSON.stringify(packagedDelivery) : 'undefined',
+  OPENCODE_V2_DELIVERY_DESCRIPTOR: externalDescriptor ? JSON.stringify(externalDescriptor) : 'undefined',
+  OPENCODE_RUNTIME_SOURCE_COMMIT: sourceCommit ? JSON.stringify(sourceCommit) : 'undefined',
+  OPENCODE_RUNTIME_VERSION: JSON.stringify(pkg.version),
   'process.env.USER_TYPE': JSON.stringify('external'),
   'process.env.CLAUDE_CODE_FORCE_FULL_LOGO': JSON.stringify('true'),
   ...(dev
@@ -256,7 +294,7 @@ function extendBuildArgs(cmd: string[]): string[] {
 
 function runBuild(cmd: string[]): void {
   const proc = Bun.spawnSync({
-    cmd,
+    cmd: [cmd[0]!, '--no-install', ...cmd.slice(1)],
     cwd: process.cwd(),
     stdout: 'inherit',
     stderr: 'inherit',
@@ -335,7 +373,7 @@ augment_launcher_path
 wait_for_target
 BUN_BIN="$(resolve_bun)" || exit $?
 
-exec "$BUN_BIN" "$TARGET" "$@"
+exec "$BUN_BIN" --no-install "$TARGET" "$@"
 `
 
   writeFileSync(launcherPath, launcher)
@@ -362,7 +400,7 @@ exit /b 127
 
 :run_target
 call :augment_launcher_path
-bun "%TARGET%" %*
+bun --no-install "%TARGET%" %*
 exit /b %ERRORLEVEL%
 
 :augment_launcher_path
@@ -375,6 +413,8 @@ exit /b 0
 }
 
 function publishBundleOutdir(stagingOutdir: string, finalOutdir: string): void {
+  // A graph-free release must not retain children/node_modules from a preceding build.
+  if (baseDelivery || supportDelivery) rmSync(finalOutdir, { recursive: true, force: true })
   mkdirSync(finalOutdir, { recursive: true })
 
   for (const entryName of readdirSync(stagingOutdir)) {
@@ -427,10 +467,9 @@ if (compile) {
   const cmd = extendBuildArgs([
     process.execPath,
     'build',
-    './src/entrypoints/cli.tsx',
-    './src/entrypoints/opencodeV2Server.ts',
-    './src/entrypoints/opencodeV2ExecutionServer.ts',
-    './src/entrypoints/opencodeV2RunOwner.ts',
+    ...(supportDelivery ? [] : ['./src/entrypoints/cli.tsx']),
+    ...(baseDelivery ? [] : ['./src/entrypoints/opencodeV2Server.ts',
+      './src/entrypoints/opencodeV2ExecutionServer.ts', './src/entrypoints/opencodeV2RunOwner.ts']),
     '--target',
     'bun',
     '--format',
@@ -445,17 +484,21 @@ if (compile) {
   ])
 
   runBuild(cmd)
-  await stageOpenCodeV2Graphs(process.cwd(), stagingOutdir, { portable: args.includes('--portable-graph'),
-    platform: portablePlatform?.split('-')[0], arch: portablePlatform?.split('-')[1] })
+  if (!baseDelivery) await stageOpenCodeV2Graphs(process.cwd(), stagingOutdir, { portable: args.includes('--portable-graph'),
+    platform: portablePlatform?.split('-')[0], arch: portablePlatform?.split('-')[1],
+    ...(supportDelivery ? { qualifiedPlatform: portablePlatform } : {}) })
   publishBundleOutdir(stagingOutdir, bundleOutdir)
-  writeLauncher(outfile, bundleEntrypoint)
+  if (!supportDelivery) writeLauncher(outfile, bundleEntrypoint)
 
   console.log(`Built ${outfile} -> ${bundleEntrypoint}`)
+  if (baseDelivery) console.log('Built V2 requires its separately installed support payload; use ./cli-source for source-mode development.')
 }
 
 // Ship the reviewed Cursor plugin next to the built runtime. Without this the
 // managed path only works for someone who staged assets by hand, which is not a
 // delivery mechanism.
-const cursorManagedRoot = `${compile ? './dist' : bundleOutdir}/cursor-managed`
-await stageCursorManagedAssets(cursorManagedRoot)
-console.log(`Staged Cursor managed assets -> ${cursorManagedRoot}`)
+if (!supportDelivery) {
+  const cursorManagedRoot = `${compile ? './dist' : bundleOutdir}/cursor-managed`
+  await stageCursorManagedAssets(cursorManagedRoot)
+  console.log(`Staged Cursor managed assets -> ${cursorManagedRoot}`)
+}

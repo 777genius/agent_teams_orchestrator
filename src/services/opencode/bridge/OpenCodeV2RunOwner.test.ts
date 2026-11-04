@@ -38,7 +38,7 @@ const intent: QueueIntent = { delivery: 'queue', identity: {
 }, input: { nativeInputID: 'msg_TESTinput', text: 'hello worker', resume: true } }
 
 async function fixture(options: { groupTools?: boolean; unknown?: boolean; foreignClient?: boolean; createUnknown?: boolean;
-  probe?: boolean; promptBarrier?: Promise<void>; closeBarrier?: Promise<void>; permissionResources?: string[];
+  probe?: boolean; unattendedTeam?: boolean; promptBarrier?: Promise<void>; closeBarrier?: Promise<void>; permissionResources?: string[];
   lifetimeMs?: number; twoMembers?: boolean; memberCount?: number; preparation?: () => void; startup?: () => void;
   graphValidations?: unknown[];
   leaseClose?: (deadline: number | undefined) => void;
@@ -79,7 +79,7 @@ async function fixture(options: { groupTools?: boolean; unknown?: boolean; forei
     binaryPath: '/TEST-opencode', binaryFingerprint: 'TEST-native', version: '2.0.32' } }
   if (options.probe) {
     const member = plan.members[0]!, config = JSON.parse(member.profile.config.content)
-    plan = { ...plan, members: [{ ...member, profile: { ...member.profile, root, directory: authority.directory } }], executionProbe: { memberId: member.memberId, intent, expectedText: 'done', capabilitySnapshotId: 'TEST-capability',
+    plan = { ...plan, members: [{ ...member, profile: { ...member.profile, root, directory: authority.directory } }], executionProbe: { memberId: member.memberId, intent, expectedText: 'done', capabilitySnapshotId: 'TEST-capability', unattendedTeam: options.unattendedTeam === true,
       prepared: { projectPath: authority.directory, canonicalProjectPath: authority.directory, workingDirectoryPath: authority.directory,
         scopeToken: null, profileRootKey: 'TEST-profile', profileRootPath: root, projectBehaviorFingerprint: 'b'.repeat(64), behaviorSources: [],
         managedConfig: config, managedConfigFingerprint: createHash('sha256').update(JSON.stringify(config)).digest('hex'),
@@ -194,7 +194,7 @@ async function fixture(options: { groupTools?: boolean; unknown?: boolean; forei
 
 // Native terminal evidence can exist without a delivery-observe RPC. The owner
 // must reconcile that exact original before reserving a subsequent queue input.
-function publishTerminal(f: Awaited<ReturnType<typeof fixture>>, terminal = true) {
+function publishTerminal(f: Awaited<ReturnType<typeof fixture>>, terminal = true, outcome: 'succeeded' | 'failed' | 'cancelled' = 'succeeded') {
   const a = f.sessionAuthority, sessionID = a.sessionID, nativeInputID = intent.identity.nativeInputID
   const events: ExecutionLog['events'] = [
     { id: 'enqueued', type: 'session.inbox.enqueued', seq: 1, aggregateID: sessionID,
@@ -208,12 +208,14 @@ function publishTerminal(f: Awaited<ReturnType<typeof fixture>>, terminal = true
     { id: 'stepend', type: 'session.step.ended', seq: 6, aggregateID: sessionID,
       data: { sessionID, assistantMessageID: 'msg_assistant', finish: 'stop' } },
   ]
-  if (terminal) events.push({ id: 'evt_terminal', type: 'session.execution.succeeded', seq: 7, aggregateID: sessionID, data: { sessionID } })
+  if (terminal) events.push({ id: 'evt_terminal', type: outcome === 'cancelled' ? 'session.execution.interrupted' : `session.execution.${outcome}`, seq: 7, aggregateID: sessionID,
+    data: { sessionID, ...(outcome === 'failed' ? { error: { type: 'provider.internal', message: 'TEST native execution failure' } } :
+      outcome === 'cancelled' ? { reason: 'interrupt' } : {}) } })
   const messages: ExecutionMessage[] = [
     { id: nativeInputID, timeCreated: 1, type: 'user', data: { id: nativeInputID, type: 'user', text: intent.input.text } },
     { id: 'msg_assistant', timeCreated: 1, type: 'assistant', data: { id: 'msg_assistant', type: 'assistant',
       agent: a.agent, model: a.model, time: { created: 1, completed: 2 }, finish: 'stop', content: [{ type: 'text', text: 'done' }] } },
-    ...(terminal ? [{ id: 'msg_terminal', timeCreated: 1, type: 'idle', data: { outcome: 'succeeded' } }] : []),
+    ...(terminal ? [{ id: 'msg_terminal', timeCreated: 1, type: 'idle', data: { outcome: outcome === 'cancelled' ? 'interrupted' : outcome } }] : []),
   ]
   f.native.log = async () => ({ events, synced: true, watermark: events.at(-1)!.seq })
   f.native.messages = async (_id, cursor) => cursor === undefined
@@ -418,12 +420,12 @@ test('reservation failure before creation stops without fencing or native sessio
 })
 
 describe('run-owned V2 lease/session/admission composition', () => {
-  test('next send settles the exact native-completed original without an observe RPC or replay', async () => {
+  for (const outcome of ['succeeded', 'failed', 'cancelled'] as const) test(`next send settles the exact ${outcome} original without an observe RPC or replay`, async () => {
     const f = await fixture()
     try {
       await f.owner.ready()
       await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
-      publishTerminal(f)
+      publishTerminal(f, true, outcome)
       const before = await (await f.store()).snapshot()
       expect(before.slot).toBe(intent.identity.requestId)
       expect(before.admissions[0]).toMatchObject({ complete: false, cursor: null })
@@ -433,6 +435,7 @@ describe('run-owned V2 lease/session/admission composition', () => {
       const after = await (await f.store()).snapshot()
       expect(after.slot).toBe(next.identity.requestId)
       expect(after.terminalSettlements).toHaveLength(1)
+      expect(after.terminalSettlements?.[0]?.state).toBe(outcome)
       expect(f.counters.prompted).toBe(2)
       await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
       expect((await (await f.store()).snapshot()).slot).toBe(next.identity.requestId)
@@ -1026,7 +1029,8 @@ requireExecutionEndpoint: authority => {
     } finally { await rm(root, { recursive: true, force: true }) }
     return
   }
-  const f = await fixture({ probe: true })
+  for (const unattendedTeam of [false, true]) {
+  const f = await fixture({ probe: true, unattendedTeam })
   try {
     await f.owner.ready()
     await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 2000)
@@ -1056,6 +1060,7 @@ requireExecutionEndpoint: authority => {
     if (settled.kind !== 'probeEvidence') throw Error('TEST probe missing')
     expect(settled.failure).toBeNull()
     expect(settled.proof).toMatchObject({ modelId: 'TEST-provider/TEST-model', opencodeVersion: '2.0.32', capabilitySnapshotId: 'TEST-capability' })
+    expect(Date.parse(settled.proof!.expiresAt) - Date.parse(settled.proof!.verifiedAt)).toBe(unattendedTeam ? 330_000 : 120_000)
     expect((await (await f.store()).snapshot()).slot).toBeNull()
     expect(f.counters).toMatchObject({ prompted: 1, acquired: 1, sessions: 1 })
     for (const fault of [new Error('mutable_readback'), new ExecutionTransportFailure('invalid_response', 'not_submitted')]) {
@@ -1068,6 +1073,7 @@ requireExecutionEndpoint: authority => {
     await expect(f.owner.execute({ operation: 'probeEvidence', ...f.selected }, Date.now() + 2000)).rejects.toThrow('incomplete_log')
     expect(f.counters.prompted).toBe(1)
   } finally { f.native.log = async () => ({ events: [], synced: true, watermark: null }); await f.close() }
+  }
 }, 15_000)
 
 

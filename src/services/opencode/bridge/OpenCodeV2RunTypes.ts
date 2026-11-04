@@ -3,8 +3,10 @@ import type { OpenCodePreparedProfile, OpenCodeExecutionProof } from '../types.j
 import type { ControllerToolProof } from './OpenCodeV2ControllerTools.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import type { AdmissionRecord, SessionAuthority } from '../execution/OpenCodeV2ExecutionContracts.js'
-import type { RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
+import type { OpenCodeV2ProviderFailureCategory, RunInitializationPhase } from '../execution/OpenCodeV2Diagnostics.js'
+import type { OpenCodeV2ProviderWireFailure } from '../transport/OpenCodeV2ProviderWire.js'
 import type { OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
+import type { OpenCodeV2DeliveryBinding } from '../host/OpenCodeV2DeliveryManifest.js'
 import type { ExecutionLease, SelectedExecutionProfile, ValidatedExecutionNative } from '../host/OpenCodeV2ExecutionHost.js'
 import type { ExecutionCleanupReceipt } from '../host/OpenCodeV2ExecutionLifecycle.js'
 import type { ExecutionBridgeClient, ExecutionLog, ExecutionMessagePage, ExecutionPermission, ExecutionMcpServer } from '../transport/OpenCodeV2ExecutionClientFactory.js'
@@ -34,9 +36,9 @@ export type RunQualification = Readonly<{ capabilitySnapshotId: string | null; e
 export type RunLaunchPlan = Readonly<{
   qualification?: RunQualification
   dataRoot: string; binding: RunBinding; deadline: number; members: readonly RunMemberPlan[]
-  executionProbe?: Readonly<{ memberId: string; intent: QueueIntent; expectedText: string; prepared: OpenCodePreparedProfile; capabilitySnapshotId: string }>
+  executionProbe?: Readonly<{ memberId: string; intent: QueueIntent; expectedText: string; prepared: OpenCodePreparedProfile; capabilitySnapshotId: string; unattendedTeam?: boolean }>
   source: Readonly<{ entryPath: string; entrySha256: string; bunPath: string; bunSha256: string
-    files: readonly Readonly<{ path: string; sha256: string }>[]; env: Readonly<Record<string, string>> }>
+    files: readonly Readonly<{ path: string; sha256: string }>[]; env: Readonly<Record<string, string>>; delivery?: OpenCodeV2DeliveryBinding }>
 }>
 type MemberRequest = Readonly<{ memberId: string; originalSessionId: string }>
 export type RunControlRequest =
@@ -62,7 +64,12 @@ export type RunMemberStatus = Readonly<{
   controllerTools?: ControllerToolProof
 }>
 export type RunStopMember = Readonly<{ memberId: string; cleanup: ExecutionCleanupReceipt | null; errors: readonly string[] }>
-export type RunProbeFailure = 'native_execution_failed' | 'native_execution_cancelled'
+export type RunProbeFailure = 'native_execution_failed' | 'native_execution_cancelled' | 'provider_free_quota_exhausted'
+/** Closed facts of an owner's own initialization failure: a fixed category and the
+ * provider wire stage. Never a message, body, path or credential. */
+export type RunOwnerFailure = Readonly<{ category: OpenCodeV2ProviderFailureCategory; operation?: OpenCodeV2ProviderWireFailure }>
+/** The original owner process is proven gone; `failure` is its own record, if any. */
+export type RunOwnerRetirement = Readonly<{ failure: RunOwnerFailure | null }>
 export type RunControlResult =
   | Readonly<{ kind: 'send_refused'; disposition: 'not_reserved'; authority: SessionAuthority; intent: QueueIntent; submissionOwner?: string }>
   | Readonly<{ kind: 'send' | 'observe'; admission: AdmissionRecord; turn: OpenCodeV2TurnProjection | null }>

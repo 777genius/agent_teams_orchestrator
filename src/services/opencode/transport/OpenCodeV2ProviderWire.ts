@@ -3,8 +3,11 @@ import { executionAssert, type ExecutionAuthority } from '../execution/OpenCodeV
 import { openCodeV2Wire } from '../compatibility/OpenCodeV2Registry.js'
 import { boundOpenCodeRead, checkOpenCodeReadJson } from './OpenCodeBoundedFetch.js'
 
-type ProviderOperation = 'provider-read' | 'model-read' | 'integration-read' | 'activation-await' | 'key-connect' | 'credential-delete' | 'credential-activate'
-type ProviderFailure = Readonly<{ operation: ProviderOperation; stage: 'request' | 'response' | 'body' | 'decode'; status: number | null }>
+export const OPEN_CODE_V2_PROVIDER_OPERATIONS = ['provider-read', 'model-read', 'integration-read', 'activation-await', 'key-connect', 'credential-delete', 'credential-activate'] as const
+export const OPEN_CODE_V2_PROVIDER_STAGES = ['request', 'response', 'body', 'decode'] as const
+type ProviderOperation = typeof OPEN_CODE_V2_PROVIDER_OPERATIONS[number]
+export type OpenCodeV2ProviderWireFailure = Readonly<{ operation: ProviderOperation; stage: typeof OPEN_CODE_V2_PROVIDER_STAGES[number]; status: number | null }>
+type ProviderFailure = OpenCodeV2ProviderWireFailure
 const failures = new WeakMap<Error, ProviderFailure>()
 /** Read only metadata minted at this transport boundary, never caller fields. */
 export function readOpenCodeV2ProviderWireFailure(error: unknown): ProviderFailure | undefined {

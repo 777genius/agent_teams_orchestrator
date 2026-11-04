@@ -19,7 +19,7 @@ const envelope=(command,body)=>({schemaVersion:1,requestId:'TEST',command,cwd:ro
 test('unsupported Windows architecture selects V1 without querying unavailable V2 authority', async () => {
   await isolated(`${prefix}
   try {
-    Object.defineProperty(process,'platform',{value:'win32'});Object.defineProperty(process,'arch',{value:'arm64'});Object.defineProperty(process,'getuid',{value:undefined});
+    Object.defineProperty(process,'platform',{value:'win32'});Object.defineProperty(process,'arch',{value:'ia32'});Object.defineProperty(process,'getuid',{value:undefined});
     let legacy=0;OpenCodeV2TeamBridge.prototype.discover=async()=>{throw Error('run_source_linux_required')};
     for(const command of ['opencode.launchTeam','opencode.sendMessage','opencode.stopTeam','opencode.observeMessageDelivery','opencode.reconcileTeam','opencode.getRuntimeTranscript']){
       const result=await execute(envelope(command,{teamId:'TEST',runId:'TEST-run'}),async()=>{legacy++;return 'V1'});assert.equal(result,'V1');
@@ -32,10 +32,10 @@ test('unsupported Windows architecture selects V1 without querying unavailable V
 
 // This source contract checks ordering/vetoes only. Real Windows launches run in the
 // native Windows end-to-end workflow.
-test('Windows x64 discovers before V1 selection and UNKNOWN vetoes a bound handshake', async () => {
+test.each(['x64', 'arm64'] as const)('Windows %s discovers before V1 selection and UNKNOWN vetoes a bound handshake', async arch => {
   await isolated(`${prefix}
   try {
-    Object.defineProperty(process,'platform',{value:'win32'});Object.defineProperty(process,'arch',{value:'x64'});
+    Object.defineProperty(process,'platform',{value:'win32'});Object.defineProperty(process,'arch',{value:${JSON.stringify(arch)}});
     const order=[];let legacy=0;
     OpenCodeV2TeamBridge.prototype.discover=async()=>{order.push('discover');return null};
     mock.module(${JSON.stringify(factory)},()=>({...f,inspectOpenCodeRuntimeAdapterSelection:async()=>{order.push('select');return {policy:{generation:'v1',version:'1.19.0'}}}}));
