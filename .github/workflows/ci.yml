@@ -255,6 +255,8 @@ jobs:
         # child startups per test; the default 5s can expire during valid work.
         # Production operation deadlines remain enforced inside the tests.
         run: bun run test:opencode-authority --timeout ${{ runner.os == 'Windows' && '30000' || '5000' }}
+      - name: Test private MCP credential publication across host platforms
+        run: bun test src/services/opencode/OpenCodePrivateMcpConfig.test.ts --timeout 30000
       - name: Test provider settings and HTTP body deadlines
         run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.test.ts src/services/opencode/OpenCodeProviderIdentity.test.ts src/services/opencode/OpenCodeInventoryService.test.ts src/services/opencode/OpenCodeProviderLabelRegression.test.ts src/services/opencode/OpenCodeClientFactory.test.ts --timeout 30000
       - name: Test V2 provider catalogs, defaults and project identity
