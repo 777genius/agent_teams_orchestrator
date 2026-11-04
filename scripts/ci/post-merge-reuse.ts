@@ -13,7 +13,7 @@ export async function provePostMergeReuse(context: Context, read: Read): Promise
     context.repository !== '777genius/agent_teams_orchestrator' || !hexSha(context.sha)) return false
   const root = `repos/${context.repository}`
   try {
-    const associated = await read(`${root}/commits/${context.sha}/pulls`)
+    const associated = await read(`${root}/commits/${context.sha}/pulls?per_page=2`)
     if (!Array.isArray(associated) || associated.length !== 1) return false
     const pr = object(associated[0]), source = fields(pr, 'head')
     const head = fields(source, 'sha')
@@ -24,19 +24,25 @@ export async function provePostMergeReuse(context: Context, read: Read): Promise
     ])
     const tree = fields(fields(merged, 'tree'), 'sha')
     if (!hexSha(tree) || tree !== fields(fields(original, 'tree'), 'sha')) return false
-    const runs = fields(await read(`${root}/commits/${head}/check-runs?check_name=CI%20required&per_page=100`), 'check_runs')
-    if (!Array.isArray(runs)) return false
-    for (const entry of runs) {
-      const check = object(entry), url = check.details_url
-      if (check.name !== 'CI required' || check.status !== 'completed' ||
-        check.conclusion !== 'success' || check.head_sha !== head ||
-        fields(check.app, 'slug') !== 'github-actions' || typeof url !== 'string') continue
-      const match = /^https:\/\/github\.com\/777genius\/agent_teams_orchestrator\/actions\/runs\/([1-9]\d*)\/job\/([1-9]\d*)$/.exec(url)
-      if (!match) continue
-      const run = object(await read(`${root}/actions/runs/${match[1]}`))
-      if (run.event === 'pull_request' && run.status === 'completed' && run.conclusion === 'success' &&
-        run.name === 'CI' && run.path === '.github/workflows/ci.yml' && run.head_sha === head) return true
-    }
+    const checks = fields(await read(`${root}/commits/${head}/check-runs?check_name=CI%20required&per_page=100`), 'check_runs')
+    if (!Array.isArray(checks)) return false
+    const candidates = checks.map(object).filter(check => check.name === 'CI required' && check.head_sha === head)
+    if (!candidates.length || candidates.some(check => !Number.isSafeInteger(check.id) || Number(check.id) <= 0)) return false
+    // Only the most recent required gate for this head is authoritative.
+    const check = candidates.sort((a, b) => Number(b.id) - Number(a.id))[0]
+    const url = check.details_url
+    const finishedBeforeMerge = (value: unknown): boolean =>
+      typeof value === 'string' && Number.isFinite(Date.parse(value)) &&
+      Date.parse(value) <= Date.parse(String(pr.merged_at))
+    if (check.status !== 'completed' || check.conclusion !== 'success' ||
+      fields(check.app, 'slug') !== 'github-actions' || typeof url !== 'string' ||
+      !finishedBeforeMerge(check.completed_at)) return false
+    const match = /^https:\/\/github\.com\/777genius\/agent_teams_orchestrator\/actions\/runs\/([1-9]\d*)\/job\/([1-9]\d*)$/.exec(url)
+    if (!match) return false
+    const run = object(await read(`${root}/actions/runs/${match[1]}`))
+    return run.event === 'pull_request' && run.status === 'completed' && run.conclusion === 'success' &&
+      run.name === 'CI' && run.path === '.github/workflows/ci.yml' && run.head_sha === head &&
+      finishedBeforeMerge(run.updated_at)
   } catch { /* API errors and unavailable evidence always fall back to full CI. */ }
   return false
 }

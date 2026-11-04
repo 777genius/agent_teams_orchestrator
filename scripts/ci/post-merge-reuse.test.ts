@@ -7,14 +7,15 @@ const repository = '777genius/agent_teams_orchestrator'
 const context = { event: 'push', ref: 'refs/heads/main', repository, sha: merge }
 const pr = { number: 7, merged_at: '2026-11-04T20:00:00Z', merge_commit_sha: merge,
   base: { ref: 'main' }, head: { sha: head } }
-const check = { name: 'CI required', head_sha: head, status: 'completed', conclusion: 'success',
+const check = { id: 456, name: 'CI required', head_sha: head, status: 'completed', conclusion: 'success',
+  completed_at: '2026-11-04T19:59:00Z',
   app: { slug: 'github-actions' },
   details_url: `https://github.com/${repository}/actions/runs/123/job/456` }
 const run = { event: 'pull_request', status: 'completed', conclusion: 'success', name: 'CI',
-  path: '.github/workflows/ci.yml', head_sha: head }
+  path: '.github/workflows/ci.yml', head_sha: head, updated_at: '2026-11-04T19:59:00Z' }
 function evidence(overrides: Record<string, unknown> = {}) {
   const table: Record<string, unknown> = {
-    [`repos/${repository}/commits/${merge}/pulls`]: [pr],
+    [`repos/${repository}/commits/${merge}/pulls?per_page=2`]: [pr],
     [`repos/${repository}/git/commits/${merge}`]: { tree: { sha: tree } },
     [`repos/${repository}/git/commits/${head}`]: { tree: { sha: tree } },
     [`repos/${repository}/commits/${head}/check-runs?check_name=CI%20required&per_page=100`]: { check_runs: [check] },
@@ -37,7 +38,7 @@ test('a direct push, dev push, invalid SHA or different repository must do full 
   }
 })
 test('missing, ambiguous, unmerged or unrelated PR never grants reuse', async () => {
-  const url = `repos/${repository}/commits/${merge}/pulls`
+  const url = `repos/${repository}/commits/${merge}/pulls?per_page=2`
   for (const prs of [[], [pr, pr], [{ ...pr, merged_at: null }], [{ ...pr, merge_commit_sha: head }],
     [{ ...pr, base: { ref: 'dev' } }]]) {
     assert.equal(await provePostMergeReuse(context, evidence({ [url]: prs })), false)
@@ -62,4 +63,22 @@ test('a cancelled, non-PR, wrong-head or other workflow run is not a PR CI proof
     { head_sha: merge }, { path: '.github/workflows/manual.yml' }, { status: 'in_progress' }]) {
     assert.equal(await provePostMergeReuse(context, evidence({ [url]: { ...run, ...changed } })), false)
   }
+})
+
+test('a newer failed or queued gate cannot be bypassed using stale successful checks', async () => {
+  const url = `repos/${repository}/commits/${head}/check-runs?check_name=CI%20required&per_page=100`
+  for (const newer of [{ ...check, id: 457, conclusion: 'failure' },
+    { ...check, id: 458, status: 'queued', conclusion: null }]) {
+    assert.equal(await provePostMergeReuse(context, evidence({ [url]: { check_runs: [check, newer] } })), false)
+  }
+})
+
+test('qualifying CI must be complete before the merge, not afterwards', async () => {
+  const checks = `repos/${repository}/commits/${head}/check-runs?check_name=CI%20required&per_page=100`
+  assert.equal(await provePostMergeReuse(context, evidence({ [checks]: {
+    check_runs: [{ ...check, completed_at: '2026-11-04T20:01:00Z' }],
+  } })), false)
+  assert.equal(await provePostMergeReuse(context, evidence({ [`repos/${repository}/actions/runs/123`]: {
+    ...run, updated_at: '2026-11-04T20:01:00Z',
+  } })), false)
 })
