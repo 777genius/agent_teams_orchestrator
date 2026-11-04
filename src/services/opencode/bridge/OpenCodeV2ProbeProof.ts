@@ -1,3 +1,4 @@
+import { classifyOpenCodeV2ProbeFailure } from './OpenCodeV2ProbeFailure.js'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
 import { buildOpenCodeExecutionProof } from '../OpenCodeExecutionProof.js'
@@ -44,9 +45,13 @@ export async function buildOwnedV2ProbeProof(input: { client: ExecutionBridgeCli
   if (!terminal) return { proof: null, failure: null }
   // This state comes only from the branded original-input cut. Never emit the
   // provider's raw error/message/body or classify a bare idle snapshot.
-  if (terminal.state !== 'succeeded') return { proof: null,
-    failure: terminal.state === 'failed' ? 'native_execution_failed' : 'native_execution_cancelled' }
   const cut = requireOriginalTerminalCut(terminal)
+  if (terminal.state !== 'succeeded') {
+    const failures = cut.log.events.filter(event => event.type === 'session.execution.failed' &&
+      event.seq > (input.admission.beforeCursor ?? -1))
+    return { proof: null, failure: terminal.state === 'cancelled' ? 'native_execution_cancelled' :
+      classifyOpenCodeV2ProbeFailure(authority.model.providerID, failures.length === 1 ? failures[0]!.data.error : null) }
+  }
   const after = cut.log
   executionAssert(after.watermark === terminal.cursor && executionHash({ messages: { data: cut.messages, previous: null, next: null }, log: after }) === terminal.cutHash, 'probe_terminal_cut_changed')
   const assistantIDs = new Set(after.events.filter(event => event.type === 'session.step.started' &&

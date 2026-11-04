@@ -222,7 +222,7 @@ test('model test distinguishes terminal failure from pending without exposing ra
   expect(openCodeV2ModelTestMessage(false, 'failed')).not.toContain('is pending')
   expect(openCodeV2ModelTestMessage(false, 'pending')).toContain('pending or unverified')
   expect(openCodeV2ModelTestMessage(false, 'available')).not.toContain('verified.')
-  expect(openCodeV2ModelTestMessage(true, 'available')).toContain('physical retirement verified')
+  expect(openCodeV2ModelTestMessage(true, 'available')).toBe('The model responded successfully.')
 })
 
 test('connect reports a settled model-verification failure without treating it as pending or bad authentication', () => {
@@ -255,4 +255,12 @@ test('connect preserves unresolved wording for cleanup uncertainty, pending prob
   expect(openCodeV2ConnectFailureMessage(new Error('provider_physical_cleanup_unknown'), true)).toContain('remains unresolved')
   expect(openCodeV2ConnectFailureMessage(new Error('provider_original_execution_failed TEST-PRIVATE'), true)).toContain('remains unresolved')
   expect(openCodeV2ConnectFailureMessage(new Error('provider_original_execution_failed'), false)).toContain('Existing credentials were preserved')
+})
+
+test('explains the confirmed OpenRouter free quota with an actionable next step', () => {
+  const message = openCodeV2ModelTestMessage(false, 'failed', 'provider_free_quota_exhausted')
+  expect(message).toContain('daily limit for free models')
+  expect(message).toContain('choose a paid model')
+  expect(openCodeV2ConnectProofFailureCode('failed', 'provider_free_quota_exhausted')).toBe('provider_original_execution_failed')
+  expect(openCodeV2ModelTestMessage(false, 'pending', 'provider_free_quota_exhausted')).not.toContain('daily limit')
 })
