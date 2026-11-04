@@ -35,11 +35,11 @@ test('decorated, multiline and out-of-range branded versions remain unsupported'
   ]) expect(classifyOpenCodeReadGeneration(output).generation).toBe('unsupported')
 })
 
-test('invalid explicit override cannot silently resolve another PATH binary', () => {
+test('invalid explicit override cannot silently resolve another PATH binary', async () => {
   const before = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
   try {
     process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = 'relative/opencode'
-    expect(() => selectedOpenCodeReadPath()).toThrow('identity_mismatch')
+    await expect(selectedOpenCodeReadPath()).rejects.toThrow('identity_mismatch')
   } finally {
     if (before === undefined) delete process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
     else process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = before

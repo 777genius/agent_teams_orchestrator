@@ -1,3 +1,4 @@
+import { productionOpenCodeFetch } from './native/OpenCodeNativeRequestLease.js'
 import type { OpenCodeSseEvent } from './types.js'
 
 export type OpenCodeSseFetch = (input: string | URL | Request, init?: RequestInit) => Promise<Response>
@@ -142,6 +143,7 @@ export function extractOpenCodeSseData(block: string): string | null {
 }
 
 export async function readOpenCodeSseEndpoint(params: {
+  requestOwner?: object
   baseUrl: string
   endpoint: OpenCodeSseEndpoint
   fetchImpl?: OpenCodeSseFetch
@@ -149,7 +151,7 @@ export async function readOpenCodeSseEndpoint(params: {
   onEvent(event: OpenCodeSseEvent): void
 }): Promise<OpenCodeSseEndpointReadResult> {
   const diagnostics: string[] = []
-  const fetchImpl = params.fetchImpl ?? fetch
+  const fetchImpl = params.fetchImpl ?? ((input, init) => productionOpenCodeFetch(input, init, params.requestOwner))
   let response: Response
   try {
     response = await fetchImpl(params.baseUrl + params.endpoint, {
@@ -182,6 +184,7 @@ export async function readOpenCodeSseEndpoint(params: {
   }
 
   if (!response.ok) {
+    void response.body?.cancel().catch(() => undefined)
     diagnostics.push(
       `OpenCode SSE endpoint ${params.endpoint} returned ${response.status} ${response.statusText}`,
     )
@@ -195,6 +198,7 @@ export async function readOpenCodeSseEndpoint(params: {
   }
 
   if (!response.headers.get('content-type')?.includes('text/event-stream')) {
+    void response.body?.cancel().catch(() => undefined)
     diagnostics.push(`OpenCode SSE endpoint ${params.endpoint} did not return text/event-stream`)
     return {
       endpoint: params.endpoint,
@@ -278,6 +282,7 @@ export async function readOpenCodeSseEndpoint(params: {
     }
   } finally {
     params.signal?.removeEventListener('abort', cancelReader)
+    await reader.cancel().catch(() => undefined)
     reader.releaseLock()
   }
 

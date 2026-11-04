@@ -17,9 +17,13 @@ const profile: OpenCodePreparedProfile = JSON.parse(await readFile(profilePath, 
 const registry = path.join(root, 'host-registry.json')
 const lockDirectory = `${registry}.lock.lock`
 const child = new ChildProcess()
+const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough()
 Object.defineProperties(child, {
-  pid: { value: 420001 }, stdout: { value: new PassThrough() },
-  stderr: { value: new PassThrough() }, stdin: { value: new PassThrough() },
+  pid: { value: 420001 }, stdout: { value: stdout },
+  stderr: { value: stderr }, stdin: { value: stdin },
+  // An unspawned Bun ChildProcess has no lazy stdio backing state. Model the
+  // three configured pipe slots explicitly, using the same stream instances.
+  stdio: { value: [stdin, stdout, stderr] },
   unref: { value: () => {} },
   kill: { value: () => { throw new Error('TEST must not terminate a host') } },
 })

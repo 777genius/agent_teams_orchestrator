@@ -1,3 +1,4 @@
+import { productionOpenCodeFetch } from './native/OpenCodeNativeRequestLease.js'
 import { OpenCodeV1ReadUnavailableError, readOpenCodeBoundedHttpResponse } from './OpenCodeBoundedHttpResponse.js'
 import { openCodeTranscriptProjector } from './OpenCodeTranscriptProjector.js'
 import type { OpenCodeSseFetch } from './OpenCodeSseEventStream.js'
@@ -16,6 +17,7 @@ export async function readOpenCodeV1TerminalTranscript(params: {
   authority?: OpenCodeV1TerminalAuthority
   runtimePromptMessageId?: string | null
   remainingMs?: () => number
+  requestOwner?: object
   baseUrl: string; sessionId: string; signal: AbortSignal; fetchImpl?: OpenCodeSseFetch
 }): Promise<OpenCodeV1TerminalEvidence> {
   const diagnostics: string[] = []
@@ -24,7 +26,7 @@ export async function readOpenCodeV1TerminalTranscript(params: {
   const read = async (path: string, maxItems: number, remainingMs?: () => number): Promise<unknown> => {
     params.signal.throwIfAborted()
     if (params.remainingMs && params.remainingMs() <= 0) throw new OpenCodeV1ReadUnavailableError('V1 terminal operation deadline expired')
-    const response = await (params.fetchImpl ?? fetch)(params.baseUrl + path, { method: 'GET', signal: params.signal, headers: { Accept: 'application/json' } })
+    const response = await (params.fetchImpl ?? ((input, init) => productionOpenCodeFetch(input, init, params.requestOwner)))(params.baseUrl + path, { method: 'GET', signal: params.signal, headers: { Accept: 'application/json' } })
     const value = await readOpenCodeBoundedHttpResponse(response, params.signal, maxItems, params.remainingMs, path.includes('/message?') ? 'transcript' : 'metadata')
     successfulReads++
     return value

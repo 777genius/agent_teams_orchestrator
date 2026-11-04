@@ -881,7 +881,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       projectPath,
       purpose: 'execution_probe',
       selectedModel,
-      env: { ...process.env },
+      env: { ...process.env, DEEPINFRA_API_KEY: undefined },
     })
 
     await expect(resolve('deepinfra/model'))
@@ -919,7 +919,7 @@ describe('OpenCodeProfileManager project behavior contract', () => {
         projectPath,
         purpose,
         selectedModel: `${providerId}/model`,
-        env: { ...process.env, ...env },
+        env: { ...process.env, DEEPINFRA_API_KEY: undefined, ...env },
       })
 
     for (const providerId of ['kiro', 'cursor-acp']) {

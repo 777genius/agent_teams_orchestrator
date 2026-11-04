@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { realpathSync } from 'node:fs'
 import { EventEmitter } from 'node:events'
+import { randomUUID } from 'node:crypto'
 import type { ChildProcess } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
@@ -26,6 +27,7 @@ mock.module('./OpenCodeV2ProviderManagement.js', () => ({
 const { OpenCodeProviderManagementAdapter } = await import('./OpenCodeProviderManagementAdapter.js')
 import { planOpenCodeProfilePolicy } from '../../../../services/opencode/OpenCodeProfilePolicy.js'
 import { OpenCodeHostManager } from '../../../../services/opencode/OpenCodeHostManager.js'
+import { readCapturedOpenCodeBinaryPath } from '../../../../services/opencode/OpenCodeBinaryResolver.js'
 
 import type {
   OpenCodeExecutionProbeResult,
@@ -343,7 +345,10 @@ describe('OpenCodeProviderManagementAdapter', () => {
 
   test('returns degraded provider management data when OpenCode inventory probing stalls', async () => {
     const originalBinaryPath = process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
+    const originalFallbackPath = process.env.OPENCODE_BIN_PATH
     process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = process.execPath
+    // No completed selection may be adopted from the unprobed fallback CLI.
+    process.env.OPENCODE_BIN_PATH = `TEST-inventory-timeout-${randomUUID()}`
     let ensureHostCalled = false
     const probeOptions: Array<{
       includeAppMcp?: boolean
@@ -367,6 +372,7 @@ describe('OpenCodeProviderManagementAdapter', () => {
     })
 
     try {
+      expect(readCapturedOpenCodeBinaryPath()).toBeNull()
       const viewResult = await adapter.loadView({
         runtimeId: 'opencode',
         projectPath: '/tmp/project',
@@ -398,6 +404,11 @@ describe('OpenCodeProviderManagementAdapter', () => {
         delete process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH
       } else {
         process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = originalBinaryPath
+      }
+      if (originalFallbackPath === undefined) {
+        delete process.env.OPENCODE_BIN_PATH
+      } else {
+        process.env.OPENCODE_BIN_PATH = originalFallbackPath
       }
     }
   })

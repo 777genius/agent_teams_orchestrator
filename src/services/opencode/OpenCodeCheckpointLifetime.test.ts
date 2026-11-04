@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { mkdtemp, realpath, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -28,9 +28,14 @@ describe('pending native OAuth session authority', () => {
   const manager = new OpenCodeProfileManager()
   const readSaved = () => manager.readSavedOAuthCredential(profile)
   const saveRegistry = () => writeFile(registryPath, JSON.stringify(registry))
+  // Synthetic hosts exercise exact registry/birth/lease checks, without native custody.
+  const endpointSpies: Array<{ mockRestore(): void }> = []
+  const fixtureHostManager = () => new OpenCodeHostManager({ persistentRegistryPath: registryPath,
+    fetchJson: async () => { throw new Error('Synthetic registry fixture must not contact HTTP') },
+  })
   const resolve = () => resolveOpenCodeProfileScope({ projectPath: project, selectedModel: 'xai/grok-4.3',
     purpose: 'launch_runtime', env, isOAuthNativeSessionSettled: value => bridge.isOwnedOAuthNativeSessionSettled(value),
-    isOAuthNativeProbeSettled: value => new OpenCodeExecutionProbe({ clientFactory: { create: () => ({
+    isOAuthNativeProbeSettled: value => new OpenCodeExecutionProbe({ hostManager: fixtureHostManager(), clientFactory: { create: () => ({
       getSessionStatus: async () => ({ 'native-session': status }), getSessionMessages: async () => messages,
     }) as never } }).isOwnedOAuthNativeProbeSettled(value) })
   const arm = (throwAfter = false) => manager.withOwnedOAuthRefresh({ profile, assertHostOwnership: async () => {},
@@ -78,17 +83,28 @@ describe('pending native OAuth session authority', () => {
         runId: record.runId, sessionId: record.opencodeSessionId, createdAt: now, updatedAt: now } },
     } } }
     await saveRegistry()
+    // Default recovery callbacks also use this suite-owned registry.
+    const endpoints = fixtureHostManager()
+    const sessionEndpoint = OpenCodeHostManager.prototype.resolveOwnedSessionEndpoint
+    const probeEndpoint = OpenCodeHostManager.prototype.resolveOwnedProbeEndpoint
+    endpointSpies.push(spyOn(OpenCodeHostManager.prototype, 'resolveOwnedSessionEndpoint')
+      .mockImplementation((...args) => sessionEndpoint.apply(endpoints, args)))
+    endpointSpies.push(spyOn(OpenCodeHostManager.prototype, 'resolveOwnedProbeEndpoint')
+      .mockImplementation((...args) => probeEndpoint.apply(endpoints, args)))
     sessionStore = new OpenCodeSessionStore(sessionPath)
     await sessionStore.upsert(record)
     status = 'idle'; messages = []; onRead = undefined
     abortAcknowledged = true; abortCalls = 0; onAbort = undefined
     bridge = new OpenCodeSessionBridge({
-      hostManager: new OpenCodeHostManager({ persistentRegistryPath: registryPath }), sessionStore,
+      hostManager: fixtureHostManager(), sessionStore,
       clientFactory: { create: () => ({ getSessionStatus: async () => ({ 'native-session': status }),
         getSessionMessages: async () => { await onRead?.(); return messages }, abortSession: async () => { abortCalls += 1; await onAbort?.(); return abortAcknowledged } }) as never },
     })
   })
-  afterEach(async () => { await rm(root, { recursive: true, force: true }) })
+  afterEach(async () => {
+    for (const spy of endpointSpies.splice(0).reverse()) spy.mockRestore()
+    await rm(root, { recursive: true, force: true })
+  })
 
   test.each(['retained-control', 'exit-listener', 'force-stop', 'force-stop-exit-after-reconcile'])('owned child exit preserves recovery lease evidence: %s', async mode => {
     const cleanup = mode !== 'retained-control'

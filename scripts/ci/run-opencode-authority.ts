@@ -15,6 +15,7 @@ const files = [
   'src/services/opencode/OpenCodeStrictLaunchCoordinator.test.ts',
   'src/services/opencode/OpenCodeHostManager.test.ts',
   'src/services/opencode/OpenCodeOwnedEndpointConcurrency.test.ts',
+  'src/services/opencode/OpenCodeOwnedProbeEndpoint.test.ts',
   'src/services/opencode/OpenCodeMcpManager.test.ts',
   'src/services/opencode/OpenCodeProcessAttributionStore.test.ts',
   'src/services/opencode/OpenCodeCursorAgentAtomicReap.test.ts',
@@ -54,14 +55,23 @@ const files = [
 ]
 
 const isRecovery = (file: string) => file.endsWith('/OpenCodeOAuthRestartRecovery.test.ts')
-const groups = [files.filter(file => !isRecovery(file)), files.filter(isRecovery)]
+// Socket transport controls run in a fresh Bun process: other suites install
+// process/native fixture mocks that must not become transport evidence.
+const groups = [files.filter(file => !isRecovery(file)), files.filter(isRecovery),
+  ['src/services/opencode/native/OpenCodeNativeRequestLease.test.ts',
+    'src/services/opencode/native/OpenCodeNativeRequestOwners.test.ts',
+    'src/services/opencode/native/OpenCodeNativeOwnerConsumers.test.ts']]
 
 export function runOpenCodeAuthorityTests(
   args: string[],
   spawn: typeof spawnSync = spawnSync,
 ): number {
   for (const group of groups) {
-    const result = spawn(process.execPath, ['test', ...group, ...args], { stdio: 'inherit' })
+    // Bun test defaults to UTC internally. Its ps/direct children must inherit
+    // the same zone; an explicit caller timezone keeps its existing meaning.
+    const result = spawn(process.execPath, ['test', ...group, ...args], {
+      stdio: 'inherit', env: { ...process.env, TZ: process.env.TZ || 'Etc/UTC' },
+    })
     if (result.error) throw result.error
     if (result.signal || result.status === null) return 1
     if (result.status !== 0) return result.status

@@ -1,4 +1,4 @@
-/** Full selected-authority conformance, no inference. Run ONLY in a clean network-none
+/** Authority-only selected-authority conformance, no native custody or inference. Run ONLY in a clean network-none
  * Linux Docker container with this bundled script, Bun and the pinned binary mounted.
  * bun selected-authority.js /absolute/opencode 1.18.29 SHA256
  */
@@ -116,8 +116,26 @@ async function main() {
     const imported = profile.managedConfig.provider as Record<string, any>
     assert(imported.deepinfra.models.chosen.structured_output === true, 'Imported regression metadata missing')
     assert(Array.isArray(profile.managedConfig.plugin) && profile.managedConfig.plugin.length === 0, 'Unexpected plugins')
-    const manager = new OpenCodeHostManager({ persistentRegistryPath: path.join(root, 'registry.json'), readProcessStartTimeMs,
+    // This network-none conformance harness owns an upstream server without native custody.
+    // Native/password transport qualification is a separate ordinary-manager suite.
+    const origins = new Set<string>()
+    const fixtureFetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      assert(origins.has(url.origin) && !url.username && !url.password, 'Foreign conformance origin')
+      return fetch(input, { ...init, redirect: 'error' })
+    }
+    const { OpenCodeClientFactory } = await import('../src/services/opencode/OpenCodeClientFactory.js')
+    const { OpenCodeMcpManager } = await import('../src/services/opencode/OpenCodeMcpManager.js')
+    const clientFactory = new OpenCodeClientFactory({ fetchImpl: fixtureFetch })
+    const mcpManager = new OpenCodeMcpManager({ clientFactory })
+    const fetchJson = async (url: string, init?: RequestInit) => {
+      const response = await fixtureFetch(url, init)
+      return { status: response.status, data: await response.json() }
+    }
+    const manager = new OpenCodeHostManager({ persistentRegistryPath: path.join(root, 'registry.json'),
+      readProcessStartTimeMs: (pid, timeoutMs) => readProcessStartTimeMs(pid, process.platform, timeoutMs), fetchJson,
       spawnHostProcess(prepared, port) {
+        origins.add(`http://127.0.0.1:${port}`)
         const child = spawn(binary, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], {
           cwd: prepared.workingDirectoryPath ?? prepared.projectPath, env: prepared.env, detached: true,
           stdio: 'ignore',
@@ -135,10 +153,10 @@ async function main() {
     const refresh = () => refreshSelectedProfileAuthority({ host, selectedModel,
       expectedBehaviorFingerprint: evidence.expectedBehaviorFingerprint,
       onRejection: diagnostic => { rejections.push(diagnostic) },
-    })
+    }, { clientFactory, mcpManager })
     phase = 'full_refresh'
     const refreshed = await refresh()
-    const live = await fetch(host.baseUrl + '/config').then(response => response.json()) as Record<string, any>
+    const live = await fixtureFetch(host.baseUrl + '/config').then(response => response.json()) as Record<string, any>
     if (!refreshed) {
       // Both objects are generated in this clean TEST fixture; report policy-only
       // differences, never imported config, environment or provider options.
@@ -163,9 +181,9 @@ async function main() {
     phase = 'cleanup'
     await stop()
     console.log(JSON.stringify({ status: 'passed', binary: { version, sha256: digest }, platform: process.platform,
-      checks: { fullRealHelper: true, realProfileAndHostManagers: true, importedDeepInfraMetadataNormalized: true,
+      checks: { realAuthorityComparators: true, realProfileAndHostManagers: true, nativeCustodyQualified: false, importedDeepInfraMetadataNormalized: true,
         actualMcpInitialize: true, actualMcpToolsList: true, sourceDriftRejected: true, ownedChildrenTerminated: true },
-      rejections, limitations: ['No model inference, strict launch, provider authentication or packaged proof.'] }, null, 2))
+      rejections, limitations: ['Authority-only fixture transport; no native custody/password/ordinary production ingress qualification.', 'No model inference, strict launch, provider authentication or packaged proof.'] }, null, 2))
   } finally {
     await stop()
     process.removeListener('SIGTERM', interrupted); process.removeListener('SIGINT', interrupted)
