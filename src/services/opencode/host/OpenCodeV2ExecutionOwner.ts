@@ -192,6 +192,8 @@ export async function acquireExecutionProfileOwner(requestedProfile: OwnedNative
       executionAssert(launchAttempted && !child, 'execution_owner_unknown')
       executionAssert(isExecutionUnboundRetirement(evidence), 'execution_owner_unknown')
       const proof = evidence as ExecutionUnboundRetirement
+      // A retirement that could not close the scope leaves the fence UNKNOWN.
+      executionAssert(proof.scopeClosed === true, 'execution_owner_unknown')
       await retire({ state: 'spawn_unbound', hostInstanceId: record.hostInstanceId, leaseOwnerId: record.leaseOwnerId,
         retirement: { pid: proof.pid, processExited: true, scopeClosed: proof.scopeClosed } })
     }) },

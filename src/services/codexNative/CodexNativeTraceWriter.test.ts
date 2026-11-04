@@ -92,8 +92,12 @@ describe('CodexNativeTraceWriter', () => {
     expect(files[0]?.endsWith('.jsonl')).toBe(true)
 
     const tracePath = path.join(processedDir, files[0]!)
-    const fileMode = (await stat(tracePath)).mode & 0o777
-    expect(fileMode).toBe(0o600)
+    const fileStat = await stat(tracePath)
+    expect(fileStat.isFile()).toBe(true)
+    // Windows reports writable files as 0666; POSIX permission bits apply only on Unix.
+    if (process.platform !== 'win32') {
+      expect(fileStat.mode & 0o777).toBe(0o600)
+    }
 
     const records = await readJsonl(tracePath)
     expect(records[0]).toMatchObject({

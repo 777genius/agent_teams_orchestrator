@@ -1,3 +1,5 @@
+import type { OpenCodeV2GroupDelivery } from '../bridge/OpenCodeV2GroupChat.js'
+import { isSuccessfulGroupCatalogResult } from '../OpenCodeCompletedNonResponse.js'
 import type { ControllerInboxBinding, ControllerInboxProof } from '../bridge/OpenCodeV2ControllerTools.js'
 import type { ExecutionLog, ExecutionLogEvent, ExecutionMessagePage } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { canonicalExecutionJSON } from './OpenCodeV2ExecutionContracts.js'
@@ -15,13 +17,16 @@ export type OpenCodeV2VisibleReply = Readonly<{
 export type OpenCodeV2TurnProjection = Readonly<{
   state: 'unknown' | 'pending' | 'succeeded' | 'failed' | 'cancelled'
   reason: string; assistantMessageIds: readonly string[]; text: string
+  /** Includes native tools omitted from the advertised controller effects. */
+  observedToolCallCount?: number
+  successfulCatalogToolCallCount?: number
   toolEffects: readonly OpenCodeV2ToolEffect[]; visibleReplies: readonly OpenCodeV2VisibleReply[]
 }>
 export type OpenCodeV2TurnCut = Readonly<{
   pin: OpenCodeV2Pin
   sessionID: string; nativeInputID: string; beforeCursor: number | null; originalText: string
   messages: ExecutionMessagePage; log: ExecutionLog
-  inboundMessageId?: string; advertisedTools?: readonly string[]
+  inboundMessageId?: string; advertisedTools?: readonly string[]; group?: OpenCodeV2GroupDelivery
   controllerBinding?: ControllerInboxBinding; controllerInbox?: ControllerInboxProof | null
 }>
 
@@ -128,6 +133,7 @@ export function projectOpenCodeV2Turn(input: OpenCodeV2TurnCut): OpenCodeV2TurnP
   if (events.some(event => event.type === 'session.step.started' &&
       assistants.includes(event.data.assistantMessageID as string) && !interval.includes(event)))
     return unknown('ambiguous_assistant_lineage')
+  let observedToolCallCount = 0, successfulCatalogToolCallCount = 0
   const text: string[] = [], toolEffects: OpenCodeV2ToolEffect[] = [], visibleReplies: OpenCodeV2VisibleReply[] = []
   for (const assistantId of assistants) {
     const message = input.messages.data.find(item => item.id === assistantId)
@@ -150,6 +156,7 @@ export function projectOpenCodeV2Turn(input: OpenCodeV2TurnCut): OpenCodeV2TurnP
         text.push(part.text); continue
       }
       if (part.type !== 'tool') continue
+      observedToolCallCount++
       const toolId = string(part.id), name = string(part.name), state = record(part.state)
       if (!toolId || !name || !state) return unknown('invalid_tool_snapshot')
       const toolEvents = related.filter(event => event.data.id === toolId)
@@ -175,26 +182,32 @@ export function projectOpenCodeV2Turn(input: OpenCodeV2TurnCut): OpenCodeV2TurnP
           !same(successes[0]?.data.content, state.content) || successes[0]?.data.executed !== part.executed ||
           (called[0]?.seq ?? Infinity) >= (successes[0]?.seq ?? -1))
         return unknown('tool_success_snapshot_mismatch')
-      if (name === 'execute' && input.advertisedTools?.includes('agent-teams_message_send')) {
+      if (['group_chat_list', 'agent-teams_group_chat_list', 'agent_teams_group_chat_list', 'mcp__agent-teams__group_chat_list', 'mcp__agent_teams__group_chat_list'].includes(name) &&
+          isSuccessfulGroupCatalogResult(state.content)) successfulCatalogToolCallCount++
+      const controllerTool = input.group ? 'group_chat_send' : 'message_send'
+      if (name === 'execute' && input.advertisedTools?.includes(`agent-teams_${controllerTool}`)) {
         const metadata = record(state.metadata)
         if (!metadata || metadata.truncated === true || !same(metadata, successes[0]?.data.metadata) ||
             !Array.isArray(metadata.toolCalls) || metadata.toolCalls.length > 256) continue
-        const calls = metadata.toolCalls.map(record).filter(call => call?.tool === 'agent-teams.message_send')
+        const calls = metadata.toolCalls.map(record).filter(call => call?.tool === `agent-teams.${controllerTool}`)
         if (calls.length !== 1 || calls[0]?.status !== 'completed' || !input.inboundMessageId ||
             !input.controllerBinding || !input.controllerInbox ||
             !same(input.controllerBinding, input.controllerInbox.binding) ||
             input.controllerBinding.sessionID !== input.sessionID) continue
         const actual = record(calls[0].input)
         if (!actual || actual.teamName !== input.controllerBinding.teamId ||
-            actual.from !== input.controllerBinding.memberId || actual.to !== 'user' ||
-            actual.source !== 'runtime_delivery' || actual.relayOfMessageId !== input.inboundMessageId ||
+            actual.from !== input.controllerBinding.memberId || actual.relayOfMessageId !== input.inboundMessageId ||
             !string(actual.text)) continue
+        if (input.group ? actual.groupChatId !== input.group.groupChatId || input.group.groupRunKey !== input.controllerBinding.runId
+          : actual.to !== 'user' || actual.source !== 'runtime_delivery') continue
         const matches = input.controllerInbox.messages.filter(row => row.relayOfMessageId === input.inboundMessageId &&
-          row.from === actual.from && row.to === actual.to && row.source === actual.source)
+          row.from === actual.from && row.to === 'user' && row.source === 'runtime_delivery' &&
+          (!input.group || row.groupChatId === input.group.groupChatId && row.groupChatProtocolVersion === 1 &&
+            row.groupMessageId === actual.messageId && row.messageId === actual.messageId))
         const reply = matches[0]
         if (matches.length !== 1 || !reply || reply.text !== actual.text || !string(reply.messageId) ||
             input.controllerInbox.messages.filter(row => row.messageId === reply.messageId).length !== 1) continue
-        const toolName = 'agent-teams.message_send'
+        const toolName = `agent-teams.${controllerTool}`
         toolEffects.push({ assistantMessageId: assistantId, toolCallId: toolId, toolName, kind: 'visible_message',
           input: actual, content: state.content, result: reply })
         visibleReplies.push({ nativeInputId: input.nativeInputID, assistantMessageId: assistantId, toolCallId: toolId,
@@ -205,10 +218,24 @@ export function projectOpenCodeV2Turn(input: OpenCodeV2TurnCut): OpenCodeV2TurnP
       const effectInput = record(state.input)
       if (!effectInput) return unknown('invalid_tool_input')
       const result = toolResult(state.content)
-      const kind = name.endsWith('_message_send') ? 'visible_message' : /_task_(claim|start|comment|done|update)$/.test(name) ? 'task' : 'other'
+      const groupSend = /^(?:agent-teams_|agent_teams_|mcp__agent-teams__|mcp__agent_teams__)group_chat_send$/.test(name)
+      const kind = (!input.group && name.endsWith('_message_send')) || groupSend ? 'visible_message' : /_task_(claim|start|comment|done|update)$/.test(name) ? 'task' : 'other'
       toolEffects.push({ assistantMessageId: assistantId, toolCallId: toolId, toolName: name, kind,
         input: effectInput, content: state.content, result })
       if (kind !== 'visible_message' || !input.inboundMessageId || !result) continue
+      if (groupSend) {
+        const group = input.group, binding = input.controllerBinding
+        const replyId = string(result.groupMessageId) ?? string(result.messageId)
+        if (group && binding && group.groupRunKey === binding.runId &&
+            effectInput.teamName === binding.teamId && effectInput.from === binding.memberId &&
+            effectInput.groupChatId === group.groupChatId && effectInput.relayOfMessageId === input.inboundMessageId &&
+            result.saved === true && result.isError !== true && result.groupChatId === group.groupChatId &&
+            result.relayOfMessageId === input.inboundMessageId && replyId && replyId === effectInput.messageId &&
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(replyId))
+          visibleReplies.push({ nativeInputId: input.nativeInputID, assistantMessageId: assistantId, toolCallId: toolId,
+            toolName: name, inboundMessageId: input.inboundMessageId, visibleReplyMessageId: replyId })
+        continue
+      }
       const reply = record(result.message)
       const relay = string(reply?.relayOfMessageId) ?? string(result.relayOfMessageId)
       const replyId = string(reply?.messageId) ?? string(result.messageId)
@@ -226,7 +253,7 @@ export function projectOpenCodeV2Turn(input: OpenCodeV2TurnCut): OpenCodeV2TurnP
   if (interval.some(event => typeof event.data.assistantMessageID === 'string' && !assistants.includes(event.data.assistantMessageID)))
     return unknown('foreign_assistant_event')
   if (end < 0) return { state: 'pending', reason: 'no_execution_terminal', assistantMessageIds: assistants,
-    text: text.join('\n'), toolEffects, visibleReplies: [] }
+    text: text.join('\n'), observedToolCallCount, successfulCatalogToolCallCount, toolEffects, visibleReplies: [] }
   const ending = events[end]
   if (!ending) return unknown('missing_execution_terminal')
   const state = ending.type === 'session.execution.succeeded' ? 'succeeded' : ending.type === 'session.execution.failed' ? 'failed' : 'cancelled'
@@ -240,5 +267,5 @@ export function projectOpenCodeV2Turn(input: OpenCodeV2TurnCut): OpenCodeV2TurnP
     if (!idle || idle.type !== 'idle' || idle.data.outcome !== (state === 'cancelled' ? 'interrupted' : state))
       return unknown('terminal_snapshot_mismatch')
   }
-  return { state, reason: ending.type, assistantMessageIds: assistants, text: text.join('\n'), toolEffects, visibleReplies }
+  return { state, reason: ending.type, assistantMessageIds: assistants, text: text.join('\n'), observedToolCallCount, successfulCatalogToolCallCount, toolEffects, visibleReplies }
 }

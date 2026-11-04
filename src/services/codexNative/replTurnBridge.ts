@@ -1,3 +1,4 @@
+import { writeChildOwnedTeammateRuntimeEvent } from '../../utils/swarm/teammateRuntimeEvents.js'
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs'
 
 import { isSessionPersistenceDisabled } from '../../bootstrap/state.js'
@@ -11,9 +12,11 @@ import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
 import { EMPTY_USAGE } from '../api/emptyUsage.js'
 import type { CodexAppServerApprovalRequestHandler } from './appServerApproval.js'
 import { executeCodexNativeTurn } from './turnExecutor.js'
+import type { CodexNativeConversationScope } from './conversationScope.js'
 
 type RunCodexNativeTurnInReplParams = {
   prompt: string | ContentBlockParam[]
+  conversationScope?: CodexNativeConversationScope
   cwd: string
   model: string
   effortValue: EffortValue | undefined
@@ -50,6 +53,17 @@ export async function runCodexNativeTurnInRepl(
   deps: RunCodexNativeTurnInReplDeps = {},
 ): Promise<void> {
   const executeTurn = deps.executeTurn ?? executeCodexNativeTurn
+  const promptText = typeof params.prompt === 'string' ? params.prompt : params.prompt
+    .flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
+  if (params.conversationScope === 'group') {
+    // Diagnostic facts only: never persist model/user text or private bootstrap context.
+    void writeChildOwnedTeammateRuntimeEvent({
+      type: 'group_context_prepared', source: 'codexNative.replTurnBridge',
+      detail: JSON.stringify({ promptChars: promptText.length,
+        hasGroupHistory: promptText.includes('<group_mailbox_history>'),
+        physicalMessageId: promptText.match(/Physical inbound ID: "([0-9a-f-]{36}:g:[0-9a-f]{24})"/)?.[1] ?? null }),
+    })
+  }
   const mutableMessages = [...params.transcriptMessages]
   const persistedTranscriptMessages = [...params.transcriptMessages]
   const initialTranscriptLength = persistedTranscriptMessages.length
@@ -58,6 +72,7 @@ export async function runCodexNativeTurnInRepl(
 
   for await (const sdkMessage of executeTurn({
     prompt: params.prompt,
+    conversationScope: params.conversationScope ?? 'direct',
     cwd: params.cwd,
     model: params.model,
     effortValue: params.effortValue,

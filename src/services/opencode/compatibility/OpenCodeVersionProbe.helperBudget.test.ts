@@ -19,10 +19,11 @@ afterEach(() => {
   Object.defineProperty(process, 'platform', { value: originalPlatform })
 })
 
-function fixture(platform: NodeJS.Platform, durations: number[], closeAt = 1, initialBirthMs = 0) {
+function fixture(platform: NodeJS.Platform, durations: number[], closeAt = 1, initialBirthMs = 0,
+  options: { initialBirth?: number; posixQuery?: (budget: number) => Promise<string> } = {}) {
   Object.defineProperty(process, 'platform', { value: platform })
   let clock = 1_000_000, removed = 0, calls = 0
-  const budgets: number[] = []
+  const budgets: number[] = [], signals: number[] = []
   let reportFailure: ((failure: NativeHelperFailure) => void) | undefined
   const child = new EventEmitter() as ChildProcess
   Object.assign(child, { pid: 900_001, stdout: new PassThrough() })
@@ -50,20 +51,21 @@ function fixture(platform: NodeJS.Platform, durations: number[], closeAt = 1, in
     return { platform, selfPid: process.pid, now: () => clock, birth: async () => {
         clock += initialBirthMs
         if (initialBirthMs) close()
-        return null
+        return options.initialBirth ?? null
       },
-      tree: query, signal: () => { throw new Error('TEST unowned process signal') },
+      tree: query, signal: target => { signals.push(target); throw new Error('TEST unowned process signal') },
       alive: () => 'gone', taskkill: async () => { throw new Error('TEST unowned process kill') },
       sleep: async ms => { clock += ms } }
   })
   const posix = spyOn(native, 'query').mockImplementation(async (_command, _args, budget) => {
+    if (options.posixQuery) { budgets.push(budget); return options.posixQuery(budget) }
     await query(budget)
     return ''
   })
   restore.push(() => date.mockRestore(), () => launcher.mockRestore(), () => spawn.mockRestore(),
     () => ports.mockRestore(), () => posix.mockRestore())
   const roots = { root: '/TEST/private', env: {}, remove: async () => { removed++ } } as OpenCodeV2ReadRoots
-  return { run: () => readOpenCodeOwnedVersion('/TEST/native', roots), budgets,
+  return { run: () => readOpenCodeOwnedVersion('/TEST/native', roots), budgets, signals, close, advance: (ms: number) => { clock += ms },
     removed: () => removed, elapsed: () => clock - 1_000_000 }
 }
 
@@ -95,11 +97,72 @@ test('a hung Windows helper exhausts the original remainder without a retirement
   expect(f.removed()).toBe(0)
 })
 
+test('Darwin census can exceed two seconds while retaining physical cleanup proof', async () => {
+  const f = fixture('darwin', [2200])
+  expect(await f.run()).toBe('1.18.34\n')
+  expect(f.budgets).toEqual([5000])
+  expect(f.removed()).toBe(1)
+})
+
+test('Darwin cold native version can take thirty-two seconds and still requires physical retirement', async () => {
+  const f = fixture('darwin', [1000], 1, 32_000)
+  expect(await f.run()).toBe('1.18.34\n')
+  expect(f.elapsed()).toBe(33_000)
+  expect(f.budgets).toEqual([5000])
+  expect(f.removed()).toBe(1)
+})
+
+test('Darwin census budget is clipped to the original probe deadline', async () => {
+  const initialBirthMs = versionAcquisitionMs('darwin') + VERSION_CLEANUP_MS - 4000
+  const f = fixture('darwin', [1500], 1, initialBirthMs)
+  expect(await f.run()).toBe('1.18.34\n')
+  expect(f.budgets).toEqual([4000])
+  expect(f.elapsed()).toBe(initialBirthMs + 1500)
+  expect(f.removed()).toBe(1)
+})
+
+test('a hung Darwin census retains ownership without extending the probe deadline', async () => {
+  const f = fixture('darwin', [6000])
+  await expect(f.run()).rejects.toBeInstanceOf(OpenCodeVersionProbeCleanupError)
+  expect(f.budgets).toEqual([5000])
+  expect(f.elapsed()).toBe(5000)
+  expect(f.removed()).toBe(0)
+})
+
 test('POSIX process-table helpers keep their two-second cap', async () => {
   const f = fixture('linux', [1000])
   expect(await f.run()).toBe('1.18.34\n')
   expect(f.budgets).toEqual([2000])
   expect(f.removed()).toBe(1)
+})
+
+for (const reason of ['helper_timeout', 'helper_error'] as const) test(`POSIX ${reason} stays pending until helper close and refuses cleanup with finite diagnostics`, async () => {
+  const query = native.query
+  const helper = Object.assign(new EventEmitter(), { pid: 900_099, stdout: new PassThrough(), kill: () => true })
+  let launched!: () => void
+  const started = new Promise<void>(resolve => { launched = resolve })
+  const f = fixture('linux', [], 1, 0, { initialBirth: 10, posixQuery: budget =>
+    query('TEST-helper', [], budget, (() => { launched(); return helper }) as never) })
+  let settled = false
+  const work = f.run().then(() => { settled = true; throw new Error('TEST expected census refusal') }, error => { settled = true; return error })
+  await started
+  f.close()
+  f.advance(2000)
+  helper.emit('error', new Error(reason === 'helper_timeout' ? 'Native helper timed out' : 'TEST-PRIVATE path and provider body'))
+  await Promise.resolve()
+  expect(settled).toBe(false)
+  expect(f.removed()).toBe(0)
+  expect(f.signals).toEqual([])
+  helper.emit('close', 1)
+  const failure = await work
+  expect(failure).toBeInstanceOf(OpenCodeVersionProbeCleanupError)
+  expect(failure.helperFailure).toEqual({ operation: 'tree', reason, exitCode: null, elapsedMs: 2000 })
+  expect(failure.terminalDiagnostic).toMatchObject({ phase: 'census', guard: 'census_helper_failed', closed: true,
+    ended: true, exitCode: 0, birthsCount: 1, candidatesCount: 0, pendingCount: 0, lastGroupCount: null, remainingMs: 6000 })
+  expect(JSON.stringify(getOpenCodeVersionProbeDiagnostics(failure))).not.toContain('TEST-PRIVATE')
+  expect(f.budgets).toEqual([2000])
+  expect(f.signals).toEqual([])
+  expect(f.removed()).toBe(0)
 })
 
 function acquisitionFixture(mode: 'closed' | 'open' | 'exit-only' | 'late-close' | 'abort') {
@@ -324,7 +387,7 @@ test('darwin gone group member with reparented PPID requires absence and final c
   expect(f.trees()).toBeGreaterThanOrEqual(4)
   expect(f.removed()).toBe(1)
   expect(f.signalled).toEqual([])
-  expect(f.budgets.every(budget => budget > 0 && budget <= 2000)).toBe(true)
+  expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
   expect(f.events.slice(-2)).toEqual(['census:empty', 'remove'])
 })
 

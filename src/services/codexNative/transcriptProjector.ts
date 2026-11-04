@@ -109,6 +109,7 @@ export class CodexNativeTranscriptProjector {
         const message = this.annotateTaskAwareMessage(
           createAssistantMessage({ content: event.text }),
         ) as Extract<Message, { type: 'assistant' }>
+        if (event.phase) Object.assign(message.message, { codexNativeMessagePhase: event.phase })
         this.lastAssistantMessage = message
         return {
           appendedMessages: [message],

@@ -4,6 +4,7 @@ import { hashOpenCodeFile, readOpenCodePackageManifest } from '../compatibility/
 import { isOpenCodeV2Pin, openCodeV2GraphPackages, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 import { readRecord } from '../catalog/OpenCodeV2ReadStatus.js'
 import { openCodeReadAssert } from '../transport/OpenCodeBoundedFetch.js'
+import { resolveOpenCodeV2Delivery, verifyOpenCodeV2DeliveryFile, type OpenCodeV2DeliveryBinding } from './OpenCodeV2DeliveryManifest.js'
 
 /** Official server packages pinned to the graph version, with an entry each subpath exports. */
 export const OPENCODE_V2_SERVER_GRAPH_ENTRIES = [['core', 'bus'], ['protocol', 'groups/pty'],
@@ -20,13 +21,18 @@ export type OpenCodeV2ServerGraph = Readonly<{
 
 /** Resolve one version-derived graph alias; an unstaged version is a coded refusal. */
 export async function resolveOpenCodeV2GraphEntry(pin: OpenCodeV2Pin, kind: 'server' | 'client',
-  subpath?: string, from: string = import.meta.dir): Promise<string> {
+  subpath?: string, from: string = import.meta.dir, binding?: OpenCodeV2DeliveryBinding): Promise<string> {
   openCodeReadAssert(isOpenCodeV2Pin(pin), 'opencode_v2_version_out_of_range')
   const name = openCodeV2GraphPackages(pin)[kind]
   let entry: string
-  try { entry = Bun.resolveSync(subpath ? `${name}/${subpath}` : name, from) }
+  if (!binding && !import.meta.url.endsWith('/OpenCodeV2ServerGraph.ts')) throw new Error('opencode_v2_support_required')
+  const delivery = binding ? await resolveOpenCodeV2Delivery(binding) : undefined
+  if (delivery) openCodeReadAssert(delivery.manifest.engineVersions.includes(pin), 'opencode_v2_version_unqualified')
+  try { entry = Bun.resolveSync(subpath ? `${name}/${subpath}` : name, delivery?.root ?? from) }
   catch { throw new Error('opencode_v2_graph_unavailable') }
-  return filesystem.realpath(entry)
+  const file = await filesystem.realpath(entry)
+  if (delivery) await verifyOpenCodeV2DeliveryFile(delivery, file)
+  return file
 }
 
 /** The selected server declares the exact Effect release its whole graph must share. */
@@ -39,8 +45,8 @@ export async function readOpenCodeV2ServerEffectVersion(modulePath: string): Pro
   return version
 }
 
-export async function verifyOpenCodeV2ServerGraph(pin: OpenCodeV2Pin): Promise<OpenCodeV2ServerGraph> {
-  const modulePath = await resolveOpenCodeV2GraphEntry(pin, 'server', 'process')
+export async function verifyOpenCodeV2ServerGraph(pin: OpenCodeV2Pin, binding?: OpenCodeV2DeliveryBinding): Promise<OpenCodeV2ServerGraph> {
+  const modulePath = await resolveOpenCodeV2GraphEntry(pin, 'server', 'process', undefined, binding)
   await verifyOpenCodePackage(modulePath, '@opencode/server', pin)
   const effectVersion = await readOpenCodeV2ServerEffectVersion(modulePath)
   const effectPath = await filesystem.realpath(Bun.resolveSync('effect', path.dirname(modulePath)))
@@ -65,7 +71,7 @@ export async function verifyOpenCodeV2ServerGraph(pin: OpenCodeV2Pin): Promise<O
     await verifyOpenCodePackage(entry, dependency, effectVersion)
     await verifyOpenCodeV2GraphEffect(entry, effectPath, effectVersion)
   }
-  const clientPath = await resolveOpenCodeV2GraphEntry(pin, 'client')
+  const clientPath = await resolveOpenCodeV2GraphEntry(pin, 'client', undefined, undefined, binding)
   await verifyOpenCodePackage(clientPath, '@opencode/client', pin)
   // The selected Promise client exchanges JSON only; its optional Effect peer
   // is not executed. Schema/protocol imports must still retain their own pin.

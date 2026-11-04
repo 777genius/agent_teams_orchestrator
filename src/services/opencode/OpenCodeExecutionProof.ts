@@ -17,6 +17,8 @@ import type {
 } from './types.js'
 
 export const OPEN_CODE_EXECUTION_PROOF_TTL_MS = 120_000
+// An owned V2 team probe must cover the 300s launch budget and a 30s handoff.
+export const OPEN_CODE_V2_TEAM_EXECUTION_PROOF_TTL_MS = 330_000
 
 type OpenCodeExecutionProofDeps = {
   nowMs?: () => number
@@ -31,6 +33,8 @@ type BuildOpenCodeExecutionProofInput = {
   snapshot: OpenCodeProvisioningSnapshot
   capabilitySnapshotId: string | null
   verifiedAt?: string
+  /** Set only by the owned V2 team-probe producer, never a public proof DTO. */
+  unattendedTeam?: boolean
 }
 
 type ValidateOpenCodeExecutionProofInput = {
@@ -177,7 +181,8 @@ export async function buildOpenCodeExecutionProof(
       readCredential: async () => credential,
     }),
     verifiedAt: new Date(issuedAtMs).toISOString(),
-    expiresAt: new Date(issuedAtMs + OPEN_CODE_EXECUTION_PROOF_TTL_MS).toISOString(),
+    expiresAt: new Date(issuedAtMs + (input.unattendedTeam === true
+      ? OPEN_CODE_V2_TEAM_EXECUTION_PROOF_TTL_MS : OPEN_CODE_EXECUTION_PROOF_TTL_MS)).toISOString(),
   }
   return { ...unsigned, proofHash: hashProof(unsigned) }
 }

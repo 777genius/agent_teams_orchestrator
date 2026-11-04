@@ -14,7 +14,7 @@ test('launch waits for original native members under one deadline before returni
       binaryPath: '/TEST/native', binaryFingerprint: 'TEST-binary', version: '2.0.32' }
     const owner = { binding, deadline: 10000 }
     const members = ['one', 'two'].map(memberId => ({ memberId, laneId: 'primary', originalSessionId: 'ses_' + memberId,
-      native: { version: '2.0.32' }, profile: { selection: { model: { providerID: 'TEST', id: 'model', variant: 'default' } } } }))
+      native: { version: '2.0.32', dialect: 'v2-2.0.32' }, profile: { selection: { model: { providerID: 'TEST', id: 'model', variant: 'default' } } } }))
     const nativeMembers = members.map(member => ({ memberId: member.memberId, laneId: member.laneId,
       originalSessionId: member.originalSessionId, opencodeSessionId: member.originalSessionId, runtimeSessionId: member.originalSessionId,
       selectedModel: 'TEST/model', selectedVariant: 'default', pin: '2.0.32', runtimePid: member.memberId === 'one' ? 123 : 124,
@@ -27,7 +27,8 @@ test('launch waits for original native members under one deadline before returni
     mock.module(${JSON.stringify(plans)}, () => ({ createOpenCodeV2LaunchPlan: async () => {
       clock += 20; return { binding, members, deadline: owner.deadline, qualification }
     }, inspectOpenCodeV2SourceAvailability: async () => { throw Error('TEST source requalification forbidden') },
-      buildOpenCodeV2InternalRunPlan: async () => { throw Error('TEST probe launch forbidden') } }))
+      buildOpenCodeV2InternalRunPlan: async () => { throw Error('TEST probe launch forbidden') },
+      removeOpenCodeV2UnstartedPlanProfiles: async () => { throw Error('TEST cleanup after launch forbidden') } }))
     const controlModule = await import(${JSON.stringify(control)})
     mock.module(${JSON.stringify(control)}, () => ({ ...controlModule,
       awaitOpenCodeV2RunMemberReadiness: async () => { throw Error('TEST obsolete member-wait path forbidden') },
@@ -67,7 +68,7 @@ test('launch waits for original native members under one deadline before returni
       const retried = ['transientTimeout', 'transientDisconnected'].includes(scenario)
       assert.deepEqual(budgets, retried ? [950, 930] : scenario === 'startingThenStopped' ? [950, 850] : [950])
       if (scenario === 'ready' || retried) {
-        assert.equal(result.ok, true)
+        assert.equal(result.ok, true, JSON.stringify({ scenario, result }))
         for (const [name, pid] of [['one', 123], ['two', 124]]) {
           assert.equal(result.data.members[name].launchState, 'confirmed_alive')
           assert.equal(result.data.members[name].runtimePid, pid)

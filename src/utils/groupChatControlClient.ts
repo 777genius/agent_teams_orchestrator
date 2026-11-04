@@ -1,3 +1,4 @@
+import { isGroupNonResponseText } from './groupNonResponse.js'
 import { createHash } from 'node:crypto'
 import type { GroupMailboxEnvelope } from './groupMailbox.js'
 
@@ -23,11 +24,15 @@ export function isBoundGroupChatControl(controlUrl?: string, context?: string): 
 }
 
 export async function relayGroupAssistantText(input: {
-  teamName: string; from: string; message: GroupMailboxEnvelope & { messageId?: string }; text: string
+  teamName: string; from: string; message: GroupMailboxEnvelope & { messageId?: string; from?: string }; text: string
 }, binding = { controlUrl, context }): Promise<void> {
   if (!isBoundGroupChatControl(binding.controlUrl, binding.context) || !input.message.groupChatId || !input.message.messageId) {
     throw new Error('Group reply unavailable: missing bound app or physical inbound identity')
   }
+  const sender = input.message.from?.trim().toLowerCase()
+  // Invoked only after a native mailbox turn completes. Explicit tool sends
+  // are separate; never suppress a human request or infer from a preview.
+  if (sender && sender !== 'user' && sender !== 'system' && isGroupNonResponseText(input.text)) return
   // Retry of the same physical reply uses the same valid UUID, never a second post.
   const bytes = createHash('sha256').update(JSON.stringify([input.teamName, input.from, input.message.groupChatId, input.message.messageId, input.text])).digest().subarray(0, 16)
   bytes[6] = (bytes[6]! & 0x0f) | 0x40

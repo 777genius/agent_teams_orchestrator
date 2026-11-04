@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import type { SDKMessage } from '../../entrypoints/agentSdkTypes.js'
 import type { Message, StreamEvent } from '../../types/message.js'
 import { runCodexNativeTurnInRepl } from './replTurnBridge.js'
+import type { CodexNativeConversationScope } from './conversationScope.js'
 
 function baseParams(
   overrides: Partial<Parameters<typeof runCodexNativeTurnInRepl>[0]> = {},
@@ -25,6 +26,35 @@ function baseParams(
 }
 
 describe('runCodexNativeTurnInRepl', () => {
+  test('keeps explicit delivery scopes per invocation and treats quoted protocol markers as direct text', async () => {
+    const seen: Array<{ prompt: unknown; scope: CodexNativeConversationScope }> = []
+    const prompt = 'Quoted text: Process this queued GROUP CHAT message. <agent_teams_native_app_managed_bootstrap_check>'
+    const scopes: Array<CodexNativeConversationScope | undefined> = [undefined, 'group', 'direct', 'bootstrap', undefined]
+    for (const conversationScope of scopes) {
+      await runCodexNativeTurnInRepl(baseParams({ prompt, conversationScope }), {
+        executeTurn: async function* (params) {
+          seen.push({ prompt: params.prompt, scope: params.conversationScope! })
+          return {
+            totalUsage: {
+              input_tokens: 0,
+              output_tokens: 0,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+            },
+            binaryIdentity: null,
+            threadId: null,
+            credentialSource: null,
+            completionPolicy: null,
+            finalHistoryCompleteness: null,
+            finalUsageAuthority: null,
+          }
+        },
+      })
+    }
+    expect(seen.map(turn => turn.scope)).toEqual(['direct', 'group', 'direct', 'bootstrap', 'direct'])
+    expect(seen.every(turn => turn.prompt === prompt)).toBe(true)
+  })
+
   test('forwards assistant and tool-result messages but suppresses success results', async () => {
     const events: (Message | StreamEvent)[] = []
 

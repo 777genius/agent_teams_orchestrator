@@ -30,6 +30,7 @@ export type TeammateRuntimeEventType =
   | 'bootstrap_proof_accepted'
   | 'bootstrap_context_loaded'
   | 'bootstrap_confirmed'
+  | 'group_context_prepared'
   | 'heartbeat'
   | 'failed'
   | 'exited'

@@ -31,6 +31,14 @@ const README = /^readme(?:\.|$)/i
 // prebuildify/node-gyp-build layout: prebuilds/<platform>-<arch>[+<arch>...]/
 const PREBUILD = /^(aix|android|darwin|freebsd|linux|netbsd|openbsd|sunos|win32)-([a-z0-9]+(?:\+[a-z0-9]+)*)$/
 const TYPE_CONDITIONS = new Set(['types', 'typings'])
+// bun-pty's pinned loader selects these exact names. Optional payloads are outside
+// Electron afterPack, so remove foreign bindings before their manifest is sealed.
+const BUN_PTY_BINDINGS: Readonly<Record<string, readonly [string, string]>> = {
+  'librust_pty.so': ['linux', 'x64'], 'librust_pty_musl.so': ['linux', 'x64'],
+  'librust_pty_arm64.so': ['linux', 'arm64'], 'librust_pty_arm64_musl.so': ['linux', 'arm64'],
+  'librust_pty.dylib': ['darwin', 'x64'], 'librust_pty_arm64.dylib': ['darwin', 'arm64'],
+  'rust_pty.dll': ['win32', 'x64'], 'rust_pty_arm64.dll': ['win32', 'arm64'],
+}
 
 function* runtimeTargets(value: unknown, condition?: string): Generator<string> {
   if (condition !== undefined && (TYPE_CONDITIONS.has(condition) || condition.startsWith('types@'))) return
@@ -84,6 +92,10 @@ export function stagedPackageFilter(manifest: StagedPackageManifest, target: Sta
   const readmeIsLicense = !rootEntries.some(name => LEGAL.test(name))
   return (relative, directory) => {
     const segments = relative.split('/')
+    if (manifest.name === 'bun-pty' && !directory && relative.startsWith('rust-pty/target/release/')) {
+      const binding = BUN_PTY_BINDINGS[relative.slice('rust-pty/target/release/'.length)]
+      if (binding && (binding[0] !== target.platform || binding[1] !== target.arch)) return false
+    }
     if (segments[0] === 'prebuilds' && segments.length >= 2 && foreignPrebuild(segments[1]!, target)) return false
     if (directory) return true
     const name = segments[segments.length - 1]!

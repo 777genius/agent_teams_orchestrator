@@ -3714,3 +3714,25 @@ test.each(['lease', 'generation'] as const)('reconciliation discards slow qualif
     await rm(tempDir, { recursive: true, force: true })
   }
 })
+
+
+test('final command cleanup fences a catalog startup held before spawn and preserves no future admission', async () => {
+  let releasePort!: (port: number) => void
+  let enteredPort!: () => void
+  const portEntered = new Promise<void>(resolve => { enteredPort = resolve })
+  let spawned = 0
+  const manager = new OpenCodeHostManager({
+    prepareProfile: async () => baseProfile,
+    allocateLoopbackPort: () => { enteredPort(); return new Promise(resolve => { releasePort = resolve }) },
+    spawnHostProcess: () => { spawned++; throw new Error('TEST late spawn must never run') },
+    persistentRegistryPath: null,
+  })
+  const pending = manager.ensureHost({ hostKey: 'TEST-late-catalog', hostLifetime: 'process', prewarmManagedSubscriptionPlugins: false })
+  const failure = pending.then(() => null, error => error)
+  await portEntered
+  expect(await manager.disposeUnregisteredOwnedHosts()).toEqual({ disposed: 0, kept: 0, diagnostics: [] })
+  releasePort(43190)
+  expect((await failure)?.message).toBe('OpenCode host manager is closing')
+  await expect(manager.ensureHost({ hostKey: 'TEST-new-catalog' })).rejects.toThrow('OpenCode host manager is closing')
+  expect(spawned).toBe(0)
+})

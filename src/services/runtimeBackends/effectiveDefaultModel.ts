@@ -20,10 +20,21 @@ export function getAnthropicDefaultLaunchModel(
 export function getAnthropicEffectiveDefaultModel(
   catalog?: Pick<RuntimeProviderModelCatalog, 'defaultLaunchModel'> | null,
 ): string | null {
-  const model = getAnthropicDefaultLaunchModel(catalog)
-  if (!model) return null
-  // Configured defaults were already resolved above; do not re-interpret a gateway ID as an alias.
-  return getUserSpecifiedModelSetting() == null
-    ? parseUserSpecifiedModel(model)
-    : model
+  const provider = getAPIProvider()
+  if (provider === 'openai' || provider === 'gemini') return null
+  const explicit = process.env.ANTHROPIC_MODEL?.trim()
+  const candidate =
+    explicit ||
+    getUserSpecifiedModelSetting()?.trim() ||
+    catalog?.defaultLaunchModel?.trim()
+  if (!candidate) return null
+  const alias = /^(opus|sonnet|haiku)(\[1m\])?$/i.exec(candidate)
+  if (alias) {
+    const family = alias[1]!.toUpperCase()
+    const mapped = process.env[`ANTHROPIC_DEFAULT_${family}_MODEL`]?.trim()
+    // Never advertise the runtime's built-in alias mapping as an inherited default.
+    return mapped ? mapped + (alias[2] || '') : null
+  }
+  // Settings and catalog recommendations are not evidence of an environment default.
+  return explicit || null
 }

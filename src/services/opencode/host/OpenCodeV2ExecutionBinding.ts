@@ -1,14 +1,17 @@
+import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import type { OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 import path from 'node:path'
 import { readExecutionPlatformBirth } from './OpenCodeV2ExecutionPlatform.js'
 import filesystem, { lstat, open, readFile, readdir } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
-import { hashOpenCodeFile, readOpenCodePackageManifest, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
+import { hashOpenCodeFile, readOpenCodePackageManifest, readOpenCodeNativePackageMetadata, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
 import { assertExecutionSelectedModel, executionAssert, executionHash, executionRecord,
   type ExecutionSelectedModel, type ExecutionBirth } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { verifyOpenCodeV2ServerGraph } from './OpenCodeV2ServerGraph.js'
+import { resolveOpenCodeV2Delivery, verifyOpenCodeV2DeliveryFile, assertOpenCodeV2DeliveryFileRow,
+  type OpenCodeV2DeliveryBinding } from './OpenCodeV2DeliveryManifest.js'
 
-export type ExecutionGraph = Readonly<{ sha256: string; files: readonly Readonly<{ path: string; sha256: string }>[] }>
+export type ExecutionGraph = Readonly<{ sha256: string; files: readonly Readonly<{ path: string; sha256: string }>[]; delivery?: OpenCodeV2DeliveryBinding }>
 export type ExecutionSelection = Readonly<{
   agent: string; model: ExecutionSelectedModel
   permissions: readonly Readonly<{ action: string; resource: string; effect: 'allow' | 'deny' | 'ask' }>[]
@@ -115,7 +118,7 @@ export function createExecutionGraphValidationCohort(): ExecutionGraphValidation
   return async (pin, receipt, signal) => {
     signal?.throwIfAborted()
     admittedExecutionGraphRows(receipt)
-    const key = `${pin}\0${receipt.sha256}`
+    const key = `${pin}\0${receipt.sha256}\0${receipt.delivery?.root ?? ''}\0${receipt.delivery?.manifestSha256 ?? ''}`
     let shared = running.get(key)
     if (!shared) {
       const controller = new AbortController()
@@ -163,6 +166,8 @@ export async function validateExecutionGraph(pin: OpenCodeV2Pin, receipt: Execut
   progress?: (value: ExecutionGraphProgress) => void, signal?: AbortSignal) {
   signal?.throwIfAborted()
   const rows = admittedExecutionGraphRows(receipt)
+  const delivery = receipt.delivery ? await resolveOpenCodeV2Delivery(receipt.delivery) : undefined
+  const rowHashes = new Map(rows.map(row => [row.path, row.sha256]))
   progress?.({ phase: 'hash', completed: 0, total: rows.length })
   // Official graphs contain tens of thousands of independent files. Bound
   // concurrent reads instead of serializing each filesystem round trip.
@@ -181,6 +186,7 @@ export async function validateExecutionGraph(pin: OpenCodeV2Pin, receipt: Execut
         signal?.throwIfAborted()
         readPhase = 'hash'
         executionAssert(await hashOpenCodeFile(row.path, signal) === row.sha256, 'execution_graph_changed')
+        if (delivery && row.path.startsWith(delivery.binding.root + path.sep)) await verifyOpenCodeV2DeliveryFile(delivery, row.path, row.sha256)
         signal?.throwIfAborted()
         } catch (error) {
           if (error instanceof Error && typeof row.path === 'string' && !originalGraphFailures.has(error)) originalGraphFailures.set(error, Object.freeze({ index, total: rows.length, readPhase,
@@ -201,7 +207,7 @@ export async function validateExecutionGraph(pin: OpenCodeV2Pin, receipt: Execut
   signal?.throwIfAborted()
   progress?.({ phase: 'closure', completed: rows.length, total: rows.length })
   signal?.throwIfAborted()
-  const graph = await verifyOpenCodeV2ServerGraph(pin)
+  const graph = await verifyOpenCodeV2ServerGraph(pin, receipt.delivery)
   signal?.throwIfAborted()
   executionAssert(rows.some(row => row.path === graph.modulePath && row.sha256 === graph.moduleSha256) &&
     rows.some(row => row.path === graph.effectPath), 'execution_graph_incomplete')
@@ -242,7 +248,10 @@ export async function validateExecutionGraph(pin: OpenCodeV2Pin, receipt: Execut
         const file = path.join(directory, item.name)
         executionAssert(!item.isSymbolicLink(), 'execution_graph_incomplete')
         if (item.isDirectory()) await walk(file)
-        else executionAssert(item.isFile() && listed.has(file), 'execution_graph_incomplete')
+        else {
+          executionAssert(item.isFile() && listed.has(file), 'execution_graph_incomplete')
+          if (delivery) assertOpenCodeV2DeliveryFileRow(delivery, file, rowHashes.get(file)!)
+        }
       }
     }
     await walk(root)
@@ -277,13 +286,22 @@ function dependencyPackageName(name: string, specification: unknown): string {
   return alias[1]!
 }
 
-export async function validateExecutionNative(native: ValidatedExecutionNative): Promise<void> {
+export async function validateExecutionNative(native: ValidatedExecutionNative, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted()
+  openCodeV2EngineVersion(native)
   executionAssert(await filesystem.realpath(native.executablePath) === native.executablePath && /^opencode(?:\.exe)?$/.test(path.basename(native.executablePath)), 'execution_identity_mismatch')
-  const metadata = executionRecord(await readOpenCodePackageManifest(path.join(path.dirname(path.dirname(native.executablePath)), 'package.json')))
-  const platform = process.platform === 'win32' ? 'windows' : process.platform
-  executionAssert(metadata.name === native.packageName && metadata.version === native.version &&
-    native.packageName.startsWith(`@opencode/cli-${platform}-${process.arch}`), 'execution_identity_mismatch')
-  executionAssert(await hashOpenCodeFile(native.executablePath) === native.executableSha256, 'execution_identity_mismatch')
+  const raw = await readOpenCodeNativePackageMetadata(native.executablePath)
+  if (native.origin === 'standalone') {
+    executionAssert(native.packageName === null && raw === undefined, 'execution_identity_mismatch')
+  } else {
+    executionAssert(native.origin === undefined || native.origin === 'npm', 'execution_identity_mismatch')
+    const metadata = executionRecord(raw)
+    const platform = process.platform === 'win32' ? 'windows' : process.platform
+    executionAssert(typeof native.packageName === 'string' && metadata.name === native.packageName && metadata.version === native.version &&
+      native.packageName.startsWith(`@opencode/cli-${platform}-${process.arch}`), 'execution_identity_mismatch')
+  }
+  executionAssert(await hashOpenCodeFile(native.executablePath, signal) === native.executableSha256, 'execution_identity_mismatch')
+  signal?.throwIfAborted()
   const handle = await open(native.executablePath, 'r')
   try {
     const header = Buffer.alloc(4); await handle.read(header, 0, 4, 0)

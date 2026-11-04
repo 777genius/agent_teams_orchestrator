@@ -101,7 +101,7 @@ export class OpenCodeV2DeliveryJournal {
       await this.store.upsert({ ...found.record, status: 'failed_before_accept', error: 'native_input_not_reserved',
         diagnostics: [`v2_intent_sha256:${executionHash(intent)}`, `v2_unreserved_sha256:${executionHash(intent)}`] },
         { definitelyUnsubmitted: { runtimePromptMessageId: intent.identity.nativeInputID, submissionOwner } })
-      return { accepted: false, runId: base.runId ?? undefined, sessionId, memberName: base.memberName,
+      return { accepted: false, promptNotSubmitted: true, runId: base.runId ?? undefined, sessionId, memberName: base.memberName,
         runtimePromptMessageId: intent.identity.nativeInputID,
         diagnostics: [{ code: 'native_input_not_reserved', severity: 'warning', message: 'The original input was not reserved or submitted.' }] }
     }, deadline)

@@ -416,6 +416,19 @@ export function getNodeEnv(): string {
   return process.env.NODE_ENV || 'development'
 }
 
+/** The effective host persistence policy, shared by transcript and native history owners. */
+export function isSessionStoragePersistenceEnabled(): boolean {
+  const allowTestPersistence = isEnvTruthy(
+    process.env.TEST_ENABLE_SESSION_PERSISTENCE,
+  )
+  return !(
+    (getNodeEnv() === 'test' && !allowTestPersistence) ||
+    getSettings_DEPRECATED()?.cleanupPeriodDays === 0 ||
+    isSessionPersistenceDisabled() ||
+    isEnvTruthy(process.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY)
+  )
+}
+
 // exported for testing
 export function getUserType(): string {
   return process.env.USER_TYPE || 'external'
@@ -964,15 +977,7 @@ class Project {
    * test sessions don't pollute the user's --resume list.
    */
   private shouldSkipPersistence(): boolean {
-    const allowTestPersistence = isEnvTruthy(
-      process.env.TEST_ENABLE_SESSION_PERSISTENCE,
-    )
-    return (
-      (getNodeEnv() === 'test' && !allowTestPersistence) ||
-      getSettings_DEPRECATED()?.cleanupPeriodDays === 0 ||
-      isSessionPersistenceDisabled() ||
-      isEnvTruthy(process.env.CLAUDE_CODE_SKIP_PROMPT_HISTORY)
-    )
+    return !isSessionStoragePersistenceEnabled()
   }
 
   /**

@@ -37,8 +37,8 @@ const intent: QueueIntent = { delivery: 'queue', identity: {
   requestId: 'request', deliveryAttemptId: 'attempt', localMessageId: 'local', nativeInputID: 'msg_TESTinput',
 }, input: { nativeInputID: 'msg_TESTinput', text: 'hello worker', resume: true } }
 
-async function fixture(options: { unknown?: boolean; foreignClient?: boolean; createUnknown?: boolean;
-  probe?: boolean; promptBarrier?: Promise<void>; closeBarrier?: Promise<void>; permissionResources?: string[];
+async function fixture(options: { groupTools?: boolean; unknown?: boolean; foreignClient?: boolean; createUnknown?: boolean;
+  probe?: boolean; unattendedTeam?: boolean; promptBarrier?: Promise<void>; closeBarrier?: Promise<void>; permissionResources?: string[];
   lifetimeMs?: number; twoMembers?: boolean; memberCount?: number; preparation?: () => void; startup?: () => void;
   graphValidations?: unknown[];
   leaseClose?: (deadline: number | undefined) => void;
@@ -69,14 +69,17 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
         executableSha256: 'b'.repeat(64), packageName: '@opencode/cli-linux-x64', runtimeMode: 'source', entrySha256: 'e'.repeat(64),
         bun: { path: '/TEST-bun', sha256: 'c'.repeat(64) }, graph: { sha256: 'a'.repeat(64), files: [] } },
       profile: { epoch: 'TEST-epoch', root: '/TEST-profile', directory: '/TEST-project', databasePath: '/TEST-profile/data/db',
-        env: {}, envSha256: 'f'.repeat(64), config: { directory: '/TEST-profile/config', content: JSON.stringify({ mcp: { servers: { 'agent-teams': { type: 'local', command: [process.execPath, fileURLToPath(new URL('./fixtures/OpenCodeV2ControllerToolsPeer.ts', import.meta.url))] } } } }), sha256: 'f'.repeat(64) },
+        env: {}, envSha256: 'f'.repeat(64), config: { directory: '/TEST-profile/config', content: JSON.stringify({ mcp: { servers: { 'agent-teams': { type: 'local', command: [process.execPath, fileURLToPath(new URL('./fixtures/OpenCodeV2ControllerToolsPeer.ts', import.meta.url)), ...(options.groupTools ? ['--group-tools'] : [])] } } } }), sha256: 'f'.repeat(64) },
         selection: { agent: 'worker', model: { providerID: 'TEST-provider', id: 'TEST-model' }, permissions: options.permissions ?? [{ action: '*', resource: '*', effect: 'ask' }] } },
       bootstrap: { key: 'test.context', value, contextHash: createHash('sha256').update(value).digest('hex'), briefingHash: 'f'.repeat(64) },
       controllerMcpName: 'agent-teams', advertisedTools: ['message_send'] }],
   }
+  if (options.groupTools !== undefined) plan = { ...plan, qualification: {
+    capabilitySnapshotId: 'TEST-group-capability', expectedBehaviorFingerprint: 'a'.repeat(64),
+    binaryPath: '/TEST-opencode', binaryFingerprint: 'TEST-native', version: '2.0.32' } }
   if (options.probe) {
     const member = plan.members[0]!, config = JSON.parse(member.profile.config.content)
-    plan = { ...plan, members: [{ ...member, profile: { ...member.profile, root, directory: authority.directory } }], executionProbe: { memberId: member.memberId, intent, expectedText: 'done', capabilitySnapshotId: 'TEST-capability',
+    plan = { ...plan, members: [{ ...member, profile: { ...member.profile, root, directory: authority.directory } }], executionProbe: { memberId: member.memberId, intent, expectedText: 'done', capabilitySnapshotId: 'TEST-capability', unattendedTeam: options.unattendedTeam === true,
       prepared: { projectPath: authority.directory, canonicalProjectPath: authority.directory, workingDirectoryPath: authority.directory,
         scopeToken: null, profileRootKey: 'TEST-profile', profileRootPath: root, projectBehaviorFingerprint: 'b'.repeat(64), behaviorSources: [],
         managedConfig: config, managedConfigFingerprint: createHash('sha256').update(JSON.stringify(config)).digest('hex'),
@@ -191,7 +194,7 @@ async function fixture(options: { unknown?: boolean; foreignClient?: boolean; cr
 
 // Native terminal evidence can exist without a delivery-observe RPC. The owner
 // must reconcile that exact original before reserving a subsequent queue input.
-function publishTerminal(f: Awaited<ReturnType<typeof fixture>>, terminal = true) {
+function publishTerminal(f: Awaited<ReturnType<typeof fixture>>, terminal = true, outcome: 'succeeded' | 'failed' | 'cancelled' = 'succeeded') {
   const a = f.sessionAuthority, sessionID = a.sessionID, nativeInputID = intent.identity.nativeInputID
   const events: ExecutionLog['events'] = [
     { id: 'enqueued', type: 'session.inbox.enqueued', seq: 1, aggregateID: sessionID,
@@ -205,12 +208,14 @@ function publishTerminal(f: Awaited<ReturnType<typeof fixture>>, terminal = true
     { id: 'stepend', type: 'session.step.ended', seq: 6, aggregateID: sessionID,
       data: { sessionID, assistantMessageID: 'msg_assistant', finish: 'stop' } },
   ]
-  if (terminal) events.push({ id: 'evt_terminal', type: 'session.execution.succeeded', seq: 7, aggregateID: sessionID, data: { sessionID } })
+  if (terminal) events.push({ id: 'evt_terminal', type: outcome === 'cancelled' ? 'session.execution.interrupted' : `session.execution.${outcome}`, seq: 7, aggregateID: sessionID,
+    data: { sessionID, ...(outcome === 'failed' ? { error: { type: 'provider.internal', message: 'TEST native execution failure' } } :
+      outcome === 'cancelled' ? { reason: 'interrupt' } : {}) } })
   const messages: ExecutionMessage[] = [
     { id: nativeInputID, timeCreated: 1, type: 'user', data: { id: nativeInputID, type: 'user', text: intent.input.text } },
     { id: 'msg_assistant', timeCreated: 1, type: 'assistant', data: { id: 'msg_assistant', type: 'assistant',
       agent: a.agent, model: a.model, time: { created: 1, completed: 2 }, finish: 'stop', content: [{ type: 'text', text: 'done' }] } },
-    ...(terminal ? [{ id: 'msg_terminal', timeCreated: 1, type: 'idle', data: { outcome: 'succeeded' } }] : []),
+    ...(terminal ? [{ id: 'msg_terminal', timeCreated: 1, type: 'idle', data: { outcome: outcome === 'cancelled' ? 'interrupted' : outcome } }] : []),
   ]
   f.native.log = async () => ({ events, synced: true, watermark: events.at(-1)!.seq })
   f.native.messages = async (_id, cursor) => cursor === undefined
@@ -415,12 +420,12 @@ test('reservation failure before creation stops without fencing or native sessio
 })
 
 describe('run-owned V2 lease/session/admission composition', () => {
-  test('next send settles the exact native-completed original without an observe RPC or replay', async () => {
+  for (const outcome of ['succeeded', 'failed', 'cancelled'] as const) test(`next send settles the exact ${outcome} original without an observe RPC or replay`, async () => {
     const f = await fixture()
     try {
       await f.owner.ready()
       await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
-      publishTerminal(f)
+      publishTerminal(f, true, outcome)
       const before = await (await f.store()).snapshot()
       expect(before.slot).toBe(intent.identity.requestId)
       expect(before.admissions[0]).toMatchObject({ complete: false, cursor: null })
@@ -430,6 +435,7 @@ describe('run-owned V2 lease/session/admission composition', () => {
       const after = await (await f.store()).snapshot()
       expect(after.slot).toBe(next.identity.requestId)
       expect(after.terminalSettlements).toHaveLength(1)
+      expect(after.terminalSettlements?.[0]?.state).toBe(outcome)
       expect(f.counters.prompted).toBe(2)
       await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 5000)
       expect((await (await f.store()).snapshot()).slot).toBe(next.identity.requestId)
@@ -790,7 +796,7 @@ describe('durable owner refusal crosses authenticated control and app journal', 
         await expect(send(next)).rejects.toThrow('run_control_disconnected')
         expect((await bridge().queryOutcome({ requestId: next.identity.requestId })).record?.safeToRetry).toBe(false)
       }
-      expect((await send(next)).accepted).toBe(false)
+      expect(await send(next)).toMatchObject({ accepted: false, promptNotSubmitted: true })
       expect((await bridge().queryOutcome({ requestId: next.identity.requestId })).record).toMatchObject({
         status: 'failed_before_accept', safeToRetry: true, runtimePromptMessageId: next.identity.nativeInputID })
       expect((await (await f.store()).snapshot()).admissions).toHaveLength(1)
@@ -861,7 +867,9 @@ test('lost send response after native invocation stays fenced and a fresh bridge
     await expect(send()).rejects.toThrow('run_control_disconnected')
     expect((await bridge().queryOutcome({ requestId: intent.identity.requestId })).record).toMatchObject({
       status: 'prompt_submitting', safeToRetry: false })
-    expect((await send()).accepted).toBe(false)
+    const recovered = await send()
+    expect(recovered.accepted).toBe(false)
+    expect(recovered.promptNotSubmitted).toBeUndefined()
     expect(operations).toEqual(['send', 'observe'])
     expect(f.counters.prompted).toBe(1)
     expect((await (await f.store()).snapshot()).admissions[0]?.state).toBe('unknown')
@@ -1021,7 +1029,8 @@ requireExecutionEndpoint: authority => {
     } finally { await rm(root, { recursive: true, force: true }) }
     return
   }
-  const f = await fixture({ probe: true })
+  for (const unattendedTeam of [false, true]) {
+  const f = await fixture({ probe: true, unattendedTeam })
   try {
     await f.owner.ready()
     await f.owner.execute({ operation: 'send', ...f.selected, intent }, Date.now() + 2000)
@@ -1051,6 +1060,7 @@ requireExecutionEndpoint: authority => {
     if (settled.kind !== 'probeEvidence') throw Error('TEST probe missing')
     expect(settled.failure).toBeNull()
     expect(settled.proof).toMatchObject({ modelId: 'TEST-provider/TEST-model', opencodeVersion: '2.0.32', capabilitySnapshotId: 'TEST-capability' })
+    expect(Date.parse(settled.proof!.expiresAt) - Date.parse(settled.proof!.verifiedAt)).toBe(unattendedTeam ? 330_000 : 120_000)
     expect((await (await f.store()).snapshot()).slot).toBeNull()
     expect(f.counters).toMatchObject({ prompted: 1, acquired: 1, sessions: 1 })
     for (const fault of [new Error('mutable_readback'), new ExecutionTransportFailure('invalid_response', 'not_submitted')]) {
@@ -1063,6 +1073,7 @@ requireExecutionEndpoint: authority => {
     await expect(f.owner.execute({ operation: 'probeEvidence', ...f.selected }, Date.now() + 2000)).rejects.toThrow('incomplete_log')
     expect(f.counters.prompted).toBe(1)
   } finally { f.native.log = async () => ({ events: [], synced: true, watermark: null }); await f.close() }
+  }
 }, 15_000)
 
 
@@ -1074,4 +1085,32 @@ test('owner entry diagnostics preserve exit without changing ignored stderr owne
   expect(JSON.parse(projectRunOwnerEntryFailure(5, null))).not.toHaveProperty('nativeExitCode')
   expect(JSON.parse(projectRunOwnerEntryFailure(5, -1))).not.toHaveProperty('nativeExitCode')
   expect(JSON.parse(projectRunOwnerEntryFailure(5, 0)).nativeExitCode).toBe(0)
+})
+
+
+test('group proof reads the original native session and fresh MCP tools without native input', async () => {
+  const f = await fixture({ groupTools: true })
+  try {
+    await f.owner.ready()
+    const clients = f.counters.clients
+    const result = await f.owner.execute({ operation: 'groupProof', ...f.selected }, Date.now() + 5000)
+    expect(result).toEqual({ kind: 'groupProof', proof: {
+      teamName: 'TEST-team', memberName: 'worker', runId: 'TEST-run', runKey: 'TEST-run',
+      laneId: 'primary', runtimePid: 42, runtimeSessionId: 'ses_TESToriginal', processorReady: true, groupReactionProtocolVersion: 1 } })
+    expect(f.counters.clients).toBeGreaterThan(clients)
+    expect(f.counters.prompted).toBe(0)
+    await expect(f.owner.execute({ operation: 'groupProof', ...f.selected, originalSessionId: 'ses_wrong' }, Date.now() + 5000)).rejects.toThrow()
+    f.native.mcp = async () => [{ name: 'agent-teams', status: 'disconnected' }]
+    await expect(f.owner.execute({ operation: 'groupProof', ...f.selected }, Date.now() + 5000)).rejects.toThrow('run_controller_mcp_unknown')
+    expect(f.counters.prompted).toBe(0)
+  } finally { await f.close() }
+})
+
+test('ordinary live native session without group MCP tools never receives a group capability', async () => {
+  const f = await fixture({ groupTools: false })
+  try {
+    await f.owner.ready()
+    expect(await f.owner.execute({ operation: 'groupProof', ...f.selected }, Date.now() + 5000)).toEqual({ kind: 'groupProof', proof: null })
+    expect(f.counters.prompted).toBe(0)
+  } finally { await f.close() }
 })

@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { getUnifiedRuntimeStatusPayload } from '../../runtimeBackends/registry.js'
-import { emptyOpenCodeV2ReadStatus } from '../catalog/OpenCodeV2ReadStatus.js'
+import { emptyOpenCodeV2ReadStatus, readStatusKey } from '../catalog/OpenCodeV2ReadStatus.js'
 import { openCodeV2InventorySnapshot } from '../catalog/OpenCodeV2InventoryService.js'
 import type { OpenCodeV2NativeIdentity } from './OpenCodeNativeIdentity.js'
 
@@ -31,4 +31,22 @@ test('summary status calls no active V2 producer', async () => {
   expect(payload.providers.opencode?.capabilities.teamLaunch).toBe(false)
   expect(payload.providers.opencode?.authenticated).toBe(false)
   expect(payload.providers.opencode?.openCodeReadStatus).toBeUndefined()
+})
+
+
+test('selection keys preserve legacy npm identities and bind independent CLI, engine and origin', () => {
+  const old = emptyOpenCodeV2ReadStatus(native, '/TEST')
+  expect(old.selectionKey).toBe(readStatusKey(`${native.executablePath}\0${native.executableSha256}\0${native.dialect}`))
+  expect(emptyOpenCodeV2ReadStatus({ ...native, engineVersion: native.version, origin: 'npm' }, '/TEST').selectionKey).toBe(old.selectionKey)
+  const independent = { ...native, version: '2.99.0' as const, engineVersion: '2.0.32' as const }
+  const current = emptyOpenCodeV2ReadStatus(independent, '/TEST')
+  expect(current).toMatchObject({ version: '2.99.0', engineVersion: '2.0.32', dialect: 'v2-2.0.32' })
+  expect(current.selectionKey).not.toBe(old.selectionKey)
+  for (const changed of [
+    { ...independent, version: '2.1.99' as const },
+    { ...independent, engineVersion: '2.0.0' as const, dialect: 'v2-2.0.0' as const },
+    { ...independent, origin: 'standalone' as const, packageName: null },
+    { ...independent, executableSha256: 'b'.repeat(64) },
+  ]) expect(emptyOpenCodeV2ReadStatus(changed, '/TEST').selectionKey).not.toBe(current.selectionKey)
+  expect(() => emptyOpenCodeV2ReadStatus({ ...independent, dialect: 'v2-2.99.0' }, '/TEST')).toThrow('execution_identity_mismatch')
 })

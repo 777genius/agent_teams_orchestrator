@@ -1,3 +1,4 @@
+import { OPEN_CODE_LOADING_TIMEOUT_MS } from '../OpenCodeLoadingBudget.js'
 import type { OpenCodeClientRequestContext } from '../OpenCodeClientRequestContext.js'
 import { openCodeV2Wire, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 
@@ -64,9 +65,9 @@ export class OpenCodeBoundedFetch {
   ) {
     openCodeReadAssert(/^http:\/\/127\.0\.0\.1:[1-9]\d*$/.test(baseUrl), 'identity_mismatch')
     openCodeReadAssert(Number.isSafeInteger(maxBytes) && maxBytes > 0 && maxBytes <= 8 * 1024 * 1024)
-    const remaining = context.remainingMs?.() ?? 60_000
+    const remaining = context.remainingMs?.() ?? OPEN_CODE_LOADING_TIMEOUT_MS
     openCodeReadAssert(Number.isFinite(remaining) && remaining > 0, 'timeout')
-    this.deadline = Date.now() + Math.min(60_000, remaining)
+    this.deadline = Date.now() + Math.min(OPEN_CODE_LOADING_TIMEOUT_MS, remaining)
   }
   check(): void {
     this.context.signal?.throwIfAborted()
@@ -102,8 +103,8 @@ export class OpenCodeBoundedFetch {
     this.controllers.add(controller)
     const signal = AbortSignal.any([request.signal, controller.signal,
       ...(this.context.signal ? [this.context.signal] : [])])
-    const initialization = activation || url.pathname === '/api/location' || url.pathname === '/api/integration'
-    const timer = setTimeout(() => controller.abort(), Math.min(initialization ? 30_000 : 15_000, this.deadline - Date.now()))
+    // Catalog reads share the original remaining budget, including body consumption.
+    const timer = setTimeout(() => controller.abort(), Math.min(this.deadline - Date.now(), this.context.remainingMs?.() ?? Infinity))
     let reader: ReturnType<typeof openCodeResponseReader> = undefined
     try {
       const headers = new Headers(request.headers)

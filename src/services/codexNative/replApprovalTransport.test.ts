@@ -66,6 +66,21 @@ function createApprovalServer(cwd: string, completeOnDecision = true) {
       return true
     },
   })
+  let exited = false
+  child.on('exit', (code, signal) => {
+    if (exited) return
+    exited = true
+    child.exitCode = code
+    child.signalCode = signal
+    stdout.end()
+    stderr.end()
+    // A real ChildProcess closes its stdio after exit. Continuity ownership
+    // deliberately waits for this event before releasing the native profile.
+    queueMicrotask(() => child.emit('close', code, signal))
+  })
+  stdin.on('finish', () => {
+    queueMicrotask(() => { if (!exited) child.emit('exit', 0, null) })
+  })
   const write = (payload: RpcMessage) =>
     stdout.write(`${JSON.stringify(payload)}\n`)
   const complete = () => {

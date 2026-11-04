@@ -1,3 +1,4 @@
+import { assertValidGroupMailboxRows, hasGroupMailboxMarker } from '../../../utils/groupMailbox.js'
 import { constants } from 'node:fs'
 import { lstat, open, readFile, realpath, type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
@@ -106,7 +107,7 @@ export type ControllerInboxBinding = Readonly<{ teamId: string; runId: string; m
 export type ControllerInboxProof = Readonly<{
   binding: ControllerInboxBinding
   messages: readonly Readonly<{ messageId: string; from: string; to: string; text: string;
-    timestamp: string; read: boolean; relayOfMessageId?: string; source?: string }>[]
+    timestamp: string; read: boolean; relayOfMessageId?: string; source?: string; groupChatId?: string; groupMessageId?: string; groupChatProtocolVersion?: 1 }>[]
 }>
 
 export const CONTROLLER_INBOX_MAX_BYTES = 4 * 1024 * 1024
@@ -139,10 +140,12 @@ export function parseControllerInboxBytes(bytes: Uint8Array | null,
     executionAssert(['messageId', 'from', 'to', 'text', 'timestamp'].every(key => typeof row[key] === 'string' && row[key].length > 0) &&
       typeof row.read === 'boolean' && (row.relayOfMessageId === undefined || typeof row.relayOfMessageId === 'string') &&
       (row.source === undefined || typeof row.source === 'string'), 'run_controller_inbox_unknown')
+    if (hasGroupMailboxMarker(row)) assertValidGroupMailboxRows([row])
     return Object.freeze({ messageId: row.messageId as string, from: row.from as string, to: row.to as string,
       text: row.text as string, timestamp: row.timestamp as string, read: row.read as boolean,
       ...(row.relayOfMessageId === undefined ? {} : { relayOfMessageId: row.relayOfMessageId as string }),
-      ...(row.source === undefined ? {} : { source: row.source as string }) })
+      ...(row.source === undefined ? {} : { source: row.source as string }),
+      ...(row.groupChatId === undefined ? {} : { groupChatId: row.groupChatId as string, groupMessageId: row.groupMessageId as string, groupChatProtocolVersion: 1 as const }) })
   })
   return Object.freeze({ binding: Object.freeze({ ...binding }), messages: Object.freeze(messages) })
 }

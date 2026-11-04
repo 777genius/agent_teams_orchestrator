@@ -5,7 +5,7 @@ import pins from '../../scripts/runtime-bun-pins.json'
 
 test('packaged runtime binds the platform to its exact pinned Bun', () => {
   for (const platform of ['win32', 'linux', 'darwin']) {
-    const expected = platform === 'win32' ? '1.4.3' : '1.3.11'
+    const expected = platform === 'win32' ? '1.4.3' : platform === 'darwin' ? '1.4.4' : '1.3.11'
     expect(openCodeBunVersion(platform)).toBe(expected)
     const identity = { schema: 1, platform, arch: 'x64', bunVersion: expected,
       bunSha256: 'a'.repeat(64), entrySha256: 'b'.repeat(64) } as const

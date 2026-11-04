@@ -8,6 +8,7 @@ const files = [
   'src/services/opencode/OpenCodeSelectedAuthorityAdoption.test.ts',
   'src/services/opencode/OpenCodeProvisioningProbe.test.ts',
   'src/services/opencode/OpenCodeSelectedSessionAuthority.test.ts',
+  'src/services/opencode/OpenCodeGroupChatCapability.test.ts',
   'src/services/opencode/OpenCodeBridgeCommandHandler.test.ts',
   'src/services/opencode/OpenCodeStopRecovery.test.ts',
   'src/services/opencode/OpenCodeStopRecoveryBridge.test.ts',

@@ -1,4 +1,6 @@
 export const TEAM_LEAD_NAME = 'team-lead'
+// Inbox of the human user (inboxes/user.json); a valid message recipient in every team.
+export const USER_RECIPIENT_NAME = 'user'
 export const SWARM_SESSION_NAME = 'claude-swarm'
 export const SWARM_VIEW_WINDOW_NAME = 'swarm-view'
 export const TMUX_COMMAND = 'tmux'
