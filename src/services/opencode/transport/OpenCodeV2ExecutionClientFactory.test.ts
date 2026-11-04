@@ -7,7 +7,7 @@ import { createOpenCodeV2ExecutionClient } from './OpenCodeV2ExecutionClientFact
 /** Public DTO resembles a persisted authority, including this process's PID. It is
  * deliberately NOT an acquired lease: no host/native effects belong in this test. */
 function persistedAuthority(pin: OpenCodeV2Pin): ExecutionAuthority {
-  return { generation: 'v2', pin, dialect: pin === '2.0.0' ? 'v2-2.0.0' : 'v2-2.0.32',
+  return { generation: 'v2', pin, dialect: `v2-${pin}`,
     graphSha256: 'a'.repeat(64), selectedCli: { path: '/TEST/opencode', sha256: 'b'.repeat(64), version: pin },
     child: { pid: process.pid, birth: { format: 'linux-start-ticks', value: '123', bootId: 'TEST-boot' },
       executablePath: process.execPath, sha256: 'c'.repeat(64) },
