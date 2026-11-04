@@ -16,14 +16,14 @@ test(`catalog refusal retains ${phase} with original thrown identity and bounded
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-catalog-phase-'))
   const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
   process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
-  const pin = '2.0.32', directory = '/TEST/catalog-project'
-  const authority: ExecutionAuthority = { generation: 'v2', pin, dialect: 'v2-2.0.32', graphSha256: 'a'.repeat(64),
+  const pin = '2.1.4', directory = '/TEST/catalog-project'
+  const authority: ExecutionAuthority = { generation: 'v2', pin, dialect: 'v2-2.1.4', graphSha256: 'a'.repeat(64),
     selectedCli: { path: '/TEST/opencode', sha256: 'b'.repeat(64), version: pin },
     child: { pid: 42, birth: { format: 'linux-start-ticks', value: '123', bootId: 'TEST-boot' }, executablePath: '/TEST/bun', sha256: 'c'.repeat(64) },
     hostInstanceId: 'TEST-host', profileEpoch: 'TEST-profile', profileRoot: '/TEST/profile', directory, leaseOwnerId: 'TEST-owner' }
   const context: ExecutionContext = { teamId: 'TEST-team', runId: 'TEST-run', laneId: 'primary', memberId: 'alice', deadline: Date.now() + 10_000 }
   const original = new Error(phase === 'cleanup' ? 'cleanup_unknown' : 'TEST-PRIVATE-CATALOG-PAYLOAD')
-  const entry = await realpath(Bun.resolveSync('@opencode/client-v2.0.32', import.meta.dir))
+  const entry = await realpath(Bun.resolveSync('@opencode/client-v2.1.4', import.meta.dir))
   const files = await Promise.all([entry, ...['schema/installation-event', 'protocol/groups/pty'].map(name => Bun.resolveSync('@opencode/' + name, path.dirname(entry)))].map(async file => {
     const canonical = await realpath(file)
     return { path: canonical, sha256: createHash('sha256').update(await readFile(canonical)).digest('hex') }

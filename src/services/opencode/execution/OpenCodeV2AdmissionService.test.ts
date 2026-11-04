@@ -15,8 +15,8 @@ import { executionCurrentOperations } from '../transport/OpenCodeV2ExecutionCurr
 import { launchableStagedOpenCodeV2Pins, stagedOpenCodeV2Client } from '../compatibility/fixtures/stagedOpenCodeV2Pins.js'
 
 const authority: SessionAuthority = {
-  host: { generation: 'v2', pin: '2.0.32', dialect: 'v2-2.0.32', graphSha256: '1'.repeat(64),
-    selectedCli: { path: '/TEST-cli', sha256: '2'.repeat(64), version: '2.0.32' },
+  host: { generation: 'v2', pin: '2.1.4', dialect: 'v2-2.1.4', graphSha256: '1'.repeat(64),
+    selectedCli: { path: '/TEST-cli', sha256: '2'.repeat(64), version: '2.1.4' },
     child: { pid: 10, birth: { format: 'linux-start-ticks', value: '11', bootId: 'TEST-boot' }, executablePath: '/TEST-bun', sha256: '3'.repeat(64) },
     hostInstanceId: 'TEST-host', profileEpoch: 'TEST-epoch', profileRoot: '/TEST-profile', directory: '/TEST-project', leaseOwnerId: 'TEST-owner' },
   teamId: 'TEST-team', runId: 'TEST-run', laneId: 'TEST-lane', memberId: 'TEST-member', sessionID: 'ses_TEST1', agent: 'TEST-agent', model: { providerID: 'TEST-provider', id: 'catalog-model' },
