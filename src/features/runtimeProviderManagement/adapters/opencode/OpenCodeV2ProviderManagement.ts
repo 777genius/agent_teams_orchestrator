@@ -1,5 +1,5 @@
-import { OpenCodeV2CatalogReadBudget, OpenCodeV2CatalogReadTimeout } from './OpenCodeV2CatalogReadBudget.js'
-import { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
+import { OpenCodeV2CatalogReadBudget, OpenCodeV2CatalogReadTimeout, type OpenCodeV2CatalogReadPhase } from './OpenCodeV2CatalogReadBudget.js'
+import { classifyOpenCodeV2RunOwnerFailure, recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
 import { openCodeV2Refusal } from '../../../../services/opencode/execution/OpenCodeV2RefusalReason.js'
 export { recordOpenCodeV2ProviderFailure } from '../../../../services/opencode/execution/OpenCodeV2Diagnostics.js'
 import path from 'node:path'
@@ -88,10 +88,12 @@ async function catalog<T>(input: { providerId: string; projectPath?: string | nu
     native = await createOpenCodeV2ExecutionReceipt(sourceRoot, selected.native, undefined, undefined, budget?.signal)
     budget?.enter('acquisition')
   } catch (error) {
+    budget?.noteFailure()
     // No lease acquisition has begun, so no native owner can use these sealed
     // key/config files. Once acquisition starts, its failure path retains custody.
     try { await rm(root, { recursive: true, force: true }) }
     catch (cleanupError) {
+      budget?.noteFailure('retirement')
       throw new AggregateError([error, cleanupError], 'provider_catalog_prelease_cleanup_unknown', { cause: error })
     }
     throw error
@@ -113,7 +115,14 @@ async function catalog<T>(input: { providerId: string; projectPath?: string | nu
       remove: credentialID => selected.wire === 'floor'
         ? selected.module.OpenCode.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch }).credential.remove({ location, credentialID })
         : selected.module.OpenCode.make({ baseUrl: endpoint.baseUrl, fetch: wire.fetch }).credential.remove({ credentialID }) })
-  } finally { budget?.retiring(); await retireOpenCodeV2CatalogOwner(wire, lease, unregister) }
+  } catch (error) {
+    budget?.noteFailure()
+    throw error
+  } finally {
+    budget?.retiring()
+    try { await retireOpenCodeV2CatalogOwner(wire, lease, unregister) }
+    catch (error) { budget?.noteFailure('retirement'); throw error }
+  }
 }
 
 /** Reopen only the retired original catalog for GET readback, never key connect/remove. */
@@ -444,6 +453,12 @@ export async function testOpenCodeV2ProviderModel(input: TestProviderModelInput)
   } catch (error) { return resultError('runtime-unhealthy', openCodeV2Refusal(error)?.message ?? 'V2 selected-model execution could not be qualified. No alternate model was tried.') }
 }
 
+/** Exact enum stages and closed failure codes only; never copy SDK text or credential material. */
+export function openCodeV2CatalogFailureMessage(phase: OpenCodeV2CatalogReadPhase, error: unknown): string {
+  const category = classifyOpenCodeV2RunOwnerFailure(error).category
+  return `V2 native provider catalog is unavailable (stage: ${phase}, category: ${category}); no legacy CLI catalog command was invoked.`
+}
+
 export async function loadOpenCodeV2ProviderModels(input: LoadProviderModelsInput,
   selectedRead?: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>, budget?: OpenCodeV2CatalogReadBudget): Promise<ProviderManagementResult<RuntimeProviderModelsView>> {
   if (!budget) return new OpenCodeV2CatalogReadBudget().run(owned => loadOpenCodeV2ProviderModels(input, selectedRead, owned)).catch(error =>
@@ -478,9 +493,15 @@ export async function loadOpenCodeV2ProviderModels(input: LoadProviderModelsInpu
         defaultModelId: owner.preferredModel, diagnostics: [], catalogState: 'fresh' as const }
     }, selectedRead, { includeSelectedApiKey: true, budget })
     return { ok: true, value }
-  } catch (error) { return resultError('runtime-unhealthy', error instanceof Error && error.message === 'provider_catalog_page_changed'
-    ? 'The OpenCode model catalog changed while loading more models. Refresh models and try again.'
-    : openCodeV2Refusal(error)?.message ?? 'V2 native provider catalog is unavailable; no legacy CLI catalog command was invoked.') }
+  } catch (error) {
+    if (error instanceof Error && error.message === 'provider_catalog_page_changed')
+      return resultError('runtime-unhealthy', 'The OpenCode model catalog changed while loading more models. Refresh models and try again.')
+    const refusal = openCodeV2Refusal(error)
+    if (refusal) return resultError('runtime-unhealthy', refusal.message)
+    const phase = budget.diagnosticPhase
+    await recordOpenCodeV2ProviderFailure(`provider-model-catalog-${phase}`, error, true).catch(() => undefined)
+    return resultError('runtime-unhealthy', openCodeV2CatalogFailureMessage(phase, error))
+  }
 }
 
 export function buildOpenCodeV2RuntimeProviderModel(row: Record<string, unknown>, providerId: string, preferredModel: string | null,
