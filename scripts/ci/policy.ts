@@ -76,7 +76,9 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     console.log(aggregate(JSON.parse(process.env.CI_NEEDS ?? '{}')))
   } else if (process.argv[2] === 'classify') {
     const event = process.env.CI_EVENT ?? ''
-    const full = event === 'workflow_dispatch' && process.env.CI_FULL === 'true'
+    // Main pushes without qualified PR CI must not retain the routine-path skips.
+    const full = (event === 'workflow_dispatch' && process.env.CI_FULL === 'true') ||
+      (event === 'push' && process.env.GITHUB_REF === 'refs/heads/main' && process.env.CI_REUSE !== 'true')
     if (event === 'workflow_dispatch' && !full) throw new Error('Dispatch requires full validation')
     const paths = full ? [] : parsePaths(execFileSync('git', diffArgs(event, process.env.CI_BASE ?? '', process.env.CI_HEAD ?? ''), { encoding: 'utf8' }))
     const decision = classify(paths, full)

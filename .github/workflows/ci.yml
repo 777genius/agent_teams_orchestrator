@@ -68,6 +68,7 @@ jobs:
           CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
           CI_FULL: ${{ inputs.full }}
+          CI_REUSE: ${{ steps.reuse.outputs.reuse }}
         run: node scripts/ci/policy.ts classify
       - name: Explain selected checks
         env:

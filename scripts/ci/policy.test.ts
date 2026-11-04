@@ -24,6 +24,7 @@ test('post-merge reuse keeps the required check and cannot leak into unqualified
     return text.split(/\n  [a-z][a-z-]*:\n/, 2)[0]
   }
   assert.match(job('scope'), /reuse: \$\{\{ steps\.reuse\.outputs\.reuse \}\}/)
+  assert.match(job('scope'), /CI_REUSE: \$\{\{ steps\.reuse\.outputs\.reuse \}\}/)
   for (const name of ['cursor-managed-plugin', 'windows-packaged-backfill',
     'opencode-authority', 'opencode-conformance', 'packaged-delivery', 'opencode-v2-linux',
     'opencode-v2-desktop-lifecycle', 'opencode-native-custody']) {
@@ -239,7 +240,15 @@ test('actual Node CLI emits outputs and fails closed without Git access or valid
     assert.equal(full.status, 0, full.stderr)
     assert.match(readFileSync(output, 'utf8'), /native=true\nauthority_os=\["ubuntu-latest","windows-latest"\]\nreason=Explicit full validation request\nv2_linux=true\n/)
     assert.notEqual(invoke('classify', { CI_EVENT: 'workflow_dispatch', CI_FULL: 'false', GITHUB_OUTPUT: output }).status, 0)
-    assert.notEqual(invoke('classify', { CI_EVENT: 'push', CI_BASE: 'a'.repeat(40), CI_HEAD: 'b'.repeat(40), GITHUB_OUTPUT: output }).status, 0)
+    // Missing/failed evidence and direct pushes to main execute the complete native matrix.
+    const mainFallback = invoke('classify', { CI_EVENT: 'push', GITHUB_REF: 'refs/heads/main', CI_REUSE: 'false', GITHUB_OUTPUT: output })
+    assert.equal(mainFallback.status, 0, mainFallback.stderr)
+    assert.match(readFileSync(output, 'utf8'), /native=true\nauthority_os=\["ubuntu-latest","windows-latest"\]\nreason=Explicit full validation request\nv2_linux=true\n/)
+    assert.equal(invoke('classify', { CI_EVENT: 'push', GITHUB_REF: 'refs/heads/main', CI_REUSE: '', GITHUB_OUTPUT: output }).status, 0)
+    // Verified reuse and dev pushes still evaluate changed paths; neither gets a forced full selection.
+    for (const [ref, reuse] of [['refs/heads/main', 'true'], ['refs/heads/dev', 'false']]) {
+      assert.notEqual(invoke('classify', { CI_EVENT: 'push', GITHUB_REF: ref, CI_REUSE: reuse, CI_BASE: 'a'.repeat(40), CI_HEAD: 'b'.repeat(40), GITHUB_OUTPUT: output }).status, 0)
+    }
     assert.equal(invoke('aggregate', { CI_NEEDS: JSON.stringify(needs()) }).status, 0)
     const failed = needs(); failed['opencode-authority'].result = 'cancelled'
     assert.notEqual(invoke('aggregate', { CI_NEEDS: JSON.stringify(failed) }).status, 0)
