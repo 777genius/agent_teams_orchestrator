@@ -275,7 +275,7 @@ test('public V2 model catalog refusal keeps a finite profile stage and a private
     const profile = await import(profilePath)
     const secret = 'TEST-SECRET-private-provider-error'
     mock.module(profilePath, () => ({ ...profile,
-      resolveOpenCodeV2CatalogProfileScope: async () => { throw Error(secret) },
+      resolveOpenCodeV2CatalogProfileScope: async () => { throw Object.assign(Error(secret), { code: 'EACCES', syscall: 'open', path: secret }) },
     }))
     const { OpenCodeProviderManagementAdapter } = await import(${JSON.stringify(import.meta.resolve('./OpenCodeProviderManagementAdapter.ts'))})
     try {
@@ -293,6 +293,7 @@ test('public V2 model catalog refusal keeps a finite profile stage and a private
       const observation = JSON.parse(bytes)
       assert.equal(observation.phase, 'provider-model-catalog-profile')
       assert.equal(observation.category, 'provider_operation_unknown')
+      assert.deepEqual(observation.failure, { name: 'Error', errno: 'EACCES', operation: 'open' })
       assert.equal(observation.retainedOriginal, true)
     } finally { mock.restore(); await rm(root, { recursive: true, force: true }) }
   `

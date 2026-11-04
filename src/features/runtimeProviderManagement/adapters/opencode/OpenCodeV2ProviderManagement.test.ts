@@ -20,6 +20,13 @@ test('V2 catalog failure messages contain only fixed phases and closed categorie
   }))
   expect(cleanup).toContain('stage: retirement, category: provider_physical_cleanup_unknown')
   expect(cleanup).not.toContain(secret)
+  // An arbitrary SDK Error can expose a failing cause getter. Diagnostics must
+  // not turn the original catalog refusal into a thrown exception.
+  const poisoned = new Error(secret)
+  Object.defineProperty(poisoned, 'cause', { get() { throw new Error(secret) } })
+  const safe = openCodeV2CatalogFailureMessage('models', poisoned)
+  expect(safe).toContain('stage: models, category: provider_operation_unknown')
+  expect(safe).not.toContain(secret)
 })
 
 test('V2 API-key admission preserves V1 OAuth and differing API credentials in the shared mirror', () => {
@@ -162,6 +169,35 @@ test('transport failure never skips physical catalog lease retirement', async ()
   await expect(retireOpenCodeV2CatalogOwner({ dispose: async () => { events.push('dispose'); throw new Error('TEST-wire') } },
     { close: async () => { events.push('retire') } }, () => { events.push('unregister') })).rejects.toThrow('provider_physical_cleanup_unknown')
   expect(events).toEqual(['dispose', 'unregister', 'retire'])
+})
+
+test('V2 catalog diagnostics preserve only allowlisted filesystem facts', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-catalog-errno-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  const secret = 'TEST-PRIVATE-FILE-PATH-AND-KEY'
+  process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+  try {
+    await recordOpenCodeV2ProviderFailure('provider-model-catalog-profile',
+      Object.assign(new Error(secret), { code: 'EACCES', syscall: 'open', path: secret }), true)
+    await recordOpenCodeV2ProviderFailure('provider-model-catalog-models',
+      Object.assign(new Error(secret), { code: 'EACCES-' + secret, syscall: 'open-' + secret, path: secret }), true)
+    const original = Object.assign(new Error(secret), { code: 'ENOENT', syscall: 'realpath', path: secret })
+    const cleanup = new AggregateError([original, new Error(secret)],
+      'provider_catalog_prelease_cleanup_unknown', { cause: original })
+    await recordOpenCodeV2ProviderFailure('provider-model-catalog-retirement', cleanup, true)
+    const directory = path.join(root, 'opencode/v2/provider-diagnostics')
+    const rows = await Promise.all((await readdir(directory)).map(async name => JSON.parse(await readFile(path.join(directory, name), 'utf8'))))
+    expect(rows.find(row => row.phase === 'provider-model-catalog-profile').failure).toEqual({ name: 'Error', errno: 'EACCES', operation: 'open' })
+    expect(rows.find(row => row.phase === 'provider-model-catalog-models').failure).toEqual({ name: 'Error' })
+    const uncertain = rows.find(row => row.phase === 'provider-model-catalog-retirement')
+    expect(uncertain.category).toBe('provider_operation_unknown')
+    expect(uncertain.failure).toEqual({ name: 'Error', errno: 'ENOENT', operation: 'realpath' })
+    expect(JSON.stringify(rows)).not.toContain(secret)
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('private failure diagnostics preserve finite control causes and redact arbitrary secrets', async () => {

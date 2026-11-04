@@ -555,7 +555,8 @@ jobs:
           fi
       - name: Read real OpenCode V2 catalog through packaged Windows runtime
         if: runner.os == 'Windows'
-        timeout-minutes: 8
+        # This step runs two independent bounded catalog reads in sequence.
+        timeout-minutes: 12
         shell: pwsh
         env:
           CANDIDATE_PLATFORM: ${{ matrix.platform }}
@@ -599,6 +600,21 @@ jobs:
             throw 'Packaged V2 catalog did not return genuine OpenCode model rows'
           }
           Write-Output "Native V2 catalog read passed ($env:CANDIDATE_PLATFORM)"
+          # The desktop's global Providers view omits --project-path and --limit.
+          # Its CLI uses HOME as cwd; exercise that exact command as well.
+          $defaultOut = Join-Path (Get-Location).Path "native-v2-models-default-$env:CANDIDATE_PLATFORM.json"
+          $defaultErr = Join-Path (Get-Location).Path "native-v2-models-default-$env:CANDIDATE_PLATFORM.stderr"
+          Push-Location $env:HOME
+          try {
+            & $runtime runtime providers models --runtime opencode --provider opencode --json 1> $defaultOut 2> $defaultErr
+            $defaultCode = $LASTEXITCODE
+          } finally { Pop-Location }
+          if ($defaultCode -ne 0) { Get-Content $defaultErr -ErrorAction SilentlyContinue; throw 'Global V2 catalog command failed' }
+          $default = Get-Content $defaultOut -Raw | ConvertFrom-Json
+          if ($default.error -or -not $default.models -or -not @($default.models.models | Where-Object { $_.providerId -eq 'opencode' }).Count) {
+            throw 'Global V2 catalog did not return native OpenCode models'
+          }
+          Write-Output "Native V2 no-project catalog read passed ($env:CANDIDATE_PLATFORM)"
       - name: Prove native Windows V2 source launch, MCP readiness and physical stop
         if: runner.os == 'Windows'
         timeout-minutes: 8
@@ -628,6 +644,8 @@ jobs:
             native-v2-cli-${{ matrix.platform }}.json
             native-v2-models-${{ matrix.platform }}.json
             native-v2-models-${{ matrix.platform }}.stderr
+            native-v2-models-default-${{ matrix.platform }}.json
+            native-v2-models-default-${{ matrix.platform }}.stderr
             native-v2-execution-${{ matrix.platform }}.json
           if-no-files-found: warn
           retention-days: 7
