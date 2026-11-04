@@ -4,6 +4,7 @@ import { copyFile, lstat, mkdir, readdir, readFile, realpath, rm, stat, writeFil
 import path from 'node:path'
 import { openCodeBunVersion } from '../../src/constants/openCodeBunVersion.js'
 import { openCodeV2ReleaseContract } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
+import { releaseOpenCodeV2Contract } from './release-delivery.js'
 import { canonicalOpenCodeV2DeliveryManifest, isOpenCodeV2DeliveryPath, OPENCODE_V2_DELIVERY_LIMITS as limits,
   OPENCODE_V2_DELIVERY_MANIFEST_FILE as manifestName, validateOpenCodeV2DeliveryDescriptor,
   type OpenCodeV2DeliveryDescriptor, type OpenCodeV2DeliveryFile, type OpenCodeV2DeliveryManifest } from '../../src/services/opencode/host/OpenCodeV2DeliveryContract.js'
@@ -126,7 +127,7 @@ export async function stageOpenCodeV2ReleaseFiles(platformKey: string, root: str
   const metadata = path.join(root, 'release/metadata', platformKey)
   const version = (await readFile(path.join(root, 'release/runtime/VERSION'), 'utf8')).trim()
   const commit = (await readFile(path.join(root, 'release/runtime/COMMIT_SHA'), 'utf8')).trim()
-  const expected = openCodeV2ReleaseContract().qualified[platformKey as keyof ReturnType<typeof openCodeV2ReleaseContract>['qualified']]
+  const expected = releaseOpenCodeV2Contract().qualified[platformKey as keyof ReturnType<typeof openCodeV2ReleaseContract>['qualified']]
   if (!expected || !/^[a-f0-9]{40}$/.test(commit)) throw new Error('Invalid runtime release source identity')
   await mkdir(metadata, { recursive: true })
   await writeFile(path.join(metadata, 'COMMIT_SHA'), commit + '\n')
