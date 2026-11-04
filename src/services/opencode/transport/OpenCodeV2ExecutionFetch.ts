@@ -102,12 +102,15 @@ export class OpenCodeV2ExecutionFetch {
     let invoked = false
     let responseStatus: number | undefined
     let reader: ReturnType<typeof executionResponseReader> = undefined
+    let requestSignal: AbortSignal | undefined
+    let requestTimedOut = false
     const controller = new AbortController()
     let timer: ReturnType<typeof setTimeout> | undefined
     this.controllers.add(controller)
     try {
       this.check()
       let request = new Request(input, init)
+      requestSignal = request.signal
       const url = new URL(request.url)
       executionAssert(url.origin === this.endpoint && !url.username && !url.password && !url.hash, 'authority_mismatch')
       const session = /^\/api\/session\/[^/]+$/.test(url.pathname)
@@ -191,7 +194,11 @@ export class OpenCodeV2ExecutionFetch {
       if (activation) executionAssert(!request.body, 'capabilities_pending')
       this.check(); request.signal.throwIfAborted()
       const signal = AbortSignal.any([controller.signal, request.signal, ...(this.context.signal ? [this.context.signal] : [])])
-      timer = setTimeout(() => controller.abort(), Math.min(30_000, this.context.deadline - Date.now()))
+      // Location initializes the native project scope during startup. This
+      // idempotent read shares the finite owner budget, not a second 30s ceiling.
+      const remaining = this.context.deadline - Date.now()
+      const budget = request.method === 'GET' && url.pathname === '/api/location' ? remaining : Math.min(30_000, remaining)
+      timer = setTimeout(() => { requestTimedOut = true; controller.abort() }, budget)
       const headers = new Headers(request.headers)
       headers.set('authorization', 'Basic ' + Buffer.from(`opencode:${this.password}`).toString('base64'))
       invoked = true
@@ -248,9 +255,12 @@ export class OpenCodeV2ExecutionFetch {
       else { checkOpenCodeReadJson(text); JSON.parse(text) }
       return new Response(text, { status: response.status, headers: response.headers })
     } catch (error) {
+      // Observe our signals before cleanup aborts the controller. Never inspect
+      // an arbitrary exception's message/cause to infer cancellation provenance.
+      const code = this.closed ? 'disposed' : requestTimedOut || this.context.signal?.aborted || requestSignal?.aborted
+        ? 'deadline' : error instanceof ExecutionTransportFailure ? error.code : 'transport_failure'
       controller.abort()
       if (reader) await this.bound(this.track(reader.cancel()), new AbortController().signal, 1000).catch(() => undefined)
-      const code = error instanceof ExecutionTransportFailure ? error.code : 'transport_failure'
       const failure = new ExecutionTransportFailure(code, invoked ? 'unknown' : 'not_submitted')
       if (code === 'http_failure' && Number.isSafeInteger(responseStatus) && Number(responseStatus) >= 100 && Number(responseStatus) <= 599)
         wireFailures.set(failure, Object.freeze({ code, status: Number(responseStatus) }))
