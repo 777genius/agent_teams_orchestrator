@@ -49,7 +49,8 @@ export function aggregate(needs: Record<string, Need>): string {
   // Even in that case a fresh main smoke must succeed; missing or failed jobs never count as skips.
   if (scope.outputs?.reuse === 'true') {
     if (needs['post-merge-smoke']?.result !== 'success') throw new Error('post-merge-smoke: missing or failed')
-    for (const job of ['cursor-managed-plugin', 'task-change-ledger', 'opencode-authority',
+    if (needs['task-change-ledger']?.result !== 'success') throw new Error('task-change-ledger: missing or failed')
+    for (const job of ['cursor-managed-plugin', 'opencode-authority',
       'windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery', 'opencode-native-custody',
       'opencode-v2-linux', 'opencode-v2-desktop-lifecycle']) {
       if (needs[job]?.result !== 'skipped') throw new Error(`${job}: ${needs[job]?.result ?? 'missing'}`)

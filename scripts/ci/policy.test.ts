@@ -24,11 +24,12 @@ test('post-merge reuse keeps the required check and cannot leak into unqualified
     return text.split(/\n  [a-z][a-z-]*:\n/, 2)[0]
   }
   assert.match(job('scope'), /reuse: \$\{\{ steps\.reuse\.outputs\.reuse \}\}/)
-  for (const name of ['cursor-managed-plugin', 'task-change-ledger', 'windows-packaged-backfill',
+  for (const name of ['cursor-managed-plugin', 'windows-packaged-backfill',
     'opencode-authority', 'opencode-conformance', 'packaged-delivery', 'opencode-v2-linux',
     'opencode-v2-desktop-lifecycle', 'opencode-native-custody']) {
     assert.match(job(name), /needs\.scope\.outputs\.reuse != 'true'/, name)
   }
+  assert.match(job('task-change-ledger'), /needs\.scope\.outputs\.reuse == 'true'/)
   assert.match(job('post-merge-smoke'), /needs\.scope\.outputs\.reuse == 'true'/)
   assert.match(job('required'), /needs: \[scope, post-merge-smoke,/)
 })
@@ -202,10 +203,10 @@ test('aggregate independently rejects required failures/cancellation/skips and c
   assert.throws(() => aggregate({}))
 })
 
-test('same-tree reuse still requires a fresh smoke and skips every original heavy job', () => {
+test('same-tree reuse requires fresh smoke and the push-only Windows ledger', () => {
   const input = needs('true')
   const reused: Record<string, { result: string; outputs?: Record<string, string> }> = {}
-  for (const [name] of Object.entries(input)) reused[name] = { result: name === 'scope' ? 'success' : 'skipped' }
+  for (const [name] of Object.entries(input)) reused[name] = { result: name === 'scope' || name === 'task-change-ledger' ? 'success' : 'skipped' }
   reused.scope = { result: 'success', outputs: { native: 'true', v2_linux: 'true', reason: 'TEST decision', reuse: 'true' } }
   reused['post-merge-smoke'] = { result: 'success' }
   assert.equal(aggregate(reused), 'TEST decision')
