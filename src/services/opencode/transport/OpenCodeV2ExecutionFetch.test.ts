@@ -202,3 +202,61 @@ for (const pin of ['2.0.0', '2.0.32'] as const) test(`${pin} selected config rea
     expect(invoked).toBe(1)
   } finally { await wire.dispose() }
 })
+
+// Advance only the wire's timers; no real wait or native/provider operation.
+test('location startup read shares owner budget; cancellation and other request caps retain uncertainty', async () => {
+  const realNow = Date.now, realSetTimeout = globalThis.setTimeout, realClearTimeout = globalThis.clearTimeout
+  let now = 1000, nextTimer = 0
+  const timers = new Map<number, { at: number; run: () => void }>()
+  Date.now = () => now
+  globalThis.setTimeout = ((run: () => void, ms: number) => {
+    const id = ++nextTimer; timers.set(id, { at: now + ms, run }); return id
+  }) as unknown as typeof setTimeout
+  globalThis.clearTimeout = ((id: number) => { timers.delete(Number(id)) }) as typeof clearTimeout
+  const advance = async (ms: number) => {
+    now += ms
+    for (const [id, timer] of [...timers]) if (timer.at <= now) { timers.delete(id); timer.run() }
+    for (let step = 0; step < 10; step++) await Promise.resolve()
+  }
+  const base = 'http://127.0.0.1:1', location = `${base}/api/location?location%5Bdirectory%5D=%2FTEST`
+  const wires: OpenCodeV2ExecutionFetch[] = []
+  try {
+    for (const scenario of ['late-location', 'owner-deadline', 'context-abort', 'request-abort', 'dispose', 'other-read', 'prompt', 'transport'] as const) {
+      let calls = 0, complete: (response: Response) => void = () => undefined
+      const context = new AbortController(), request = new AbortController()
+      const wire = new OpenCodeV2ExecutionFetch(base, '2.0.32', '/TEST', 'TEST',
+        { deadline: now + 90_000, signal: context.signal }, async (_input, init) => {
+          calls++
+          if (scenario === 'transport') throw new Error('private socket failure')
+          return await new Promise<Response>((resolve, reject) => {
+            complete = resolve
+            init?.signal?.addEventListener('abort', () => reject(new Error('private abort')), { once: true })
+          })
+        })
+      wires.push(wire)
+      const url = scenario === 'other-read' ? `${base}/api/info` : scenario === 'prompt' ? `${base}/api/session/ses_original/prompt` : location
+      const work = wire.fetch(url, { signal: request.signal, ...(scenario === 'prompt' ? {
+        method: 'POST', body: JSON.stringify({ id: 'msg_original', text: 'one input', delivery: 'queue', resume: false }),
+      } : {}) }).then(response => response, (error: unknown) => error)
+      for (let step = 0; step < 10; step++) await Promise.resolve()
+      if (scenario === 'late-location') {
+        await advance(31_000)
+        complete(Response.json({ directory: '/TEST' }))
+        expect(await work).toBeInstanceOf(Response)
+      } else {
+        if (scenario === 'context-abort') context.abort()
+        else if (scenario === 'request-abort') request.abort()
+        else if (scenario === 'dispose') await wire.dispose()
+        else if (scenario !== 'transport') await advance(scenario === 'owner-deadline' ? 90_000 : 30_000)
+        const failure = await work
+        expect(failure).toMatchObject({ code: scenario === 'transport' ? 'transport_failure' : scenario === 'dispose' ? 'disposed' : 'deadline', disposition: 'unknown' })
+        expect(executionWasNotSubmitted(failure)).toBe(false)
+      }
+      expect(calls).toBe(1) // No replay, including uncertain POST cancellation.
+      await wire.dispose()
+    }
+  } finally {
+    await Promise.allSettled(wires.map(wire => wire.dispose()))
+    Date.now = realNow; globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout
+  }
+})
