@@ -199,6 +199,13 @@ for (const version of ['2.1.4'] as const) test(`${version} absent selected auth 
   authContent = '{}\n'
   await expect(createOpenCodeV2PreparedMember(selection, native(), parent, member)).rejects.toThrow('run_selected_auth_changed')
 })
+for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} refuses unqualified launch selection before receipt creation`, async () => {
+  pin = version
+  await expect(inspectOpenCodeV2SourceAvailability(envelope())).rejects.toThrow('opencode_v2_version_unqualified')
+  expect(nativeSelectionCalls).toBe(1)
+  expect(nativeReceiptCalls).toBe(0)
+  expect(receiptControllers).toEqual([])
+})
 test('local controller entries bind canonical real files while flags pass through unchanged', async () => {
   const packageRoot = path.join(root, 'pkg'); await mkdir(packageRoot)
   const realEntry = path.join(packageRoot, 'entry.mjs'); await writeFile(realEntry, 'export {}\n')
