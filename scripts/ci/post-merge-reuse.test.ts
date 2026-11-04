@@ -6,17 +6,19 @@ const merge = 'a'.repeat(40), head = 'b'.repeat(40), tree = 'c'.repeat(40)
 const repository = '777genius/agent_teams_orchestrator'
 const context = { event: 'push', ref: 'refs/heads/main', repository, sha: merge }
 const pr = { number: 7, merged_at: '2026-11-04T20:00:00Z', merge_commit_sha: merge,
-  base: { ref: 'main' }, head: { sha: head } }
+  base: { ref: 'main' }, head: { sha: head, ref: 'feat/verified', repo: { full_name: repository } } }
 const check = { id: 456, name: 'CI required', head_sha: head, status: 'completed', conclusion: 'success',
   completed_at: '2026-11-04T19:59:00Z',
   app: { slug: 'github-actions' },
   details_url: `https://github.com/${repository}/actions/runs/123/job/456` }
 const run = { event: 'pull_request', status: 'completed', conclusion: 'success', name: 'CI',
   path: '.github/workflows/ci.yml', head_sha: head, updated_at: '2026-11-04T19:59:00Z',
-  pull_requests: [{ number: pr.number }] }
+  head_branch: pr.head.ref, head_repository: { full_name: repository },
+  pull_requests: [] }
 function evidence(overrides: Record<string, unknown> = {}) {
   const table: Record<string, unknown> = {
     [`repos/${repository}/commits/${merge}/pulls?per_page=2`]: [pr],
+    [`repos/${repository}/commits/${head}/pulls?per_page=2`]: [pr],
     [`repos/${repository}/git/commits/${merge}`]: { tree: { sha: tree } },
     [`repos/${repository}/git/commits/${head}`]: { tree: { sha: tree } },
     [`repos/${repository}/commits/${head}/check-runs?check_name=CI%20required&per_page=100`]: { check_runs: [check] },
@@ -35,7 +37,12 @@ test('only an identical merged PR tree and completed PR CI required permits reus
 test('a direct push, dev push, invalid SHA or different repository must do full CI without API reads', async () => {
   for (const changed of [{ event: 'pull_request' }, { ref: 'refs/heads/dev' }, { sha: 'bad' },
     { repository: 'another/repo' }]) {
-    assert.equal(await provePostMergeReuse({ ...context, ...changed }, async () => { throw Error('Must not read') }), false)
+    let calls = 0
+    assert.equal(await provePostMergeReuse({ ...context, ...changed }, async () => {
+      calls++
+      throw Error('Must not read')
+    }), false)
+    assert.equal(calls, 0)
   }
 })
 test('missing, ambiguous, unmerged or unrelated PR never grants reuse', async () => {
@@ -74,11 +81,28 @@ test('a newer failed or queued gate cannot be bypassed using stale successful ch
   }
 })
 
-test('a successful run from another PR or ambiguous/missing PR association cannot grant reuse', async () => {
+test('a completed GitHub PR run with an empty pull_requests list still uses unambiguous head provenance', async () => {
+  assert.equal(await provePostMergeReuse(context, evidence()), true)
   const url = `repos/${repository}/actions/runs/123`
-  for (const pulls of [[], [{ number: pr.number + 1 }],
-    [{ number: pr.number }, { number: pr.number + 1 }], null]) {
-    assert.equal(await provePostMergeReuse(context, evidence({ [url]: { ...run, pull_requests: pulls } })), false)
+  for (const changed of [
+    { pull_requests: [{ number: pr.number + 1 }] },
+    { pull_requests: [{ number: pr.number }, { number: pr.number + 1 }] },
+    { pull_requests: null },
+    { head_branch: 'another-branch' },
+    { head_repository: { full_name: 'another/repository' } },
+  ]) {
+    assert.equal(await provePostMergeReuse(context, evidence({ [url]: { ...run, ...changed } })), false)
+  }
+})
+
+test('another, missing or ambiguous PR at the exact head must always force full CI', async () => {
+  const url = `repos/${repository}/commits/${head}/pulls?per_page=2`
+  for (const pulls of [
+    [], [pr, pr], [{ ...pr, number: pr.number + 1 }],
+    [{ ...pr, head: { ...pr.head, ref: 'another-branch' } }],
+    [{ ...pr, head: { ...pr.head, repo: { full_name: 'another/repository' } } }],
+  ]) {
+    assert.equal(await provePostMergeReuse(context, evidence({ [url]: pulls })), false)
   }
 })
 

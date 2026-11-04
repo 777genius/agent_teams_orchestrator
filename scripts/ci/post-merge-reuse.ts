@@ -17,8 +17,23 @@ export async function provePostMergeReuse(context: Context, read: Read): Promise
     if (!Array.isArray(associated) || associated.length !== 1) return false
     const pr = object(associated[0]), source = fields(pr, 'head')
     const head = fields(source, 'sha')
+    const headBranch = fields(source, 'ref')
+    const headRepository = fields(fields(source, 'repo'), 'full_name')
     if (!hexSha(head) || pr.merge_commit_sha !== context.sha ||
-      typeof pr.merged_at !== 'string' || fields(pr.base, 'ref') !== 'main') return false
+      typeof pr.merged_at !== 'string' || fields(pr.base, 'ref') !== 'main' ||
+      typeof headBranch !== 'string' || !headBranch ||
+      typeof headRepository !== 'string' || !headRepository) return false
+    // GitHub omits workflow_run.pull_requests after some real merges. Resolve
+    // the exact head's own PR association independently instead of trusting
+    // an empty list or borrowing a successful run from a different PR.
+    const headAssociated = await read(`${root}/commits/${head}/pulls?per_page=2`)
+    if (!Array.isArray(headAssociated) || headAssociated.length !== 1 ||
+      fields(headAssociated[0], 'number') !== pr.number ||
+      fields(fields(headAssociated[0], 'head'), 'sha') !== head ||
+      fields(fields(headAssociated[0], 'head'), 'ref') !== headBranch ||
+      fields(fields(fields(headAssociated[0], 'head'), 'repo'), 'full_name') !== headRepository ||
+      fields(fields(headAssociated[0], 'base'), 'ref') !== 'main' ||
+      fields(headAssociated[0], 'merge_commit_sha') !== context.sha) return false
     const [merged, original] = await Promise.all([
       read(`${root}/git/commits/${context.sha}`), read(`${root}/git/commits/${head}`),
     ])
@@ -44,7 +59,9 @@ export async function provePostMergeReuse(context: Context, read: Read): Promise
     // Only the run linked to the PR that actually merged is reusable.
     const runPulls = fields(run, 'pull_requests')
     const samePr = Number.isSafeInteger(pr.number) && Array.isArray(runPulls) &&
-      runPulls.length === 1 && fields(runPulls[0], 'number') === pr.number
+      (runPulls.length === 0 || (runPulls.length === 1 && fields(runPulls[0], 'number') === pr.number)) &&
+      run.head_branch === headBranch &&
+      fields(run.head_repository, 'full_name') === headRepository
     return samePr && run.event === 'pull_request' && run.status === 'completed' && run.conclusion === 'success' &&
       run.name === 'CI' && run.path === '.github/workflows/ci.yml' && run.head_sha === head &&
       finishedBeforeMerge(run.updated_at)
