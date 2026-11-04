@@ -333,6 +333,13 @@ test('V2 model-list failure preserves models phase when lease retirement succeed
       requireExecutionEndpoint: () => ({ baseUrl: 'http://127.0.0.1:1', password: 'TEST-only', signal: new AbortController().signal }),
       registerExecutionDisposer: () => () => { unregistered++ },
     }))
+    const w = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/transport/OpenCodeV2ProviderWire.ts'))}
+    const providerWire = await import(w)
+    let disposed = 0
+    mock.module(w, () => ({ ...providerWire, OpenCodeV2ProviderWire: class {
+      fetch = async () => { throw Error('TEST-unexpected-provider-fetch') }
+      async dispose() { disposed++ }
+    } }))
     const m = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/transport/OpenCodeV2ClientModule.ts'))}
     const client = await import(m)
     mock.module(m, () => ({ ...client, resolveOpenCodeV2ClientEntry: async () => 'TEST-entry',
@@ -352,6 +359,7 @@ test('V2 model-list failure preserves models phase when lease retirement succeed
       assert.match(result.error.message, /stage: models, category: provider_operation_unknown/)
       assert(!JSON.stringify(result).includes(secret))
       assert.equal(retired, 1)
+      assert.equal(disposed, 1)
       assert.equal(unregistered, 1)
       const directory = path.join(root, 'opencode/v2/provider-diagnostics')
       const names = await readdir(directory)
