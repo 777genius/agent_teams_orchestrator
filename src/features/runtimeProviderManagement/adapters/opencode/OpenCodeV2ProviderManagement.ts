@@ -455,7 +455,9 @@ export async function testOpenCodeV2ProviderModel(input: TestProviderModelInput)
 
 /** Exact enum stages and closed failure codes only; never copy SDK text or credential material. */
 export function openCodeV2CatalogFailureMessage(phase: OpenCodeV2CatalogReadPhase, error: unknown): string {
-  const category = classifyOpenCodeV2RunOwnerFailure(error).category
+  let category: string = 'provider_operation_unknown'
+  try { category = classifyOpenCodeV2RunOwnerFailure(error).category }
+  catch { /* Untrusted SDK error causes cannot replace the catalog refusal. */ }
   return `V2 native provider catalog is unavailable (stage: ${phase}, category: ${category}); no legacy CLI catalog command was invoked.`
 }
 
