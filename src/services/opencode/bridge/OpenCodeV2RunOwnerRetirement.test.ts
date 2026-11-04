@@ -13,7 +13,7 @@ import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 const peer = fileURLToPath(new URL('./fixtures/OpenCodeV2RunControlPeer.ts', import.meta.url))
 const providerEndpoint = fileURLToPath(new URL('./fixtures/OpenCodeV2ProviderEndpointPreload.ts', import.meta.url))
 const binding = { teamId: 'TEST-team', runId: 'TEST-run', controllerInstanceId: 'controller', ownerId: 'owner' }
-const target = { memberId: 'worker', originalSessionId: 'ses_TESToriginal', selectedModel: 'TEST/TEST', pin: '2.0.32' as const }
+const target = { memberId: 'worker', originalSessionId: 'ses_TESToriginal', selectedModel: 'TEST/TEST', pin: '2.1.4' as const }
 const posix = process.platform !== 'win32'
 
 function ready(child: ChildProcess): Promise<void> {
