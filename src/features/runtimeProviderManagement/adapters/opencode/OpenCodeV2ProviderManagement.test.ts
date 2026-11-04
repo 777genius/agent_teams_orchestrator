@@ -2,11 +2,26 @@ import { mkdir, mkdtemp, realpath, readdir, readFile, rm, stat, writeFile } from
 import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { test, expect } from 'bun:test'
-import { openCodeV2ModelTestMessage, openCodeV2ConnectProofFailureCode, openCodeV2ConnectFailureMessage, buildOpenCodeV2RuntimeProviderModel, openCodeV2ConnectionIDs, assertOpenCodeV2NativeV1AuthUnoccupied, assertOpenCodeV2SharedAuthMirrorSafe, requireOpenCodeV2OwnedConnection, rollbackOpenCodeV2OwnedConnection, retireOpenCodeV2CatalogOwner, recordOpenCodeV2ProviderFailure } from './OpenCodeV2ProviderManagement.js'
+import { openCodeV2ModelTestMessage, openCodeV2ConnectProofFailureCode, openCodeV2ConnectFailureMessage, buildOpenCodeV2RuntimeProviderModel, openCodeV2ConnectionIDs, assertOpenCodeV2NativeV1AuthUnoccupied, assertOpenCodeV2SharedAuthMirrorSafe, requireOpenCodeV2OwnedConnection, rollbackOpenCodeV2OwnedConnection, retireOpenCodeV2CatalogOwner, recordOpenCodeV2ProviderFailure, openCodeV2CatalogFailureMessage } from './OpenCodeV2ProviderManagement.js'
 import { readOpenCodeV2ConnectIntent, removeOpenCodeV2ConnectIntentIfUnchanged, writeOpenCodeV2ConnectIntent } from './OpenCodeV2ProviderConnectIntent.js'
 import type { OpenCodeAuthCredential } from '../../../../services/opencode/OpenCodeAuthStore.js'
 const empty = { id: 'groq', methods: [{ type: 'key' }], connections: [] }
 const connection = { ...empty, connections: [{ type: 'credential', id: 'cred_original', label: 'Groq' }] }
+test('V2 catalog failure messages contain only fixed phases and closed categories', () => {
+  const secret = 'TEST-SECRET-do-not-report'
+  const known = openCodeV2CatalogFailureMessage('models', new Error('provider_catalog_location_changed'))
+  expect(known).toContain('stage: models, category: provider_catalog_location_changed')
+  expect(known).toContain('no legacy CLI catalog command was invoked')
+  const unknown = openCodeV2CatalogFailureMessage('profile', new Error(`private ${secret}`))
+  expect(unknown).toContain('stage: profile, category: provider_operation_unknown')
+  expect(unknown).not.toContain(secret)
+  const cleanup = openCodeV2CatalogFailureMessage('retirement', new Error('provider_physical_cleanup_unknown', {
+    cause: new Error(secret),
+  }))
+  expect(cleanup).toContain('stage: retirement, category: provider_physical_cleanup_unknown')
+  expect(cleanup).not.toContain(secret)
+})
+
 test('V2 API-key admission preserves V1 OAuth and differing API credentials in the shared mirror', () => {
   const next = { type: 'api' as const, key: 'TEST-new' }
   expect(() => assertOpenCodeV2SharedAuthMirrorSafe(null, next)).not.toThrow()
