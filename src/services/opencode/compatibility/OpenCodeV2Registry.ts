@@ -159,6 +159,14 @@ export function openCodeV2EngineVersion(identity: { version: OpenCodeV2Pin; engi
 export function openCodeV2QualifiedVersions(): readonly OpenCodeV2Pin[] {
   return [...qualifications.keys()].sort(byVersion)
 }
+/** Versions once qualified for teams remain readable through the authenticated
+ * original owner, even after their launch qualification is retired. Never use
+ * this read-only check for new launch, send, or engine selection. */
+const RETIRED_READABLE_V2_ENGINES = new Set<OpenCodeV2Pin>(['2.0.0', '2.0.32'])
+export function isOpenCodeV2ReadableEngine(version: unknown): version is OpenCodeV2Pin {
+  return isOpenCodeV2Pin(version) && (qualifications.has(version) || RETIRED_READABLE_V2_ENGINES.has(version))
+}
+
 export function openCodeV2CurrentPlatform(): string {
   return `${process.platform}-${process.arch}`
 }

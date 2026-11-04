@@ -17,7 +17,7 @@ import { createOpenCodeV2LaunchPlan, inspectOpenCodeV2SourceAvailability, remove
 import { createBridgeServerIdentity } from '../OpenCodeBridgeCommandHandler.js'
 import { SUPPORTED_COMMANDS } from './OpenCodeBridgeProtocol.js'
 import { createHash } from 'node:crypto'
-import { openCodeV2LaunchRefusal } from '../compatibility/OpenCodeV2Registry.js'
+import { isOpenCodeV2ReadableEngine, openCodeV2LaunchRefusal } from '../compatibility/OpenCodeV2Registry.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import { assertIntentIdentity, executionAssert, executionHash } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
@@ -543,7 +543,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         if (envelope.command === 'opencode.getRuntimeTranscript') {
           const qualification = originalStatus?.qualification
           executionAssert(
-            openCodeV2LaunchRefusal(member.pin) === null && (qualification?.engineVersion === undefined ? qualification?.version : qualification.engineVersion) === member.pin,
+            isOpenCodeV2ReadableEngine(member.pin) && (qualification?.engineVersion === undefined ? qualification?.version : qualification.engineVersion) === member.pin,
             'v2_transcript_version_unsupported')
           const window = body.messageLimit
           executionAssert(window === undefined || (typeof window === 'number' && Number.isSafeInteger(window) && window > 0),

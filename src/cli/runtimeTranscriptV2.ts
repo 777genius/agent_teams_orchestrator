@@ -3,7 +3,7 @@ import path from 'node:path'
 import { executeExistingOpenCodeV2TranscriptEnvelope } from '../services/opencode/bridge/OpenCodeV2TeamBridge.js'
 import type { OpenCodeV2CanonicalTranscript } from '../services/opencode/bridge/OpenCodeV2TranscriptProjection.js'
 import { executionAssert, executionRecord } from '../services/opencode/execution/OpenCodeV2ExecutionContracts.js'
-import { openCodeV2LaunchRefusal } from '../services/opencode/compatibility/OpenCodeV2Registry.js'
+import { isOpenCodeV2ReadableEngine } from '../services/opencode/compatibility/OpenCodeV2Registry.js'
 import type { OpenCodeLogProjection, OpenCodeSessionRecord, OpenCodeSessionReconcileSummary } from '../services/opencode/types.js'
 
 export type RuntimeTranscriptSelection = Readonly<{
@@ -22,8 +22,8 @@ type Ports = Readonly<{
 const exactText = (value: unknown): value is string => typeof value === 'string' && value.length > 0 &&
   value.trim() === value && !value.includes('\0')
 const v2Version = (value: unknown): boolean => typeof value === 'string' && /^2(?:\.|$)/.test(value.trim())
-// A transcript belongs to a run that admission already qualified; the same rule applies here.
-const supported = (value: unknown): boolean => openCodeV2LaunchRefusal(value) === null
+// Read-only compatibility is independent of current launch admission; ownership is still checked below.
+const supported = isOpenCodeV2ReadableEngine
 
 /** The V2 owner stores its own run state, never a legacy session-store record.
  * An explicit original binding can select it; a positive legacy record stays V1. */

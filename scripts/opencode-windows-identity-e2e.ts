@@ -119,7 +119,10 @@ async function models(label: string, runtime: string, selection: string) {
 }
 
 function startContention(): ChildProcess[] {
-  return Array.from({ length: os.availableParallelism() * 2 }, () =>
+  // One busy worker per effective CPU still saturates the runner. The former
+  // 2x oversubscription starved the identity harness itself: a Windows 2025
+  // run ended at its 240s watchdog before the next baseline outcome was saved.
+  return Array.from({ length: os.availableParallelism() }, () =>
     spawn(process.execPath, ['-e', 'for(;;){}'], { stdio: 'ignore', windowsHide: true }))
 }
 

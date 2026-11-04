@@ -6,11 +6,29 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { privateOpenCodeReadEnvironment } from '../profile/OpenCodeV2ManagedConfig.js'
 import { boundOpenCodeRead } from './OpenCodeBoundedFetch.js'
+import { openCodeV2LaunchRefusal, openCodeV2Wire } from '../compatibility/OpenCodeV2Registry.js'
 import { OpenCodeV2ExecutionFetch, ExecutionTransportFailure, executionWasNotSubmitted, executionSessionIsMissing } from './OpenCodeV2ExecutionFetch.js'
+
+// Retired wire dialects remain identifiable for historical reads, but no new transport can acquire them.
+test('historical V2 wire identification does not re-admit retired engines', () => {
+  expect(openCodeV2Wire('2.0.0')).toBe('floor')
+  expect(openCodeV2Wire('2.0.32')).toBe('current')
+  for (const pin of ['2.0.0', '2.0.32'] as const) {
+    let failure: unknown
+    try { new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', pin, '/TEST', 'TEST', { deadline: Date.now() + 1000 }) }
+    catch (error) { failure = error }
+    expect(failure).toBeInstanceOf(ExecutionTransportFailure)
+    expect(failure).toMatchObject({ code: 'unqualified_version', disposition: 'not_submitted' })
+  }
+})
+
+// No version is launch-qualified on some platforms. Historical refusal stays tested,
+// while real transport behavior runs only with an admitted engine.
+const qualifiedTest = openCodeV2LaunchRefusal('2.1.4') === null ? test : test.skip
 
 // These fail if loss triggers a replay, deadlines stop at headers, cleanup does
 // not cancel real response bodies, or a truncated SSE/foreign location is used.
-test('response loss retains one admission, original readback and actual socket cancellation', async () => {
+qualifiedTest('response loss retains one admission, original readback and actual socket cancellation', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-execution-node-peer-'))
   await Promise.all(['home', 'tmp', 'config', 'data', 'cache', 'state', 'appdata', 'localappdata'].map(name => mkdir(path.join(root, name))))
   const fixture = fileURLToPath(new URL('./OpenCodeV2ExecutionPeer.ts', import.meta.url))
@@ -35,12 +53,12 @@ test('response loss retains one admission, original readback and actual socket c
   try {
     const port = await boundOpenCodeRead(Promise.race([ready, exited.then(() => { throw new Error('peer exited') })]), 5000)
     const base = `http://127.0.0.1:${port}`
-    const make = (pin: '2.0.0' | '2.0.32' = '2.0.32', ms = 2000, signal?: AbortSignal) => {
-      const wire = new OpenCodeV2ExecutionFetch(base, pin, '/TEST', 'TEST-private', { deadline: Date.now() + ms, signal })
+    const make = (ms = 2000, signal?: AbortSignal) => {
+      const wire = new OpenCodeV2ExecutionFetch(base, '2.1.4', '/TEST', 'TEST-private', { deadline: Date.now() + ms, signal })
       wires.push(wire); return wire
     }
     const aborted = new AbortController(); aborted.abort()
-    const pre = make('2.0.32', 2000, aborted.signal)
+    const pre = make(2000, aborted.signal)
     const absent = await pre.fetch(`${base}/api/session/ses_original/prompt`, { method: 'POST', body: '{}' }).catch(error => error)
     expect(executionWasNotSubmitted(absent)).toBe(true)
     const sdkWrapped = Object.assign(new Error('Transport', { cause: absent }), { name: 'ClientError', reason: 'Transport' })
@@ -67,7 +85,7 @@ test('response loss retains one admission, original readback and actual socket c
       expect(executionWasNotSubmitted(failure)).toBe(false)
     }
 
-    const stalled = make('2.0.32', 150)
+    const stalled = make(150)
     await expect(stalled.fetch(`${base}/api/info`)).rejects.toBeInstanceOf(ExecutionTransportFailure)
     await stalled.dispose()
     await boundOpenCodeRead(bodyClosed, 2000) // Independently observed socket close, before teardown.
@@ -76,9 +94,9 @@ test('response loss retains one admission, original readback and actual socket c
     await expect(make().fetch(`${base}/api/experimental/session/ses_original/log?follow=false`)).rejects.toMatchObject({ code: 'incomplete_stream' })
     await expect(make().fetch(`${base}/api/location?location%5Bdirectory%5D=%2Fforeign`)).rejects.toMatchObject({ disposition: 'not_submitted' })
     await expect(make().fetch(`${base}/api/session/ses_original`)).rejects.toMatchObject({ code: 'media_type' })
-    const floor = await make('2.0.0').fetch(`${base}/api/plugin/await-activation?location%5Bdirectory%5D=%2FTEST`, { method: 'POST' })
-    expect(floor.status).toBe(204)
-    expect(await floor.text()).toBe('')
+    // No currently qualified engine admits the retired floor-only activation route.
+    const retiredRoute = await make().fetch(`${base}/api/plugin/await-activation?location%5Bdirectory%5D=%2FTEST`, { method: 'POST' }).catch(error => error)
+    expect(retiredRoute).toMatchObject({ code: 'capabilities_pending', disposition: 'not_submitted' })
     // Readback receipt has one input; each error scenario used its own intent.
     expect(mutations).toBe(4)
     passed = true
@@ -97,9 +115,9 @@ test('response loss retains one admission, original readback and actual socket c
   }
 }, 20_000)
 
-test('forbidden mutation and exhausted context prove non-submission without physical requests', async () => {
+qualifiedTest('forbidden mutation and exhausted context prove non-submission without physical requests', async () => {
   let requests = 0
-  const wire = new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', '2.0.32', '/TEST', 'TEST',
+  const wire = new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', '2.1.4', '/TEST', 'TEST',
     { deadline: Date.now() + 1000 }, async () => { requests++; return Response.json({}) })
   try {
     const failure = await wire.fetch('http://127.0.0.1:1/api/session/ses_original/interrupt', { method: 'POST' }).catch(error => error)
@@ -110,14 +128,14 @@ test('forbidden mutation and exhausted context prove non-submission without phys
 
 // A non-byte response must be rejected before byte accounting, while preserving
 // mutation uncertainty and cancelling/releasing the actual body reader.
-test('non-byte mutation response retains uncertainty and cancels its reader', async () => {
+qualifiedTest('non-byte mutation response retains uncertainty and cancels its reader', async () => {
   let requests = 0, cancellations = 0
   let signal: AbortSignal | undefined
   const body = new ReadableStream<string>({
     start(controller) { controller.enqueue('{}') },
     cancel() { cancellations++ },
   })
-  const wire = new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', '2.0.32', '/TEST', 'TEST',
+  const wire = new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', '2.1.4', '/TEST', 'TEST',
     { deadline: Date.now() + 1000 }, async (_input, init) => {
       requests++; signal = init?.signal ?? undefined
       return new Response(body, { headers: { 'content-type': 'application/json' } })
@@ -138,7 +156,7 @@ test('non-byte mutation response retains uncertainty and cancels its reader', as
 
 // Neither a 404 status nor a public error-shaped object proves absence. Only a
 // completely consumed, validated native error for this exact GET can do so.
-for (const pin of ['2.0.0', '2.0.32'] as const) test(`session absence requires complete exact native 404 for ${pin}`, async () => {
+qualifiedTest('session absence requires complete exact native 404 for qualified current wire', async () => {
   const native = { _tag: 'SessionNotFoundError', sessionID: 'ses_original', message: 'private native detail' }
   const json = JSON.stringify(native)
   const cases = [
@@ -156,7 +174,7 @@ for (const pin of ['2.0.0', '2.0.32'] as const) test(`session absence requires c
   ]
   for (const scenario of cases) {
     let calls = 0
-    const wire = new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', pin, '/TEST', 'TEST',
+    const wire = new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', '2.1.4', '/TEST', 'TEST',
       { deadline: Date.now() + 1000 }, async () => {
         calls++
         const body = scenario.broken ? new ReadableStream<Uint8Array>({
@@ -185,9 +203,9 @@ for (const pin of ['2.0.0', '2.0.32'] as const) test(`session absence requires c
   expect(executionSessionIsMissing(new ExecutionTransportFailure('session_missing', 'unknown'), 'ses_original')).toBe(false)
 })
 
-for (const pin of ['2.0.0', '2.0.32'] as const) test(`${pin} selected config readback cannot widen filesystem or mutation authority`, async () => {
+qualifiedTest('qualified current wire config readback cannot widen filesystem or mutation authority', async () => {
   let invoked = 0
-  const wire = new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', pin, '/TEST/project', 'TEST',
+  const wire = new OpenCodeV2ExecutionFetch('http://127.0.0.1:1', '2.1.4', '/TEST/project', 'TEST',
     { deadline: Date.now() + 1000 }, async () => { invoked++; return Response.json([]) })
   try {
     const config = 'http://127.0.0.1:1/api/config?location%5Bdirectory%5D=%2FTEST%2Fproject'
@@ -204,7 +222,7 @@ for (const pin of ['2.0.0', '2.0.32'] as const) test(`${pin} selected config rea
 })
 
 // Advance only the wire's timers; no real wait or native/provider operation.
-test('location startup read shares owner budget; cancellation and other request caps retain uncertainty', async () => {
+qualifiedTest('location startup read shares owner budget; cancellation and other request caps retain uncertainty', async () => {
   const realNow = Date.now, realSetTimeout = globalThis.setTimeout, realClearTimeout = globalThis.clearTimeout
   let now = 1000, nextTimer = 0
   const timers = new Map<number, { at: number; run: () => void }>()
@@ -224,7 +242,7 @@ test('location startup read shares owner budget; cancellation and other request 
     for (const scenario of ['late-location', 'owner-deadline', 'context-abort', 'request-abort', 'dispose', 'other-read', 'prompt', 'transport'] as const) {
       let calls = 0, complete: (response: Response) => void = () => undefined
       const context = new AbortController(), request = new AbortController()
-      const wire = new OpenCodeV2ExecutionFetch(base, '2.0.32', '/TEST', 'TEST',
+      const wire = new OpenCodeV2ExecutionFetch(base, '2.1.4', '/TEST', 'TEST',
         { deadline: now + 90_000, signal: context.signal }, async (_input, init) => {
           calls++
           if (scenario === 'transport') throw new Error('private socket failure')

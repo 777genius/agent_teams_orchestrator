@@ -26,7 +26,7 @@ import { recordOpenCodeV2ProviderFailure } from '../execution/OpenCodeV2Diagnost
 // containment qualification. Same-fields fake close results must stay unknown.
 async function missingSession(sessionID: string): Promise<never> {
   const endpoint = 'http://127.0.0.1:1'
-  const wire = new OpenCodeV2ExecutionFetch(endpoint, '2.0.32', '/TEST-project', 'TEST-only',
+  const wire = new OpenCodeV2ExecutionFetch(endpoint, '2.1.4', '/TEST-project', 'TEST-only',
     { deadline: Date.now() + 5000 }, async () => new Response(JSON.stringify({
       _tag: 'SessionNotFoundError', sessionID, message: 'synthetic missing',
     }), { status: 404, headers: { 'content-type': 'application/json' } }))
@@ -50,8 +50,8 @@ async function fixture(options: { groupTools?: boolean; unknown?: boolean; forei
   initializationCall?: (operation: 'log' | 'messages' | 'putInstruction' | 'instructions' | 'connectMcp' | 'mcp') => Promise<void>;
   permissions?: import('../host/OpenCodeV2ExecutionBinding.js').ExecutionSelection['permissions'] } = {}) {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-r249-owner-')))
-  const authority: ExecutionAuthority = { generation: 'v2', pin: '2.0.32', dialect: 'v2-2.0.32',
-    graphSha256: 'a'.repeat(64), selectedCli: { path: '/TEST-opencode', sha256: 'b'.repeat(64), version: '2.0.32' },
+  const authority: ExecutionAuthority = { generation: 'v2', pin: '2.1.4', dialect: 'v2-2.1.4',
+    graphSha256: 'a'.repeat(64), selectedCli: { path: '/TEST-opencode', sha256: 'b'.repeat(64), version: '2.1.4' },
     child: { pid: 42, birth: { format: 'linux-start-ticks', value: '42', bootId: 'TEST' }, executablePath: '/TEST-bun', sha256: 'c'.repeat(64) },
     hostInstanceId: 'TEST-host', profileEpoch: 'TEST-epoch', profileRoot: options.probe ? root : '/TEST-profile', directory: options.probe ? path.join(root, 'project') : '/TEST-project', leaseOwnerId: 'TEST-owner' }
   if (options.probe) {
@@ -65,7 +65,7 @@ async function fixture(options: { groupTools?: boolean; unknown?: boolean; forei
     source: { entryPath: '/TEST-entry.ts', entrySha256: 'd'.repeat(64), bunPath: '/TEST-bun', bunSha256: 'c'.repeat(64),
       files: [{ path: '/TEST-entry.ts', sha256: 'd'.repeat(64) }], env: {} },
     members: [{ memberId: 'worker', laneId: 'primary', originalSessionId: 'ses_TESToriginal',
-      native: { generation: 'v2', version: '2.0.32', dialect: 'v2-2.0.32', executablePath: '/TEST-opencode',
+      native: { generation: 'v2', version: '2.1.4', dialect: 'v2-2.1.4', executablePath: '/TEST-opencode',
         executableSha256: 'b'.repeat(64), packageName: '@opencode/cli-linux-x64', runtimeMode: 'source', entrySha256: 'e'.repeat(64),
         bun: { path: '/TEST-bun', sha256: 'c'.repeat(64) }, graph: { sha256: 'a'.repeat(64), files: [] } },
       profile: { epoch: 'TEST-epoch', root: '/TEST-profile', directory: '/TEST-project', databasePath: '/TEST-profile/data/db',
@@ -76,7 +76,7 @@ async function fixture(options: { groupTools?: boolean; unknown?: boolean; forei
   }
   if (options.groupTools !== undefined) plan = { ...plan, qualification: {
     capabilitySnapshotId: 'TEST-group-capability', expectedBehaviorFingerprint: 'a'.repeat(64),
-    binaryPath: '/TEST-opencode', binaryFingerprint: 'TEST-native', version: '2.0.32' } }
+    binaryPath: '/TEST-opencode', binaryFingerprint: 'TEST-native', version: '2.1.4' } }
   if (options.probe) {
     const member = plan.members[0]!, config = JSON.parse(member.profile.config.content)
     plan = { ...plan, members: [{ ...member, profile: { ...member.profile, root, directory: authority.directory } }], executionProbe: { memberId: member.memberId, intent, expectedText: 'done', capabilitySnapshotId: 'TEST-capability', unattendedTeam: options.unattendedTeam === true,
@@ -1059,7 +1059,7 @@ requireExecutionEndpoint: authority => {
     expect(settled.kind).toBe('probeEvidence')
     if (settled.kind !== 'probeEvidence') throw Error('TEST probe missing')
     expect(settled.failure).toBeNull()
-    expect(settled.proof).toMatchObject({ modelId: 'TEST-provider/TEST-model', opencodeVersion: '2.0.32', capabilitySnapshotId: 'TEST-capability' })
+    expect(settled.proof).toMatchObject({ modelId: 'TEST-provider/TEST-model', opencodeVersion: '2.1.4', capabilitySnapshotId: 'TEST-capability' })
     expect(Date.parse(settled.proof!.expiresAt) - Date.parse(settled.proof!.verifiedAt)).toBe(unattendedTeam ? 330_000 : 120_000)
     expect((await (await f.store()).snapshot()).slot).toBeNull()
     expect(f.counters).toMatchObject({ prompted: 1, acquired: 1, sessions: 1 })

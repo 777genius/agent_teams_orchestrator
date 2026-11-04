@@ -6,7 +6,7 @@ import {
   openCodeV2Delivered, resolveOpenCodeV2EngineVersion, openCodeV2EngineVersion,
   assertOpenCodeV2Launchable, classifyOpenCodeV2Version, isOpenCodeV2Identity, openCodeV2Dialect,
   openCodeV2GraphPackages, openCodeV2LaunchRefusal, openCodeV2Qualification, openCodeV2QualifiedVersions,
-  openCodeV2ReleaseContract, openCodeV2StagedVersions, openCodeV2Wire, parseOpenCodeV2GraphAlias, type OpenCodeV2Pin,
+  openCodeV2ReleaseContract, openCodeV2StagedVersions, openCodeV2Wire, isOpenCodeV2ReadableEngine, parseOpenCodeV2GraphAlias, type OpenCodeV2Pin,
 } from './OpenCodeV2Registry.js'
 import { validateRunLaunchPlan } from '../bridge/OpenCodeV2RunOwner.js'
 import { openCodeV2KeyIntegration, openCodeV2KeyIntegrations } from '../catalog/OpenCodeV2KeyIntegrations.js'
@@ -44,18 +44,17 @@ test('dialect, wire family and graph aliases derive from any in-range version wi
   })).toEqual([version])
 })
 
-test('existing 2.0.0 floor and 2.0.32 current identities are unchanged', () => {
+test('2.0.0 floor and 2.0.32 current keep their identities but no longer admit a team launch', () => {
   expect(openCodeV2Dialect('2.0.0')).toBe('v2-2.0.0')
   expect(openCodeV2Dialect('2.0.32')).toBe('v2-2.0.32')
   expect(openCodeV2Wire('2.0.0')).toBe('floor')
   expect(openCodeV2Wire('2.0.32')).toBe('current')
-  // Both keep the POSIX platforms where V2 execution already ran. Their Windows evidence
-  // ran under the removed AppContainer host, so plain Windows execution is not claimed.
-  for (const platform of ['darwin-arm64', 'darwin-x64', 'linux-x64']) {
-    expect(openCodeV2LaunchRefusal('2.0.0', platform)).toBeNull()
-    expect(openCodeV2LaunchRefusal('2.0.32', platform)).toBeNull()
+  // Only the latest qualified release launches; its evidence ran without the removed sandbox.
+  expect(openCodeV2QualifiedVersions()).toEqual(['2.1.4'])
+  for (const platform of ['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64', 'win32-arm64', 'win32-x64']) {
+    expect(openCodeV2LaunchRefusal('2.0.0', platform)).toBe('opencode_v2_version_unqualified')
+    expect(openCodeV2LaunchRefusal('2.0.32', platform)).toBe('opencode_v2_version_unqualified')
   }
-  for (const version of ['2.0.0', '2.0.32']) expect(openCodeV2LaunchRefusal(version, 'win32-x64')).toBe('opencode_v2_version_unqualified')
 })
 
 test('qualification is per platform: a version is admitted only where its evidence ran', () => {
@@ -117,8 +116,8 @@ test('every stable V2 CLI selects an exact platform-qualified owned engine witho
     for (const version of qualified) expect(resolveOpenCodeV2EngineVersion(version, platform)).toBe(version)
     for (const version of ['2.1.99', '2.99.0', '2.999.999']) {
       const engine = resolveOpenCodeV2EngineVersion(version, platform)
-      expect(engine).toBe(qualified.at(-1)!)
-      expect(openCodeV2LaunchRefusal(engine, platform)).toBeNull()
+      expect(engine).toBe(qualified.at(-1) ?? null)
+      if (engine !== null) expect(openCodeV2LaunchRefusal(engine, platform)).toBeNull()
       // The external CLI does not acquire qualification by recognition.
       expect(openCodeV2LaunchRefusal(version, platform)).toBe('opencode_v2_version_unqualified')
     }
@@ -151,15 +150,22 @@ test('persisted run plans retain their original engine across a newer default wi
       controllerMcpName: 'agent-teams', advertisedTools: [] }],
   } as unknown as RunLaunchPlan
   const before = JSON.stringify(plan)
-  validateRunLaunchPlan(plan)
+  expect(() => validateRunLaunchPlan(plan)).toThrow('opencode_v2_version_unqualified')
   expect(JSON.stringify(plan)).toBe(before)
   const retained = structuredClone(plan)
   Object.assign(retained.members[0]!.native, { version: '2.99.0', engineVersion: '2.0.32' })
   expect(resolveOpenCodeV2EngineVersion('2.99.0', 'linux-x64')).toBe('2.1.4')
-  validateRunLaunchPlan(retained)
+  expect(() => validateRunLaunchPlan(retained)).toThrow('opencode_v2_version_unqualified')
   expect(openCodeV2EngineVersion(retained.members[0]!.native)).toBe('2.0.32')
   Object.assign(retained.members[0]!.native, { engineVersion: '2.0.40', dialect: 'v2-2.0.40' })
   expect(() => validateRunLaunchPlan(retained)).toThrow('opencode_v2_version_unqualified')
+})
+
+test('historical V2 read compatibility never requalifies retired engines for launch', () => {
+  for (const version of ['2.0.0', '2.0.32', '2.1.4']) expect(isOpenCodeV2ReadableEngine(version)).toBe(true)
+  for (const version of ['2.0.99', '2.1.0', '3.0.0', '2.1.4-rc.1']) expect(isOpenCodeV2ReadableEngine(version)).toBe(false)
+  for (const retired of ['2.0.0', '2.0.32'])
+    expect(openCodeV2LaunchRefusal(retired, 'linux-x64')).toBe('opencode_v2_version_unqualified')
 })
 
 test('compiled runtime without V2 refuses team launch and hides key integrations', () => {
