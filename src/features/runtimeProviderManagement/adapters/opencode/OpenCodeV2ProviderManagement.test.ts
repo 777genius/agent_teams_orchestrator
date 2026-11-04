@@ -164,6 +164,28 @@ test('transport failure never skips physical catalog lease retirement', async ()
   expect(events).toEqual(['dispose', 'unregister', 'retire'])
 })
 
+test('V2 catalog diagnostics preserve only allowlisted filesystem facts', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-catalog-errno-'))
+  const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
+  const secret = 'TEST-PRIVATE-FILE-PATH-AND-KEY'
+  process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
+  try {
+    await recordOpenCodeV2ProviderFailure('provider-model-catalog-profile',
+      Object.assign(new Error(secret), { code: 'EACCES', syscall: 'open', path: secret }), true)
+    await recordOpenCodeV2ProviderFailure('provider-model-catalog-models',
+      Object.assign(new Error(secret), { code: 'EACCES-' + secret, syscall: 'open-' + secret, path: secret }), true)
+    const directory = path.join(root, 'opencode/v2/provider-diagnostics')
+    const rows = await Promise.all((await readdir(directory)).map(async name => JSON.parse(await readFile(path.join(directory, name), 'utf8'))))
+    expect(rows.find(row => row.phase === 'provider-model-catalog-profile').failure).toEqual({ name: 'Error', errno: 'EACCES', operation: 'open' })
+    expect(rows.find(row => row.phase === 'provider-model-catalog-models').failure).toEqual({ name: 'Error' })
+    expect(JSON.stringify(rows)).not.toContain(secret)
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
+    else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('private failure diagnostics preserve finite control causes and redact arbitrary secrets', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-provider-diagnostics-'))
   const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
