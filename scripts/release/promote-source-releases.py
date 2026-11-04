@@ -54,22 +54,68 @@ def verify_delivery(tag):
     if not required.issubset(assets) or set(assets) - (required | {'win32-arm64'}):
         raise ValueError('Binary manifest has an incomplete or unknown platform set')
     expected = {manifest_name, sums_name}
+    digests = {}
+    exact_sizes = {}
     for platform, asset in assets.items():
         extension = 'zip' if platform.startswith('win32-') else 'tar.gz'
         name = f'agent-teams-runtime-{platform}-{tag}.{extension}'
         if asset['file'] != name or not re.fullmatch(r'[a-f0-9]{64}', asset['sha256']):
             raise ValueError(f'Invalid manifest asset for {platform}')
         expected.add(name)
-    actual = {asset['name'] for asset in release['assets'] if asset['size'] > 0}
-    if not expected.issubset(actual):
-        raise ValueError(f'Missing uploaded assets: {sorted(expected - actual)}')
+        digests[name] = asset['sha256']
+
+    # Modern releases ship an independently qualified V2 support ZIP for
+    # each delivered platform with an admitted engine. Older releases have
+    # no support descriptor; do not invent one retroactively.
+    support = manifest.get('opencodeV2Delivery')
+    if support is not None:
+        contract = manifest.get('opencodeV2')
+        qualified = contract.get('qualified') if isinstance(contract, dict) else None
+        if not isinstance(support, dict) or not isinstance(qualified, dict):
+            raise ValueError('Invalid V2 support qualification contract')
+        required_support = set()
+        for platform in assets:
+            versions = qualified.get(platform)
+            if not isinstance(versions, list) or not all(isinstance(v, str) for v in versions):
+                raise ValueError(f'Invalid V2 qualification for {platform}')
+            if not versions:
+                continue
+            required_support.add(platform)
+            descriptor = support.get(platform)
+            archive = descriptor.get('archive') if isinstance(descriptor, dict) else None
+            system, architecture = platform.split('-', 1)
+            filename = f'agent-teams-opencode-v2-support-{platform}-{tag}.zip'
+            if (not isinstance(archive, dict)
+                    or descriptor.get('platform') != system
+                    or descriptor.get('arch') != architecture
+                    or descriptor.get('runtimeVersion') != version
+                    or descriptor.get('sourceCommit') != source_commit
+                    or descriptor.get('bridgeProtocol') != manifest.get('bridgeProtocol')
+                    or descriptor.get('engineVersions') != versions
+                    or archive.get('file') != filename or archive.get('kind') != 'zip'
+                    or not isinstance(archive.get('sha256'), str)
+                    or not re.fullmatch(r'[a-f0-9]{64}', archive['sha256'])
+                    or type(archive.get('bytes')) is not int or archive['bytes'] <= 0):
+                raise ValueError(f'Invalid V2 support archive for {platform}')
+            expected.add(filename)
+            digests[filename] = archive['sha256']
+            exact_sizes[filename] = archive['bytes']
+        if set(support) != required_support:
+            raise ValueError('V2 support roster differs from qualified platforms')
+
+    uploaded = {asset['name']: asset['size'] for asset in release['assets'] if asset['size'] > 0}
+    if not expected.issubset(uploaded):
+        raise ValueError(f'Missing uploaded assets: {sorted(expected - uploaded.keys())}')
+    for filename, size in exact_sizes.items():
+        if uploaded[filename] != size:
+            raise ValueError(f'V2 support upload size differs: {filename}')
     sums = command('curl', '--fail', '--silent', '--show-error', '--location',
                    '--retry', '3', base + sums_name)
     checksums = {line.split()[1].lstrip('*'): line.split()[0]
                  for line in sums.splitlines() if len(line.split()) == 2}
-    for asset in assets.values():
-        if checksums.get(asset['file']) != asset['sha256']:
-            raise ValueError(f'Checksum list disagrees with manifest: {asset["file"]}')
+    for filename, digest in digests.items():
+        if checksums.get(filename) != digest:
+            raise ValueError(f'Checksum list disagrees with manifest: {filename}')
     # HEAD follows the real anonymous asset URL without downloading gigabytes.
     def check(name):
         command('curl', '--fail', '--silent', '--show-error', '--location',

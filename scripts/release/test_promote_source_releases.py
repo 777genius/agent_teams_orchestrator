@@ -23,6 +23,7 @@ class PromotionTest(unittest.TestCase):
                             assets=[{'name': a['file'], 'size': 100} for a in self.assets.values()] + [
                                 {'name': f'agent-teams-runtime-manifest-{self.tag}.json', 'size': 100},
                                 {'name': f'agent-teams-runtime-SHA256SUMS-{self.tag}', 'size': 100}])
+        self.sums = {item['file']: item['sha256'] for item in self.assets.values()}
         self.calls = []
         self.published = False
 
@@ -41,7 +42,7 @@ class PromotionTest(unittest.TestCase):
         if 'PATCH' in args:
             self.published = True
         if args[0] == 'curl' and '--head' not in args:
-            return '\n'.join(f'{self.digest}  {a["file"]}' for a in self.assets.values())
+            return '\n'.join(f'{digest}  {name}' for name, digest in self.sums.items())
         return ''
 
     def run_promotion(self, apply=True):
@@ -77,6 +78,60 @@ class PromotionTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.run_promotion()
                 self.assertFalse(any('PATCH' in c for c in self.calls))
+
+    def add_v2_support(self):
+        platform = 'linux-x64'
+        filename = f'agent-teams-opencode-v2-support-{platform}-{self.tag}.zip'
+        self.manifest['bridgeProtocol'] = 1
+        self.manifest['opencodeV2'] = {
+            'qualified': {name: ['2.1.4'] if name == platform else [] for name in self.assets}
+        }
+        self.manifest['opencodeV2Delivery'] = {
+            platform: dict(platform='linux', arch='x64', runtimeVersion=self.tag[1:],
+                           sourceCommit=self.sha, bridgeProtocol=1, engineVersions=['2.1.4'],
+                           archive=dict(file=filename, kind='zip', sha256=self.digest, bytes=100))
+        }
+        self.release['assets'].append(dict(name=filename, size=100))
+        self.sums[filename] = self.digest
+        return filename
+
+    def test_v2_support_is_verified_before_publishing(self):
+        filename = self.add_v2_support()
+        self.assertEqual(self.run_promotion()['status'], 'published')
+        patch_index = next(i for i, c in enumerate(self.calls) if 'PATCH' in c)
+        heads = [c[-1] for c in self.calls[:patch_index] if '--head' in c]
+        self.assertEqual(len(heads), 7)
+        self.assertTrue(any(url.endswith(filename) for url in heads))
+
+    def test_v2_support_missing_or_inconsistent_blocks_publication(self):
+        for defect in ('missing-metadata', 'missing-upload', 'missing-checksum',
+                       'wrong-digest', 'wrong-size', 'wrong-version', 'wrong-source',
+                       'wrong-platform', 'extra-descriptor'):
+            with self.subTest(defect=defect):
+                self.setUp()
+                filename = self.add_v2_support()
+                descriptor = self.manifest['opencodeV2Delivery']['linux-x64']
+                if defect == 'missing-metadata':
+                    del self.manifest['opencodeV2Delivery']['linux-x64']
+                elif defect == 'missing-upload':
+                    self.release['assets'].pop()
+                elif defect == 'missing-checksum':
+                    del self.sums[filename]
+                elif defect == 'wrong-digest':
+                    descriptor['archive']['sha256'] = 'c' * 64
+                elif defect == 'wrong-size':
+                    descriptor['archive']['bytes'] = 101
+                elif defect == 'wrong-version':
+                    descriptor['engineVersions'] = ['2.0.32']
+                elif defect == 'wrong-source':
+                    descriptor['sourceCommit'] = 'c' * 40
+                elif defect == 'wrong-platform':
+                    descriptor['platform'] = 'darwin'
+                else:
+                    self.manifest['opencodeV2Delivery']['darwin-arm64'] = descriptor
+                with self.assertRaises(ValueError):
+                    self.run_promotion()
+                self.assertFalse(any('PATCH' in call for call in self.calls))
 
     def test_suffixed_tag_does_not_block_stable_candidates(self):
         tags = ['v1.2.4-rc.1', 'v1.2.3']
