@@ -681,6 +681,9 @@ jobs:
           node-version: '24'
       - name: Install frozen portable dependencies
         run: bun install --frozen-lockfile --linker hoisted
+      # Read/replay of previously owned engines must not requalify them for launch.
+      - name: Test V2 qualification, historical transcripts and native turn projection
+        run: bun test src/services/opencode/compatibility/OpenCodeV2Registry.test.ts src/cli/runtimeTranscriptV2.test.ts src/services/opencode/bridge/OpenCodeV2TurnProjection.test.ts --timeout 30000
       # Plain execution and permission tests run in packaged-delivery on Linux and Windows.
       - name: Test readiness, refusal text and activation deadline
         run: bun test src/services/opencode/host/OpenCodeV2ExecutionReadiness.test.ts src/services/opencode/execution/OpenCodeV2RefusalReason.test.ts src/services/opencode/execution/OpenCodeV2ActivationDeadline.test.ts
