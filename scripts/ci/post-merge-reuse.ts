@@ -17,9 +17,10 @@ export async function provePostMergeReuse(context: Context, read: Read): Promise
     if (!Array.isArray(associated) || associated.length !== 1) return false
     const pr = object(associated[0]), source = fields(pr, 'head')
     const head = fields(source, 'sha')
+    const baseSha = fields(pr.base, 'sha')
     const headBranch = fields(source, 'ref')
     const headRepository = fields(fields(source, 'repo'), 'full_name')
-    if (!hexSha(head) || pr.merge_commit_sha !== context.sha ||
+    if (!hexSha(head) || !hexSha(baseSha) || pr.merge_commit_sha !== context.sha ||
       typeof pr.merged_at !== 'string' || fields(pr.base, 'ref') !== 'main' ||
       typeof headBranch !== 'string' || !headBranch ||
       typeof headRepository !== 'string' || !headRepository) return false
@@ -38,7 +39,9 @@ export async function provePostMergeReuse(context: Context, read: Read): Promise
       read(`${root}/git/commits/${context.sha}`), read(`${root}/git/commits/${head}`),
     ])
     const tree = fields(fields(merged, 'tree'), 'sha')
-    if (!hexSha(tree) || tree !== fields(fields(original, 'tree'), 'sha')) return false
+    const parents = fields(merged, 'parents')
+    if (!hexSha(tree) || tree !== fields(fields(original, 'tree'), 'sha') ||
+      !Array.isArray(parents) || !parents.length || fields(parents[0], 'sha') !== baseSha) return false
     const checks = fields(await read(`${root}/commits/${head}/check-runs?check_name=CI%20required&per_page=100`), 'check_runs')
     if (!Array.isArray(checks)) return false
     const candidates = checks.map(object).filter(check => check.name === 'CI required' && check.head_sha === head)
@@ -55,12 +58,14 @@ export async function provePostMergeReuse(context: Context, read: Read): Promise
     const match = /^https:\/\/github\.com\/777genius\/agent_teams_orchestrator\/actions\/runs\/([1-9]\d*)\/job\/([1-9]\d*)$/.exec(url)
     if (!match) return false
     const run = object(await read(`${root}/actions/runs/${match[1]}`))
-    // A different PR for the same commit may have passed a narrower scope.
-    // Only the run linked to the PR that actually merged is reusable.
+    // GitHub may empty run.pull_requests after merge. An empty list proves
+    // nothing: require the server-evaluated PR number, head, base and target
+    // in the workflow run title (plus the frozen merge-parent base).
     const runPulls = fields(run, 'pull_requests')
+    const expectedTitle = `CI PR=${pr.number} HEAD=${head} BASE=${baseSha} TARGET=main`
     const samePr = Number.isSafeInteger(pr.number) && Array.isArray(runPulls) &&
       (runPulls.length === 0 || (runPulls.length === 1 && fields(runPulls[0], 'number') === pr.number)) &&
-      run.head_branch === headBranch &&
+      run.display_title === expectedTitle && run.head_branch === headBranch &&
       fields(run.head_repository, 'full_name') === headRepository
     return samePr && run.event === 'pull_request' && run.status === 'completed' && run.conclusion === 'success' &&
       run.name === 'CI' && run.path === '.github/workflows/ci.yml' && run.head_sha === head &&

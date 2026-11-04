@@ -1,4 +1,10 @@
 name: CI
+# GitHub evaluates these identifiers from the originating PR event. After merge
+# workflow_run.pull_requests may be empty; do not trust the head SHA alone.
+run-name: >-
+  ${{ github.event_name == 'pull_request'
+      && format('CI PR={0} HEAD={1} BASE={2} TARGET={3}', github.event.pull_request.number, github.event.pull_request.head.sha, github.event.pull_request.base.sha, github.event.pull_request.base.ref)
+      || format('CI {0} HEAD={1}', github.event_name, github.sha) }}
 
 on:
   push:
