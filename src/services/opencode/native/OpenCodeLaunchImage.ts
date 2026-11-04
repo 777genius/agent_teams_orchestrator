@@ -1,5 +1,5 @@
 import { constants } from 'node:fs'
-import { lstat, mkdir, open, realpath } from 'node:fs/promises'
+import { lstat, mkdir, open, realpath, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { createHash, randomBytes } from 'node:crypto'
 
@@ -86,13 +86,20 @@ export async function verifyNativeEpochDirectories(images: NativeEpochImages): P
   }
 }
 
-export async function createNativeEpochImages(profileRoot: string, hostKey: string, selected: string, helper: string): Promise<NativeEpochImages> {
+/** Establish the gated authority parent without allocating a full native image.
+ * An active/unknown predecessor must be refused before copies are created. */
+export async function ensureNativeEpochParent(profileRoot: string, hostKey: string) {
   await validateNativeProfileRoot(profileRoot)
   const authorities = path.join(profileRoot, 'host-authority')
   await privateDirectory(authorities)
   const host = path.join(authorities, createHash('sha256').update(hostKey).digest('hex'))
   await privateDirectory(host)
   const images = path.join(host, 'images'); await privateDirectory(images)
+  return { authorities, host, images }
+}
+
+export async function createNativeEpochImages(profileRoot: string, hostKey: string, selected: string, helper: string): Promise<NativeEpochImages> {
+  const { authorities, host, images } = await ensureNativeEpochParent(profileRoot, hostKey)
   const epoch = randomBytes(32).toString('hex'), root = path.join(images, epoch)
   await mkdir(root, { mode: 0o700 }) // Exclusive epoch; never reuse or repair old images.
   const image = path.join(root, 'opencode'), custodian = path.join(root, 'custodian')
@@ -115,4 +122,28 @@ export async function createNativeEpochImages(profileRoot: string, hostKey: stri
     directories.push(Object.freeze({ path: directory, dev: String(observed.dev), ino: String(observed.ino), mode: Number(observed.mode & 0o777n) }))
   }
   return Object.freeze({ epoch, root, image, helper: custodian, imageIdentity, helperIdentity, directories: Object.freeze(directories), exitReceipt, probeRoot })
+}
+
+/** Remove only the two captured executable copies after a proven native death.
+ * Keep the epoch, file identity and exit receipt for later review/recovery.
+ * This is idempotent, never scans by PID and never touches uncertain epochs. */
+export async function reclaimRetiredNativeImages(images: NativeEpochImages): Promise<void> {
+  await verifyNativeEpochDirectories(images)
+  const remaining: string[] = []
+  for (const [file, identity] of [[images.image, images.imageIdentity], [images.helper, images.helperIdentity]] as const) {
+    try { await verifyNativeImage(file, identity); remaining.push(file) }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+  }
+  if (!remaining.length) return
+  const root = await open(images.root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+  try {
+    const observed = await root.stat({ bigint: true })
+    const expected = images.directories.find(row => row.path === images.root)
+    requireFact(expected && String(observed.dev) === expected.dev && String(observed.ino) === expected.ino)
+    await root.chmod(0o700)
+    try { for (const file of remaining) await unlink(file) }
+    finally { await root.chmod(0o500) }
+  } finally { await root.close() }
 }

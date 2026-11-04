@@ -6,7 +6,8 @@ import path from 'node:path'
 import { createHash, randomBytes } from 'node:crypto'
 import { Transform, type Readable } from 'node:stream'
 import {
-  createNativeEpochImages, verifyNativeImage, verifyNativeEpochDirectories, validateNativeProfileRoot,
+  createNativeEpochImages, ensureNativeEpochParent, reclaimRetiredNativeImages,
+  verifyNativeImage, verifyNativeEpochDirectories, validateNativeProfileRoot,
   type NativeEpochImages, type NativeFileIdentity,
 } from './OpenCodeLaunchImage.js'
 import { nativeAuthorityPath, nativeExitConfirmed, readNativeAuthority, withNativeAuthorityGate, writeNativeAuthority, type NativeAuthority } from './OpenCodeNativeAuthority.js'
@@ -318,6 +319,8 @@ function bind(reference: NativeCustodyReference, child: ChildProcess | null): Na
       if (await nativeExitConfirmed(authority)) {
         await writeNativeAuthority(authorityFile(reference), { ...authority, phase: 'dead' })
         if (byEndpoint.get(reference.baseUrl) === custody) byEndpoint.delete(reference.baseUrl)
+        // The native exit receipt remains readable even after executable copies are unlinked.
+        await reclaimRetiredNativeImages(reference.images).catch(() => undefined)
         return
       }
       await verifyAuthority(reference)
@@ -326,10 +329,12 @@ function bind(reference: NativeCustodyReference, child: ChildProcess | null): Na
         await control(reference, 'stop')
         await writeNativeAuthority(authorityFile(reference), { ...authority, phase: 'dead' })
         if (byEndpoint.get(reference.baseUrl) === custody) byEndpoint.delete(reference.baseUrl)
+        if (await nativeExitConfirmed(authority)) await reclaimRetiredNativeImages(reference.images).catch(() => undefined)
       } catch (error) {
         if (await nativeExitConfirmed(authority)) {
           await writeNativeAuthority(authorityFile(reference), { ...authority, phase: 'dead' })
           if (byEndpoint.get(reference.baseUrl) === custody) byEndpoint.delete(reference.baseUrl)
+          await reclaimRetiredNativeImages(reference.images).catch(() => undefined)
           return
         }
         await writeNativeAuthority(authorityFile(reference), { ...authority, phase: 'unknown' }); throw error
@@ -366,9 +371,9 @@ export async function launchNativeCustody(input: {
 }): Promise<NativeCustody> {
   fact(process.platform === 'linux' && /^http:\/\/127\.0\.0\.1:[1-9][0-9]*$/.test(input.baseUrl))
   input.signal?.throwIfAborted()
-  const images = await createNativeEpochImages(input.profileRoot, input.hostKey, input.selectedBinary, input.helper.path)
-  fact(images.helperIdentity.sha256 === input.helper.sha256)
-  input.signal?.throwIfAborted()
+  // Create only the private gate's parent before checking prior authority.
+  // Never copy a replacement native image while the former epoch is live/unknown.
+  await ensureNativeEpochParent(input.profileRoot, input.hostKey)
   const file = nativeAuthorityPath(input.profileRoot, input.hostKey)
   return withNativeAuthorityGate(file, async () => {
     let previous: NativeAuthority | null = null
@@ -387,6 +392,15 @@ export async function launchNativeCustody(input: {
       }
     }
     fact(!previous || previous.phase === 'dead')
+    if (previous?.reference && previous.phase === 'dead') {
+      const death = await nativeExitConfirmed(previous) ||
+        nativePreviousBootConfirmed(previous, (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim())
+      if (death) await reclaimRetiredNativeImages(previous.images)
+    }
+    input.signal?.throwIfAborted()
+    const images = await createNativeEpochImages(input.profileRoot, input.hostKey, input.selectedBinary, input.helper.path)
+    fact(images.helperIdentity.sha256 === input.helper.sha256)
+    input.signal?.throwIfAborted()
     const password = randomBytes(32).toString('hex')
     const authorization = `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}`
     const nativeEnvironment = { ...input.env, OPENCODE_SERVER_PASSWORD: password, OPENCODE_SERVER_USERNAME: 'opencode' }

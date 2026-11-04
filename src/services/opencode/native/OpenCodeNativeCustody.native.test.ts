@@ -13,7 +13,7 @@ import type { OpenCodePreparedProfile } from '../types.js'
 import { fetchNativeOpenCode, nativeRequestFailureGate } from './OpenCodeNativeRequestLease.js'
 import { failureDiagnostic } from './fixtures/OpenCodeNativeColdController.js'
 import { qualifyNativeColdRecovery } from './OpenCodeNativeColdRecovery.js'
-import { nativeAuthorityPath, readNativeAuthority } from './OpenCodeNativeAuthority.js'
+import { nativeAuthorityPath, nativeExitConfirmed, readNativeAuthority } from './OpenCodeNativeAuthority.js'
 
 // Required in the physical Linux qualification lane. Mac/Windows cannot count
 // this as their custody proof; their retained native backends remain separate.
@@ -299,6 +299,25 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
       throw error
     }
   }, 20000)
+  test('native image copies are reclaimed only after confirmed retirement; exit receipt remains durable', async () => {
+    const custody = await start('retirement-image-reclaim')
+    const image = custody.reference.images
+    expect((await lstat(image.image)).isFile()).toBe(true)
+    expect((await lstat(image.helper)).isFile()).toBe(true)
+    await custody.stopExact()
+    active.delete(custody)
+    const authority = await readNativeAuthority(nativeAuthorityPath(profile, 'retirement-image-reclaim'))
+    expect(authority.phase).toBe('dead')
+    expect(await nativeExitConfirmed(authority)).toBe(true)
+    for (const file of [image.image, image.helper]) {
+      const missing = await lstat(file).then(() => false, (error: NodeJS.ErrnoException) => error.code === 'ENOENT')
+      expect(missing).toBe(true)
+    }
+    // Repeated stop never acts on a reused PID or resurrects retired copies.
+    await custody.stopExact()
+    expect(await nativeExitConfirmed(await readNativeAuthority(nativeAuthorityPath(profile, 'retirement-image-reclaim')))).toBe(true)
+  }, 20000)
+
   test('native config ingress denies unauthenticated access while the production request path remains authorized', async () => {
     const custody = await start('native-ingress-privacy')
     const response = await globalThis.fetch(`${custody.reference.baseUrl}/config`, { redirect: 'error' })
