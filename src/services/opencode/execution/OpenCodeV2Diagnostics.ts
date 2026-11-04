@@ -1,5 +1,3 @@
-import { readWindowsNativeAliasFailure } from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
-import { windowsRealpathInstallCauses } from '../host/windows/OpenCodeV2WindowsChildControl.js'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { types } from 'node:util'
@@ -9,8 +7,8 @@ import { executionAssert } from './OpenCodeV2ExecutionContracts.js'
 import { readOpenCodeV2ProviderWireFailure } from '../transport/OpenCodeV2ProviderWire.js'
 import { readOpenCodeV2ExecutionWireFailure } from '../transport/OpenCodeV2ExecutionFetch.js'
 import type { ExecutionMcpFailure } from '../transport/OpenCodeV2ExecutionClientFactory.js'
-import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirectories.js'
 import { readOpenCodeV2ServerFailure, type OpenCodeV2ServerFailure } from './OpenCodeV2ServerFailure.js'
+import type { RunOwnerFailure } from '../bridge/OpenCodeV2RunTypes.js'
 
 export type ExecutionCatalogPhase = 'client-setup' | 'info' | 'location' | 'integration-ready'
 const catalogPhases = new Set<ExecutionCatalogPhase>(['client-setup', 'info', 'location', 'integration-ready'])
@@ -71,7 +69,7 @@ function startupDiagnostic(output: string | undefined) {
       const closedFields: Record<string, readonly string[]> = {
         errno: ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'],
         operation: ['realpath', 'open', 'read', 'lstat', 'stat'], errorName: ['Error', 'TypeError', 'ReferenceError', 'RangeError', 'AbortError'],
-        cause: ['execution_contract_invalid', 'execution_identity_mismatch', 'execution_entry_changed', 'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed', 'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing', 'execution_containment_identity_mismatch', 'execution_realpath_unavailable', ...windowsRealpathInstallCauses, 'execution_timeout', 'execution_cancelled'],
+        cause: ['execution_contract_invalid', 'execution_identity_mismatch', 'execution_entry_changed', 'v2_compiled_runtime_unsupported', 'v2_execution_layout_unsupported', 'execution_profile_changed', 'execution_graph_changed', 'execution_graph_incomplete', 'execution_graph_dependency_missing', 'execution_containment_identity_mismatch', 'execution_realpath_unavailable', 'execution_timeout', 'execution_cancelled'],
         profileGuard: ['environment_hash', 'config_hash', 'home_mapping', 'path_containment', 'database_type', 'models_type', 'models_hash', 'process_cwd', 'process_pwd', 'process_environment'],
       }
       if (!row || Array.isArray(row)) continue
@@ -301,24 +299,28 @@ export function retainOpenCodeV2InitializationPhase(error: unknown, phase: RunIn
   }))
 }
 
-const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_method_unsupported', 'provider_existing_credentials_unsupported',
+const providerFailureCodes = ['provider_missing', 'provider_key_method_unsupported', 'provider_existing_credentials_unsupported',
   'provider_catalog_scope_changed', 'provider_catalog_location_changed', 'provider_integration_changed', 'provider_credential_identity_changed',
   'provider_owned_connection_unknown', 'provider_active_connection_changed', 'provider_auth_publication_changed', 'provider_auth_publication_unknown',
-  'provider_selected_model_missing', 'provider_original_connect_unknown', 'provider_original_execution_pending', 'provider_execution_target_changed',
+  'provider_selected_model_missing', 'provider_original_connect_unknown', 'provider_original_execution_pending', 'provider_original_execution_failed', 'provider_execution_target_changed',
   'provider_saved_proof_changed', 'provider_saved_proof_unqualified', 'provider_physical_cleanup_unknown', 'provider_mutation_unknown',
   'provider_response_invalid', 'provider_authority_changed', 'provider_directory_changed', 'provider_rollback_peer_changed',
   'provider_rollback_publication_changed', 'provider_rollback_unknown', 'provider_rollback_publication_unknown',
+  'execution_spawn_failed', 'execution_child_exited', 'execution_prepare_timeout', 'execution_prepare_aborted',
+  'execution_retired_before_start', 'execution_platform_unsupported', 'execution_environment_injection', 'execution_ipc_unavailable',
+  'execution_profile_not_private', 'intent_identity_invalid',
   'run_control_timeout', 'run_control_disconnected', 'run_control_changed', 'run_control_foreign', 'run_control_invalid',
-  'run_control_frame_too_large', 'run_owner_stale', 'run_process_unknown', 'run_process_changed',
+  'run_control_frame_too_large', 'run_owner_stale', 'run_owner_retired', 'run_process_unknown', 'run_process_changed',
   'run_control_client_budget_exhausted', 'run_control_connect_busy_timeout_expired',
   'run_control_connect_idle_expired', 'run_control_connect_no_listener_expired',
   'run_deadline_expired', 'run_readiness_changed', 'run_readiness_unknown', 'run_operation_unknown',
   'run_state_wall_deadline_expired',
   'run_acquisition_timeout', 'run_initialization_timeout', 'run_stopped', 'cancelled', 'run_controller_mcp_unknown', 'execution_http_transport_unknown',
+  'execution_selected_auth_anonymous_unproven',
   'execution_selected_auth_required', 'execution_selected_auth_unbound', 'execution_selected_auth_changed',
   'execution_selected_auth_missing', 'execution_selected_auth_unsupported', 'execution_selected_auth_location_changed',
   'execution_selected_auth_provider_unknown', 'execution_selected_auth_existing_or_unsupported',
-  'execution_selected_auth_readback_unknown', 'execution_selected_auth_profile_changed',
+  'execution_selected_auth_readback_unknown', 'execution_selected_auth_profile_changed', 'selected_provider_not_in_v2_catalog',
   'execution_selected_oauth_readback_unknown', 'execution_selected_oauth_recovery_required', 'execution_selected_oauth_windows_unqualified',
   'execution_selected_oauth_provider_unknown', 'execution_selected_oauth_integration_unknown',
   'execution_selected_oauth_connection_unknown', 'execution_selected_oauth_model_unknown',
@@ -327,10 +329,11 @@ const privateProviderFailureCodes = new Set(['provider_missing', 'provider_key_m
   'execution_timeout', 'execution_owner_unknown', 'execution_owner_record_invalid', 'cleanup_unknown', 'selection_mismatch', 'authority_mismatch',
   'graph_mismatch', 'identity_mismatch', 'unqualified_version', 'invalid_response', 'invalid_model',
   'opencode_v2_version_out_of_range', 'opencode_v2_version_unqualified', 'opencode_v2_graph_unavailable',
-  'http_failure', 'transport_failure', 'media_type', 'deadline', 'authority_or_deadline', 'disposed', 'timeout'])
+  'http_failure', 'transport_failure', 'media_type', 'deadline', 'authority_or_deadline', 'disposed', 'timeout'] as const
+const privateProviderFailureCodes = new Set<string>(providerFailureCodes)
 // Exact native producer literals only; neither an arbitrary message nor a
 // syntactically plausible unknown stage is persisted as diagnostic data.
-const privateNativeFailureCodes = new Set([
+const nativeFailureCodes = [
   'cleanup_unknown', 'execution_identity_unknown', 'execution_path_alias',
   'execution_cancelled', 'execution_containment_unqualified', 'execution_containment_dll_identity', 'execution_containment_filesystem_denied',
   'execution_containment_helper_closed', 'execution_containment_helper_failed', 'execution_containment_helper_identity',
@@ -345,7 +348,15 @@ const privateNativeFailureCodes = new Set([
   'execution_owner_metadata_changed', 'execution_owner_metadata_invalid', 'execution_owner_metadata_missing',
   'execution_owner_metadata_purpose_invalid', 'execution_owner_not_private', 'execution_owner_ntfs_required',
   'execution_owner_path_invalid', 'execution_owner_prepared_invalid', 'execution_owner_prepared_purpose_invalid',
-  'execution_owner_read_only', 'execution_owner_unknown', 'execution_owner_write_through_pending'])
+  'execution_owner_read_only', 'execution_owner_unknown', 'execution_owner_write_through_pending'] as const
+const privateNativeFailureCodes = new Set<string>(nativeFailureCodes)
+/** Every category a provider or owner failure record can carry. */
+export type OpenCodeV2ProviderFailureCategory = typeof providerFailureCodes[number] | typeof nativeFailureCodes[number] | 'provider_operation_unknown'
+/** Readers accept only these closed categories; anything else reads as unknown. */
+export function openCodeV2ProviderFailureCategory(value: unknown): OpenCodeV2ProviderFailureCategory {
+  return typeof value === 'string' && (privateProviderFailureCodes.has(value) || privateNativeFailureCodes.has(value))
+    ? value as OpenCodeV2ProviderFailureCategory : 'provider_operation_unknown'
+}
 const privateNativeFailureStages = new Set([
   'alias_predicate',
   'assert_mapping', 'assert_stopped', 'assert_broker',
@@ -384,24 +395,37 @@ function nativeFailure(error: unknown): { category: string; native?: { stage: st
   return { category: match[1]!, ...(privateNativeFailureStages.has(match[2]!)
     ? { native: { stage: match[2]!, nativeCode } } : {}) }
 }
-/** Private static phase/category only: never an arbitrary SDK message, body, credential or key. */
-export async function recordOpenCodeV2ProviderFailure(phase: string, error: unknown, retainedOriginal: boolean, startupOutput?: string, acquisitionTiming?: unknown, cleanupTiming?: Readonly<{ elapsedMs: number; dataRoot?: string; observation?: ExecutionCleanupObservation }>): Promise<void> {
+function providerFailureCategory(error: unknown) {
   // Only our finite cleanup wrappers may preserve one exact known cause.
   const cause = error instanceof Error && (error.message === 'cleanup_unknown' || error.message === 'execution_owner_unknown')
     ? error.cause : undefined
   const native = nativeFailure(cause) ?? nativeFailure(error)
   const category = cause instanceof Error && privateProviderFailureCodes.has(cause.message) ? cause.message
     : native?.category ?? (error instanceof Error && privateProviderFailureCodes.has(error.message) ? error.message : 'provider_operation_unknown')
+  return { cause, native, category }
+}
+/** The same closed category and provider wire stage as the diagnostics record, for the
+ * owner's run directory. Never a message, body, path or credential. */
+export function classifyOpenCodeV2RunOwnerFailure(error: unknown): RunOwnerFailure {
+  const category = openCodeV2ProviderFailureCategory(providerFailureCategory(error).category), operation = readOpenCodeV2ProviderWireFailure(error)
+  return { category, ...(operation ? { operation: { operation: operation.operation, stage: operation.stage, status: operation.status } } : {}) }
+}
+/** Private static phase/category only: never an arbitrary SDK message, body, credential or key. */
+export async function recordOpenCodeV2ProviderFailure(phase: string, error: unknown, retainedOriginal: boolean, startupOutput?: string, acquisitionTiming?: unknown, cleanupTiming?: Readonly<{ elapsedMs: number; dataRoot?: string; observation?: ExecutionCleanupObservation }>): Promise<void> {
+  const { cause, native, category } = providerFailureCategory(error)
   // Preserve only fixed original exception facts when a startup guard is not a
   // known category. Never persist its message, path, stack or arbitrary fields.
-  const detail = (cause instanceof Error ? cause : error instanceof Error ? error : undefined) as
+  // The prelease wrapper retains the original setup failure even if profile cleanup failed.
+  // Read only fixed error facts; cleanup uncertainty remains the primary category.
+  const prelease = error instanceof AggregateError && error.message === 'provider_catalog_prelease_cleanup_unknown'
+    ? error.cause : undefined
+  const detail = (cause instanceof Error ? cause : prelease instanceof Error ? prelease : error instanceof Error ? error : undefined) as
     { name?: unknown; code?: unknown; syscall?: unknown } | undefined
   const name = ['Error', 'TypeError', 'ReferenceError', 'RangeError', 'AbortError'].find(value => value === detail?.name)
   const errno = ['EPERM', 'EACCES', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EINVAL', 'UNKNOWN', 'EIO', 'ENOSYS'].find(value => value === detail?.code)
   const syscall = ['realpath', 'open', 'read', 'lstat', 'stat'].find(value => value === detail?.syscall)
-  const failure = phase === 'execution-host-startup' && (name || errno || syscall)
+  const failure = (phase === 'execution-host-startup' || phase.startsWith('provider-model-catalog-')) && (name || errno || syscall)
     ? { ...(name ? { name } : {}), ...(errno ? { errno } : {}), ...(syscall ? { operation: syscall } : {}) } : undefined
-  const alias = readWindowsNativeAliasFailure(cause) ?? readWindowsNativeAliasFailure(error)
   const operation = readOpenCodeV2ProviderWireFailure(error)
   const catalog = error !== null && typeof error === 'object' ? catalogFailures.get(error) : undefined
   const startup = startupDiagnostic(startupOutput)
@@ -424,16 +448,14 @@ export async function recordOpenCodeV2ProviderFailure(phase: string, error: unkn
   if (cleanupTiming?.dataRoot !== undefined && (!cleanup || typeof cleanupTiming.dataRoot !== 'string' || !path.isAbsolute(cleanupTiming.dataRoot))) return
   try {
     const directory = path.join(cleanupTiming?.dataRoot ?? resolveClaudeMultimodelPaths().data, 'opencode/v2/provider-diagnostics')
-    if (process.platform === 'win32') {
-      await ensureWindowsPrivateDirectories([directory])
-    } else {
+    {
       await mkdir(directory, { recursive: true, mode: 0o700 })
       const info = await lstat(directory)
-      executionAssert(info.isDirectory() && !info.isSymbolicLink() && info.uid === process.getuid?.() && (info.mode & 0o077) === 0, 'provider_diagnostics_foreign')
+      executionAssert(info.isDirectory() && !info.isSymbolicLink() && (process.platform === 'win32' || info.uid === process.getuid?.() && (info.mode & 0o077) === 0), 'provider_diagnostics_foreign')
     }
     // Nonsecret observational data only: this file is not native ownership or
     // cleanup authority, even when an elevated Windows writer owns the file.
     await writeFile(path.join(directory, randomUUID() + '.json'), JSON.stringify({ schemaVersion: 1, phase, category, retainedOriginal,
-      ...(native?.native ? { native: native.native } : {}), ...(alias ? { alias } : {}), ...(failure ? { failure } : {}), ...(operation ? { operation } : {}), ...(catalog ? { catalog } : {}), ...(startup ? { startup } : {}), ...(acquisition ? { acquisition } : {}), ...(cleanup ? { cleanup } : {}), ...(initialization ? { initialization } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
+      ...(native?.native ? { native: native.native } : {}), ...(failure ? { failure } : {}), ...(operation ? { operation } : {}), ...(catalog ? { catalog } : {}), ...(startup ? { startup } : {}), ...(acquisition ? { acquisition } : {}), ...(cleanup ? { cleanup } : {}), ...(initialization ? { initialization } : {}), recordedAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 })
   } catch { /* Diagnostics cannot replace or retry the unresolved original operation. */ }
 }

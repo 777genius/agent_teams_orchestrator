@@ -1,3 +1,4 @@
+import { COMPLETED_NON_RESPONSE_REASON, isOpenCodeNonResponseText, isSuccessfulGroupCatalogResult } from './OpenCodeCompletedNonResponse.js'
 import type {
   OpenCodeCanonicalMessage,
   OpenCodeCanonicalToolCall,
@@ -643,8 +644,19 @@ function classifyChildren(input: {
   }
 
   if (best) {
+    const child = input.children.find(item => item.id === best.assistantMessageId)
+    const onlyTextChild = input.children.filter(item => compactText(item.text) || compactText(item.previewText)).length === 1
+    const completedNonResponse = best.state === 'responded_plain_text' && onlyTextChild &&
+      (input.rawStatus === 'idle' || input.rawStatus === null) && child &&
+      child.id === input.children.at(-1)?.id && child.parentId === deliveredUserMessageId && Number.isFinite(child.completedAt) &&
+      (child.completedAt ?? 0) > 0 && child.finishReason === 'stop' &&
+      !child.hasError && !hasErroredMeaningfulTool && input.children.every(item => !item.hasError && item.toolCalls.every(tool =>
+        normalizeToolName(tool.toolName) === 'group_chat_list' && tool.status === 'completed' && !isErroredTool(tool) &&
+        (isSuccessfulGroupCatalogResult(tool.output) || (tool.output == null && isSuccessfulGroupCatalogResult(tool.outputText))))) &&
+      isOpenCodeNonResponseText(child.text)
     return {
       ...best,
+      ...(completedNonResponse ? { reason: COMPLETED_NON_RESPONSE_REASON } : {}),
       toolCallNames: [...observedToolNames],
     }
   }
@@ -661,10 +673,10 @@ function classifyChildren(input: {
   }
 
   const lastChild = input.children[input.children.length - 1]
-  // A silent group peer may complete without sending a reply. A missing status
-  // is not completion proof: the exact child must positively finish on its own.
-  const completedSilentGroupTurn = Boolean(
-    input.groupChatId && (input.rawStatus === 'idle' || input.rawStatus === null) && lastChild?.id
+  // Completion is a fact about this exact child, independent of reply policy.
+  // Consumers decide whether the delivery permits silence; idle alone proves nothing.
+  const completedSilentTurn = Boolean(
+    (input.rawStatus === 'idle' || input.rawStatus === null) && lastChild?.id
     && Number.isFinite(lastChild.completedAt) && (lastChild.completedAt ?? 0) > 0
     && lastChild.finishReason === 'stop' && observedToolNames.size === 0,
   )
@@ -674,7 +686,7 @@ function classifyChildren(input: {
     assistantMessageId: lastChild?.id ?? null,
     toolCallNames: [...observedToolNames],
     latestAssistantPreview: messagePreview(lastChild ?? null),
-    reason: completedSilentGroupTurn
+    reason: completedSilentTurn
       ? 'assistant_child_completed_without_visible_or_meaningful_response'
       : 'assistant_child_has_no_visible_or_meaningful_response',
   })

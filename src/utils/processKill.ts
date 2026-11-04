@@ -59,6 +59,7 @@ function readProcessQueryOutput(
   args: string[],
   outputLimitBytes: number,
   timeoutMs = PROCESS_START_TIME_QUERY_TIMEOUT_MS,
+  env?: NodeJS.ProcessEnv,
 ): Promise<string | null> {
   return new Promise(resolve => {
     let settled = false
@@ -86,6 +87,7 @@ function readProcessQueryOutput(
       child = spawn(command, args, {
         stdio: ['ignore', 'pipe', command === 'powershell.exe' ? 'pipe' : 'ignore'],
         windowsHide: true,
+        ...(env ? { env } : {}),
       })
       child.stderr?.resume()
       child.stdout?.on('data', (chunk: Buffer | string) => {
@@ -125,10 +127,14 @@ export async function readProcessStartTimeMs(
   }
 
   if (platform === 'darwin') {
+    // lstart follows LC_TIME; only the C locale prints a date Date.parse reads
+    // (ru_RU and de_DE give NaN). The time zone stays the caller's own.
     const output = await readProcessQueryOutput(
       'ps',
       ['-p', String(normalizedPid), '-o', 'lstart='],
       PROCESS_START_TIME_OUTPUT_LIMIT_BYTES,
+      undefined,
+      { ...process.env, LC_ALL: 'C', LC_TIME: 'C', LANG: 'C' },
     )
     return output === null ? null : parseDarwinProcessStartTime(output)
   }

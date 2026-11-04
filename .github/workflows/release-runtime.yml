@@ -171,12 +171,11 @@ jobs:
             platform: win32-x64
             archive_name: agent-teams-runtime-win32-x64.zip
             binary_name: claude-multimodel.exe
-          - runner: ubuntu-24.04
+          - runner: windows-11-arm
             platform: win32-arm64
             archive_name: agent-teams-runtime-win32-arm64.zip
             binary_name: claude-multimodel.exe
-            compile_target: bun-windows-arm64
-          - runner: macos-14
+          - runner: macos-15
             platform: darwin-arm64
             archive_name: agent-teams-runtime-darwin-arm64.tar.gz
             binary_name: claude-multimodel
@@ -196,37 +195,38 @@ jobs:
         with:
           bun-version: 1.4.2
 
+      - name: Require native Windows build architecture
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config --global core.longpaths true
+          if ($LASTEXITCODE -ne 0) { throw 'Could not enable Windows long paths' }
+          bun --no-install -e 'if (`${process.platform}-${process.arch}` !== process.env.EXPECTED_PLATFORM || Bun.version !== "1.4.2") throw new Error("Release compiler must run natively at its pinned version")'
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows release compiler check failed' }
+
       - name: Install dependencies
-        if: matrix.platform != 'win32-arm64'
         run: bun install --frozen-lockfile --linker hoisted
 
-      - name: Install Windows ARM64 dependencies
-        if: matrix.platform == 'win32-arm64'
-        run: bun install --frozen-lockfile --linker hoisted --os=win32 --cpu=arm64
-
-      - name: Compile Windows x64 native assets
-        if: matrix.platform == 'win32-x64'
-        run: bun scripts/opencode-v2/compile-windows.ts
-
-      # The committed release setting (scripts/opencode-v2/release-delivery.ts) decides whether
-      # this release ships OpenCode V2; the manifest's opencodeV2 contract follows it.
-      - name: Resolve OpenCode V2 delivery
+      - name: Resolve OpenCode V2 release delivery
         id: opencode-v2
         shell: bash
         run: |
           set -euo pipefail
-          delivery="$(bun ./scripts/opencode-v2/release-delivery.ts | tr -d '\r')"
-          case "$delivery" in bundled|off) ;; *) echo "Unexpected OpenCode V2 delivery: $delivery" >&2; exit 1 ;; esac
+          delivery="$(bun --no-install ./scripts/opencode-v2/release-delivery.ts | tr -d '\r')"
+          [[ "$delivery" == bundled || "$delivery" == off ]] || { echo "Unsupported V2 delivery: $delivery" >&2; exit 1; }
           echo "delivery=$delivery" >> "$GITHUB_OUTPUT"
-          echo "OpenCode V2 delivery: \`$delivery\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "OpenCode V2 delivery: `$delivery`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build packaged runtime deliveries
         env:
-          BUN_COMPILE_TARGET: ${{ matrix.compile_target }}
-        run: bun run ./scripts/package-runtime.ts --platform ${{ matrix.platform }}
+          RUNTIME_OPENCODE_V2: ${{ steps.opencode-v2.outputs.delivery }}
+        run: bun --no-install ./scripts/package-runtime.ts --platform ${{ matrix.platform }}
 
       - name: Verify compiled runtime
-        if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -292,7 +292,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Verify compiled Windows architecture
-        if: matrix.platform == 'win32-x64'
+        if: runner.os == 'Windows'
         env:
           EXPECTED_PLATFORM: ${{ matrix.platform }}
         shell: pwsh
@@ -304,24 +304,17 @@ jobs:
           }
 
           $bytes = [System.IO.File]::ReadAllBytes($binary)
+          if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw 'Compiled runtime DOS header mismatch' }
           $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3c)
+          if ($peOffset -lt 64 -or $peOffset + 6 -gt $bytes.Length -or [System.BitConverter]::ToUInt32($bytes, $peOffset) -ne 0x00004550) { throw 'Compiled runtime PE header mismatch' }
           $machine = [System.BitConverter]::ToUInt16($bytes, $peOffset + 4)
           $expectedMachine = if ($env:EXPECTED_PLATFORM -eq "win32-arm64") { 0xaa64 } else { 0x8664 }
           if ($machine -ne $expectedMachine) {
             throw "Compiled runtime architecture mismatch: expected 0x$($expectedMachine.ToString('x4')), got 0x$($machine.ToString('x4'))"
           }
 
-      - name: Verify cross-compiled Windows ARM64 architecture
-        if: matrix.platform == 'win32-arm64'
-        shell: bash
-        run: |
-          set -euo pipefail
-          binary_metadata="$(file dist/cli.exe)"
-          echo "$binary_metadata"
-          grep -Fq 'Aarch64' <<<"$binary_metadata"
-
       - name: Package runtime archive
-        if: runner.os != 'Windows' && matrix.platform != 'win32-arm64'
+        if: runner.os != 'Windows'
         env:
           RAW_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
           OPENCODE_V2_DELIVERY: ${{ steps.opencode-v2.outputs.delivery }}
@@ -346,14 +339,13 @@ jobs:
           printf '%s\n' "$runtime_version" > release/runtime/VERSION
           printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
           if [[ "$OPENCODE_V2_DELIVERY" == bundled ]]; then
-            [[ -f dist/opencode-delivery.json ]] || { echo "Packaged OpenCode delivery identity missing" >&2; exit 1; }
+            [[ -f dist/opencode-delivery.json && -d dist/local-cli && -d dist/bun ]] || { echo "Bundled OpenCode delivery missing" >&2; exit 1; }
             cp dist/opencode-delivery.json release/runtime/opencode-delivery.json
-            cp -R dist/local-cli release/runtime/local-cli
-            cp -R dist/bun release/runtime/bun
+            if [[ -f dist/opencode-v2-delivery.json ]]; then cp dist/opencode-v2-delivery.json release/runtime/opencode-v2-delivery.json; fi
+            cp -R dist/local-cli dist/bun release/runtime/
           else
-            # Without OpenCode V2 the compiled runtime runs every command itself.
-            for leftover in dist/opencode-delivery.json dist/local-cli dist/bun; do
-              [[ ! -e "$leftover" ]] || { echo "OpenCode V2 delivery found in a release without V2: $leftover" >&2; exit 1; }
+            for leftover in dist/opencode-delivery.json dist/opencode-v2-delivery.json dist/local-cli dist/bun; do
+              [[ ! -e "$leftover" ]] || { echo "Unexpected V2 files: $leftover" >&2; exit 1; }
             done
           fi
           # The managed Cursor assets are resolved beside the installed binary.
@@ -362,40 +354,6 @@ jobs:
           [[ -d dist/cursor-managed ]] || { echo "Managed Cursor assets missing"; exit 1; }
           cp -R dist/cursor-managed release/runtime/cursor-managed
           tar -czf "release/${{ matrix.archive_name }}" -C release runtime
-
-      - name: Package cross-compiled Windows ARM64 runtime archive
-        if: matrix.platform == 'win32-arm64'
-        env:
-          RAW_RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
-          OPENCODE_V2_DELIVERY: ${{ steps.opencode-v2.outputs.delivery }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          runtime_version="${RAW_RUNTIME_VERSION#v}"
-          runtime_commit="$(git rev-parse HEAD)"
-
-          rm -rf release
-          mkdir -p release/runtime
-          cp dist/cli.exe "release/runtime/${{ matrix.binary_name }}"
-          printf '%s\n' "$runtime_version" > release/runtime/VERSION
-          printf '%s\n' "$runtime_commit" > release/runtime/COMMIT_SHA
-          if [[ "$OPENCODE_V2_DELIVERY" == bundled ]]; then
-            [[ -f dist/opencode-delivery.json ]] || { echo "Packaged OpenCode delivery identity missing" >&2; exit 1; }
-            cp dist/opencode-delivery.json release/runtime/opencode-delivery.json
-            cp -R dist/local-cli release/runtime/local-cli
-            cp -R dist/bun release/runtime/bun
-          else
-            # Without OpenCode V2 the compiled runtime runs every command itself.
-            for leftover in dist/opencode-delivery.json dist/local-cli dist/bun; do
-              [[ ! -e "$leftover" ]] || { echo "OpenCode V2 delivery found in a release without V2: $leftover" >&2; exit 1; }
-            done
-          fi
-          # The managed Cursor assets are resolved beside the installed binary.
-          # Leaving them out of the archive turns automatic discovery into a
-          # manual staging step nobody performs on a real install.
-          [[ -d dist/cursor-managed ]] || { echo "Managed Cursor assets missing"; exit 1; }
-          cp -R dist/cursor-managed release/runtime/cursor-managed
-          (cd release && zip -qr "${{ matrix.archive_name }}" runtime)
 
       - name: Package runtime archive (Windows)
         if: runner.os == 'Windows'
@@ -421,14 +379,14 @@ jobs:
           Set-Content -Path release/runtime/VERSION -Value $runtimeVersion
           Set-Content -Path release/runtime/COMMIT_SHA -Value $runtimeCommit
           if ($env:OPENCODE_V2_DELIVERY -eq 'bundled') {
-            if (-not (Test-Path dist/opencode-delivery.json -PathType Leaf)) { throw "Packaged OpenCode delivery identity missing" }
+            if (-not (Test-Path dist/opencode-delivery.json -PathType Leaf)) { throw "Bundled OpenCode delivery identity missing" }
             Copy-Item dist/opencode-delivery.json release/runtime/opencode-delivery.json
+            if (Test-Path dist/opencode-v2-delivery.json) { Copy-Item dist/opencode-v2-delivery.json release/runtime/opencode-v2-delivery.json }
             Copy-Item dist/local-cli release/runtime/local-cli -Recurse
             Copy-Item dist/bun release/runtime/bun -Recurse
           } else {
-            # Without OpenCode V2 the compiled runtime runs every command itself.
-            foreach ($leftover in @('dist/opencode-delivery.json', 'dist/local-cli', 'dist/bun')) {
-              if (Test-Path $leftover) { throw "OpenCode V2 delivery found in a release without V2: $leftover" }
+            foreach ($leftover in @('dist/opencode-delivery.json', 'dist/opencode-v2-delivery.json', 'dist/local-cli', 'dist/bun')) {
+              if (Test-Path $leftover) { throw "Unexpected V2 files: $leftover" }
             }
           }
           # Resolved beside the installed binary; see the bash packaging step.
@@ -436,8 +394,14 @@ jobs:
           Copy-Item dist/cursor-managed release/runtime/cursor-managed -Recurse
           Compress-Archive -Path release/runtime -DestinationPath "release/${{ matrix.archive_name }}" -Force
 
+      - name: Stage qualified support and source sidecars
+        env:
+          RUNTIME_OPENCODE_V2: ${{ steps.opencode-v2.outputs.delivery }}
+        shell: bash
+        run: bun --no-install ./scripts/opencode-v2/delivery.ts stage-release '${{ matrix.platform }}'
+
       - name: Serve every staged V2 graph from the release archive
-        if: runner.os != 'Windows' && matrix.platform != 'win32-arm64' && steps.opencode-v2.outputs.delivery == 'bundled'
+        if: runner.os != 'Windows' && steps.opencode-v2.outputs.delivery == 'bundled'
         timeout-minutes: 10
         shell: bash
         env:
@@ -448,23 +412,81 @@ jobs:
           extracted="$RUNNER_TEMP/TEST-release-server-smoke"
           rm -rf "$extracted"
           mkdir -p "$extracted"
+          echo "packaged-server-smoke: extract_base"
           tar -xzf "release/$ARCHIVE_NAME" -C "$extracted"
-          "$extracted/runtime/bun/bun" --no-env-file scripts/opencode-v2/packaged-server-smoke.ts "$extracted/runtime" "$RUNNER_TEMP/packaged-server-smoke.json"
+          support_archive="$(bun --no-install -e 'console.log(JSON.parse(await Bun.file("dist/opencode-v2-delivery.json").text()).archive.file)')"
+          mkdir -p "$extracted/support"
+          echo "packaged-server-smoke: extract_support"
+          unzip -q "release/$support_archive" -d "$extracted/support"
+          echo "packaged-server-smoke: start_harness"
+          "$extracted/runtime/bun/bun" --no-install --no-env-file scripts/opencode-v2/packaged-server-smoke.ts "$extracted/runtime" "$extracted/support" "$RUNNER_TEMP/packaged-server-smoke.json"
 
-      - name: Serve every staged V2 graph from the release archive (Windows)
+      - name: Preserve packaged server startup evidence
+        if: always() && runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-server-proof-${{ matrix.platform }}-${{ needs.prepare-release.outputs.source_commit }}
+          path: |
+            ${{ runner.temp }}/packaged-server-smoke.json
+            ${{ runner.temp }}/packaged-server-smoke.json.progress.ndjson
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Prove native Windows V2 server and PTY from the release archives
         if: runner.os == 'Windows' && steps.opencode-v2.outputs.delivery == 'bundled'
         timeout-minutes: 10
         shell: pwsh
         env:
           ARCHIVE_NAME: ${{ matrix.archive_name }}
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+          EXPECTED_SOURCE_COMMIT: ${{ needs.prepare-release.outputs.source_commit }}
+          PR_HEAD_SHA: ${{ needs.prepare-release.outputs.source_commit }}
         run: |
           $ErrorActionPreference = "Stop"
           # Outside the checkout, so module resolution cannot fall back to the source install.
           $extracted = Join-Path $env:RUNNER_TEMP 'TEST-release-server-smoke'
           Remove-Item $extracted -Recurse -Force -ErrorAction SilentlyContinue
           Expand-Archive -Path "release/$env:ARCHIVE_NAME" -DestinationPath $extracted
-          & (Join-Path $extracted 'runtime/bun/bun.exe') --no-env-file scripts/opencode-v2/packaged-server-smoke.ts (Join-Path $extracted 'runtime') (Join-Path $env:RUNNER_TEMP 'packaged-server-smoke.json')
+          $base = Join-Path $extracted 'runtime'
+          $descriptor = Get-Content (Join-Path $base 'opencode-v2-delivery.json') -Raw | ConvertFrom-Json
+          $sourceCommit = (Get-Content (Join-Path $base 'COMMIT_SHA') -Raw).Trim()
+          $runtimeVersion = (Get-Content (Join-Path $base 'VERSION') -Raw).Trim()
+          if ($sourceCommit -cne $env:EXPECTED_SOURCE_COMMIT -or $descriptor.sourceCommit -cne $sourceCommit -or $descriptor.runtimeVersion -cne $runtimeVersion) { throw 'Release archive source identity mismatch' }
+          if ("$($descriptor.platform)-$($descriptor.arch)" -cne $env:EXPECTED_PLATFORM -or $descriptor.requiredBunVersion -cne '1.4.3') { throw 'Release archive Windows target mismatch' }
+          $supportArchive = $descriptor.archive.file
+          $supportHash = (Get-FileHash "release/$supportArchive" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($supportHash -cne $descriptor.archive.sha256 -or (Get-Item "release/$supportArchive").Length -ne $descriptor.archive.bytes) { throw 'Release support archive differs from its descriptor' }
+          $evidence = @{ schemaVersion = 1; ok = $false; sourceCommit = $sourceCommit; platform = $env:EXPECTED_PLATFORM; runtimeVersion = $runtimeVersion;
+            base = @{ file = "$([IO.Path]::GetFileNameWithoutExtension($env:ARCHIVE_NAME))-v$runtimeVersion.zip"; sha256 = (Get-FileHash "release/$env:ARCHIVE_NAME" -Algorithm SHA256).Hash.ToLowerInvariant() };
+            support = @{ file = $supportArchive; sha256 = $supportHash }; serverReceipt = 'packaged-server-smoke.json'; ptyReceipt = 'packaged-pty-smoke.json' }
+          $evidencePath = Join-Path $env:RUNNER_TEMP 'release-delivery-smoke.json'
+          $evidence | ConvertTo-Json -Depth 5 | Set-Content $evidencePath
+          Expand-Archive -Path "release/$supportArchive" -DestinationPath (Join-Path $extracted 'support')
+          $actualVersion = (& (Join-Path $base 'claude-multimodel.exe') --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualVersion -cne "$env:EXPECTED_CLAUDE_CODE_VERSION (Claude Code)") { throw 'Extracted compiled runtime version mismatch' }
+          $shippedBun = Join-Path $base 'bun/bun.exe'
+          $native = & $shippedBun --no-install --no-env-file -e 'console.log(JSON.stringify({platform:process.platform,arch:process.arch,version:Bun.version}))' | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or "$($native.platform)-$($native.arch)" -cne $env:EXPECTED_PLATFORM -or $native.version -cne $descriptor.requiredBunVersion) { throw 'Shipped Bun must execute natively at the descriptor version' }
+          $evidence.shippedBun = $native
+          & $shippedBun --no-install --no-env-file scripts/opencode-v2/packaged-server-smoke.ts $base (Join-Path $extracted 'support') (Join-Path $env:RUNNER_TEMP 'packaged-server-smoke.json')
           if ($LASTEXITCODE -ne 0) { throw 'Staged V2 server smoke failed' }
+          & $shippedBun --no-install --no-env-file scripts/opencode-v2/packaged-pty-smoke.ts $base (Join-Path $extracted 'support') (Join-Path $env:RUNNER_TEMP 'packaged-pty-smoke.json') $env:EXPECTED_PLATFORM
+          if ($LASTEXITCODE -ne 0) { throw 'Staged V2 PTY smoke failed' }
+          $evidence.ok = $true
+          $evidence | ConvertTo-Json -Depth 5 | Set-Content $evidencePath
+
+      - name: Preserve exact Windows release archive proof
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-release-proof-${{ matrix.platform }}-${{ needs.prepare-release.outputs.source_commit }}
+          path: |
+            ${{ runner.temp }}/release-delivery-smoke.json
+            ${{ runner.temp }}/packaged-server-smoke.json
+            ${{ runner.temp }}/packaged-server-smoke.json.progress.ndjson
+            ${{ runner.temp }}/packaged-pty-smoke.json
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Rename archive to versioned asset name
         id: versioned-archive
@@ -494,7 +516,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: runtime-${{ matrix.platform }}
-          path: release/${{ steps.versioned-archive.outputs.archive_name }}
+          path: |
+            release/${{ steps.versioned-archive.outputs.archive_name }}
+            release/agent-teams-opencode-v2-support-*.zip
+            release/metadata/${{ matrix.platform }}
           if-no-files-found: error
           retention-days: 1
 
@@ -547,16 +572,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          find release-flat -maxdepth 1 -type f -name 'agent-teams-runtime-*' -printf '%f\n' \
-            | sort > expected-assets.txt
-          if [[ "$(wc -l < expected-assets.txt)" -ne 7 ]]; then
-            echo "Expected exactly seven runtime release assets" >&2
-            cat expected-assets.txt >&2
-            exit 1
-          fi
+          # The generator validated every base/qualified support source and digest.
+          # Metadata sidecars remain private; only this complete derived roster is public.
+          cp release-flat/expected-assets.txt expected-assets.txt
+          [[ -s expected-assets.txt ]] || { echo "Runtime release roster is empty" >&2; exit 1; }
 
           release_id="$EXISTING_DRAFT_RELEASE_ID"
           if [[ -n "$release_id" ]]; then
+            # Preparation can precede this step by a full build. Re-read before
+            # deleting: published support assets are retained for installed apps.
+            current_release="$(gh api "repos/${TARGET_RELEASE_REPO}/releases/${release_id}")"
+            if ! jq -e --arg tag "$TARGET_RELEASE_TAG" '.draft == true and .tag_name == $tag' \
+              >/dev/null <<<"$current_release"; then
+              echo "Refusing to delete a published release or another runtime tag" >&2
+              exit 1
+            fi
             # Recreate the draft instead of deleting large assets one-by-one.
             # GitHub often returns 500 when deleting those zips in place.
             status="$(curl --silent --show-error \
@@ -659,6 +689,7 @@ jobs:
           TARGET_RELEASE_REPO: ${{ needs.prepare-release.outputs.target_repo }}
           TARGET_RELEASE_TAG: ${{ needs.prepare-release.outputs.target_tag }}
           RUNTIME_VERSION: ${{ needs.prepare-release.outputs.runtime_version }}
+          RUNTIME_SOURCE_COMMIT: ${{ needs.prepare-release.outputs.source_commit }}
         shell: bash
         run: |
           set -euo pipefail
@@ -679,17 +710,27 @@ jobs:
             exit 1
           fi
 
-          cat > expected-assets.txt <<EOF
-          agent-teams-runtime-SHA256SUMS-v${RUNTIME_VERSION}
-          agent-teams-runtime-darwin-arm64-v${RUNTIME_VERSION}.tar.gz
-          agent-teams-runtime-darwin-x64-v${RUNTIME_VERSION}.tar.gz
-          agent-teams-runtime-linux-x64-v${RUNTIME_VERSION}.tar.gz
-          agent-teams-runtime-manifest-v${RUNTIME_VERSION}.json
-          agent-teams-runtime-win32-arm64-v${RUNTIME_VERSION}.zip
-          agent-teams-runtime-win32-x64-v${RUNTIME_VERSION}.zip
-          EOF
+          manifest_name="agent-teams-runtime-manifest-v${RUNTIME_VERSION}.json"
+          curl --fail --silent --show-error --location \
+            "https://github.com/${TARGET_RELEASE_REPO}/releases/download/${TARGET_RELEASE_TAG}/${manifest_name}" \
+            --output public-runtime-manifest.json
+          jq --exit-status --arg version "$RUNTIME_VERSION" --arg commit "$RUNTIME_SOURCE_COMMIT" '
+            . as $manifest |
+            .version == $version and .sourceCommit == $commit and
+            (if has("opencodeV2Delivery") then
+              .bridgeProtocol == 1 and
+              ((.opencodeV2Delivery | keys) == [.assets | keys[] | select(($manifest.opencodeV2.qualified[.] | length) > 0)]) and
+              all(.opencodeV2Delivery | to_entries[];
+                . as $delivery | .value.runtimeVersion == $version and .value.sourceCommit == $commit and
+                .value.bridgeProtocol == 1 and (.value.platform + "-" + .value.arch) == .key and
+                .value.engineVersions == $manifest.opencodeV2.qualified[$delivery.key])
+            else (.version | split(".") | map(tonumber)) <= [0, 0, 145] end)
+          ' public-runtime-manifest.json >/dev/null
+          {
+            printf '%s\n' "agent-teams-runtime-SHA256SUMS-v${RUNTIME_VERSION}" "$manifest_name"
+            jq -r '.assets[].file, ((.opencodeV2Delivery // {}) | .[].archive.file)' public-runtime-manifest.json
+          } | sort > expected-assets.txt
           jq -r '.assets[].name' <<<"$release_json" | sort > actual-assets.txt
-          sort -o expected-assets.txt expected-assets.txt
           diff -u expected-assets.txt actual-assets.txt
 
           while IFS= read -r asset; do

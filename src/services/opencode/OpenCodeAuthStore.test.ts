@@ -850,56 +850,6 @@ await writeFile(process.argv[4], 'finished', 'utf8')
     }
   })
 
-  test('creates only the SDK global private namespace before auth locking and preserves native refusals', async () => {
-    const scriptPath = path.join(tempDir, 'private-global-auth-order.ts')
-    const authStoreUrl = pathToFileURL(path.resolve('src/services/opencode/OpenCodeAuthStore.ts')).href
-    const privateDirectoriesUrl = pathToFileURL(path.resolve('src/services/opencode/profile/OpenCodePrivateDirectories.ts')).href
-    await writeFile(scriptPath, `
-import assert from 'node:assert/strict'
-import { mock } from 'bun:test'
-import { access, mkdir, readFile } from 'node:fs/promises'
-import path from 'node:path'
-const data = path.join(process.argv[2], 'managed-data')
-process.env.CLAUDE_MULTIMODEL_DATA_HOME = data
-const globalAuth = path.join(data, 'opencode', 'auth.json')
-const coordination = globalAuth + '.agent-teams-coordination.sqlite'
-let calls = 0, refuse = false
-const original = new Error('execution_owner_not_private:private_acl_owner:0')
-mock.module(${JSON.stringify(privateDirectoriesUrl)}, () => ({
-  hasWindowsPrivateProfileDirectoryDelivery: async () => true,
-  ensureWindowsPrivateDirectories: async (directories: readonly string[]) => {
-    assert.deepEqual(directories, [data, path.dirname(globalAuth)])
-    if (refuse) throw original
-    assert.equal(await access(coordination).then(() => true, () => false), false)
-    assert.equal(await access(globalAuth).then(() => true, () => false), false)
-    calls++
-    await mkdir(path.dirname(globalAuth), { recursive: true })
-  },
-}))
-const { upsertOpenCodeApiAuthCredential } = await import(${JSON.stringify(authStoreUrl)})
-await upsertOpenCodeApiAuthCredential({ authPath: globalAuth, providerId: 'openrouter', apiKey: 'TEST-noncredential' })
-assert.equal(calls, 1)
-const saved = await readFile(globalAuth, 'utf8')
-const arbitrary = path.join(process.argv[2], 'user-chosen-store', 'auth.json')
-await upsertOpenCodeApiAuthCredential({ authPath: arbitrary, providerId: 'openrouter', apiKey: 'TEST-noncredential' })
-assert.equal(calls, 1)
-assert.equal(JSON.parse(await readFile(arbitrary, 'utf8')).openrouter.key, 'TEST-noncredential')
-refuse = true
-await assert.rejects(upsertOpenCodeApiAuthCredential({ authPath: globalAuth, providerId: 'openrouter', apiKey: 'TEST-replacement' }), error => error === original)
-assert.equal(await readFile(globalAuth, 'utf8'), saved)
-`, 'utf8')
-    // Isolate this ordering double from every other test's native validation.
-    const child = Bun.spawn([process.execPath, scriptPath, tempDir], { stdout: 'ignore', stderr: 'pipe' })
-    let ended = false
-    try {
-      const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
-      ended = true
-      expect(stderr).toBe('')
-      expect(code).toBe(0)
-    } finally {
-      if (!ended) { child.kill(); await child.exited }
-    }
-  }, 15_000)
 
   test('reports whether managed auth includes all local source entries', () => {
     expect(

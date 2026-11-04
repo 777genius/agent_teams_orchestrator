@@ -397,10 +397,17 @@ describe('Codex Native strict MCP launch safe e2e', () => {
       )
 
       expect(execStarted).toBe(false)
-      expect(JSON.stringify(params.mutableMessages)).toContain(
+      const assistantText = params.mutableMessages
+        .flatMap(message =>
+          message.type === 'assistant'
+            ? message.message.content.flatMap(block => block.type === 'text' ? [block.text] : [])
+            : [],
+        )
+        .join('\n')
+      expect(assistantText).toContain(
         'Strict Codex MCP launch could not load dynamic MCP config',
       )
-      expect(JSON.stringify(params.mutableMessages)).toContain(missingConfigPath)
+      expect(assistantText).toContain(missingConfigPath)
     } finally {
       setFlagSettingsInline(previousSettings)
       await rm(tempDirectory, { recursive: true, force: true })

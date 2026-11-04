@@ -26,7 +26,9 @@ if (version.status !== 0 || version.stdout.trim() !== '2.777.777 (Claude Code)')
 const home = mkdtempSync(path.join(tmpdir(), 'TEST-runtime-without-v2-'))
 try {
   const status = run(['runtime', 'status', '--provider', 'opencode', '--json'], {
-    PATH: '', HOME: home, USERPROFILE: home, APPDATA: path.join(home, 'appdata'), LOCALAPPDATA: path.join(home, 'local-appdata'),
+    PATH: process.platform === 'win32' ? path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32') : '',
+    ...(process.platform === 'win32' ? { SystemRoot: process.env.SystemRoot, ComSpec: process.env.ComSpec, WINDIR: process.env.SystemRoot } : {}),
+    HOME: home, USERPROFILE: home, APPDATA: path.join(home, 'appdata'), LOCALAPPDATA: path.join(home, 'local-appdata'),
     XDG_CONFIG_HOME: path.join(home, '.config'), XDG_CACHE_HOME: path.join(home, '.cache'), XDG_DATA_HOME: path.join(home, '.local', 'share'),
     CLAUDE_CONFIG_DIR: path.join(home, '.claude'), ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
   })

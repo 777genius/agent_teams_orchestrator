@@ -1,15 +1,17 @@
+import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import type { OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
-import { readWindowsRealpathFailure, type WindowsRealpathFailure } from './windows/OpenCodeV2WindowsRealpath.js'
 import path from 'node:path'
 import { readExecutionPlatformBirth } from './OpenCodeV2ExecutionPlatform.js'
 import filesystem, { lstat, open, readFile, readdir } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
-import { hashOpenCodeFile, readOpenCodePackageManifest, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
+import { hashOpenCodeFile, readOpenCodePackageManifest, readOpenCodeNativePackageMetadata, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
 import { assertExecutionSelectedModel, executionAssert, executionHash, executionRecord,
   type ExecutionSelectedModel, type ExecutionBirth } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { verifyOpenCodeV2ServerGraph } from './OpenCodeV2ServerGraph.js'
+import { resolveOpenCodeV2Delivery, verifyOpenCodeV2DeliveryFile, assertOpenCodeV2DeliveryFileRow,
+  type OpenCodeV2DeliveryBinding } from './OpenCodeV2DeliveryManifest.js'
 
-export type ExecutionGraph = Readonly<{ sha256: string; files: readonly Readonly<{ path: string; sha256: string }>[] }>
+export type ExecutionGraph = Readonly<{ sha256: string; files: readonly Readonly<{ path: string; sha256: string }>[]; delivery?: OpenCodeV2DeliveryBinding }>
 export type ExecutionSelection = Readonly<{
   agent: string; model: ExecutionSelectedModel
   permissions: readonly Readonly<{ action: string; resource: string; effect: 'allow' | 'deny' | 'ask' }>[]
@@ -35,6 +37,14 @@ export async function canonicalExecutionDirectory(directory: string): Promise<vo
   const info = await lstat(directory)
   executionAssert(info.isDirectory() && !info.isSymbolicLink(), 'execution_identity_mismatch')
 }
+/** POSIX keeps a profile private by owner and mode bits. Windows has no cheap owner check (its
+ * profiles inherit the user's ACL), so a canonical profile directory must at least stay off
+ * network shares and device namespaces; reparse points already fail canonicalExecutionDirectory. */
+export async function assertExecutionProfilePrivate(directory: string): Promise<void> {
+  const info = await lstat(directory)
+  executionAssert(process.platform === 'win32' ? !/^[\\/]{2}/.test(directory)
+    : info.uid === process.getuid?.() && (info.mode & 0o077) === 0, 'execution_profile_not_private')
+}
 const inside = (root: string, file: string) => file.startsWith(root + path.sep)
 export const executionProfileGuards = ['environment_hash', 'config_hash', 'home_mapping', 'path_containment',
   'database_type', 'models_type', 'models_hash', 'process_cwd', 'process_pwd', 'process_environment'] as const
@@ -47,7 +57,7 @@ export async function validateExecutionProfile(profile: OwnedNativeProfile): Pro
   else { executionAssert(profile.selection.agent.length > 0); assertExecutionSelectedModel(profile.selection.model) }
   await canonicalExecutionDirectory(profile.root)
   await canonicalExecutionDirectory(profile.directory)
-  executionAssert(await lstat(profile.root).then(info => process.platform === 'win32' || (info.mode & 0o077) === 0), 'execution_profile_not_private')
+  await assertExecutionProfilePrivate(profile.root)
   assertExecutionProfile(executionHash(profile.env) === profile.envSha256, 'environment_hash')
   executionAssert(Object.entries(profile.env).every(([key, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && typeof value === 'string' && !value.includes('\0')))
   executionAssert(!Object.keys(profile.env).some(key => /^(?:NODE_OPTIONS|NODE_PATH|BUN_.*|LD_.*|DYLD_.*|BASH_ENV|ENV|ZDOTDIR|SHELLOPTS)$/i.test(key)), 'execution_environment_injection')
@@ -58,13 +68,13 @@ export async function validateExecutionProfile(profile: OwnedNativeProfile): Pro
     APPDATA: 'appdata', LOCALAPPDATA: 'localappdata' })) {
     assertExecutionProfile(profile.env[key] === path.join(profile.root, relative), 'home_mapping')
     await canonicalExecutionDirectory(profile.env[key]!)
-    executionAssert(await lstat(profile.env[key]!).then(info => process.platform === 'win32' || (info.mode & 0o077) === 0), 'execution_profile_not_private')
+    await assertExecutionProfilePrivate(profile.env[key]!)
   }
   assertExecutionProfile(inside(profile.root, profile.config.directory) && inside(profile.root, profile.databasePath), 'path_containment')
   await canonicalExecutionDirectory(profile.config.directory)
   await canonicalExecutionDirectory(path.dirname(profile.databasePath))
   for (const directory of [profile.config.directory, path.dirname(profile.databasePath)]) {
-    executionAssert(await lstat(directory).then(info => process.platform === 'win32' || (info.mode & 0o077) === 0), 'execution_profile_not_private')
+    await assertExecutionProfilePrivate(directory)
   }
   const db = await lstat(profile.databasePath).catch(error => {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
@@ -79,7 +89,7 @@ export async function validateExecutionProfile(profile: OwnedNativeProfile): Pro
 }
 
 /** Receipt covers the owner's reviewed graph, including generated client and server dependencies. */
-export type ExecutionGraphFailure = Readonly<{ index: number; total: number; readPhase: 'realpath' | 'hash'; pathSha256: string; contentSha256: string; realpath?: WindowsRealpathFailure }>
+export type ExecutionGraphFailure = Readonly<{ index: number; total: number; readPhase: 'realpath' | 'hash'; pathSha256: string; contentSha256: string }>
 const originalGraphFailures = new WeakMap<Error, ExecutionGraphFailure>()
 export function readExecutionGraphFailure(error: unknown): ExecutionGraphFailure | undefined {
   return error instanceof Error ? originalGraphFailures.get(error) : undefined
@@ -108,7 +118,7 @@ export function createExecutionGraphValidationCohort(): ExecutionGraphValidation
   return async (pin, receipt, signal) => {
     signal?.throwIfAborted()
     admittedExecutionGraphRows(receipt)
-    const key = `${pin}\0${receipt.sha256}`
+    const key = `${pin}\0${receipt.sha256}\0${receipt.delivery?.root ?? ''}\0${receipt.delivery?.manifestSha256 ?? ''}`
     let shared = running.get(key)
     if (!shared) {
       const controller = new AbortController()
@@ -156,6 +166,8 @@ export async function validateExecutionGraph(pin: OpenCodeV2Pin, receipt: Execut
   progress?: (value: ExecutionGraphProgress) => void, signal?: AbortSignal) {
   signal?.throwIfAborted()
   const rows = admittedExecutionGraphRows(receipt)
+  const delivery = receipt.delivery ? await resolveOpenCodeV2Delivery(receipt.delivery) : undefined
+  const rowHashes = new Map(rows.map(row => [row.path, row.sha256]))
   progress?.({ phase: 'hash', completed: 0, total: rows.length })
   // Official graphs contain tens of thousands of independent files. Bound
   // concurrent reads instead of serializing each filesystem round trip.
@@ -174,11 +186,11 @@ export async function validateExecutionGraph(pin: OpenCodeV2Pin, receipt: Execut
         signal?.throwIfAborted()
         readPhase = 'hash'
         executionAssert(await hashOpenCodeFile(row.path, signal) === row.sha256, 'execution_graph_changed')
+        if (delivery && row.path.startsWith(delivery.binding.root + path.sep)) await verifyOpenCodeV2DeliveryFile(delivery, row.path, row.sha256)
         signal?.throwIfAborted()
         } catch (error) {
           if (error instanceof Error && typeof row.path === 'string' && !originalGraphFailures.has(error)) originalGraphFailures.set(error, Object.freeze({ index, total: rows.length, readPhase,
-            pathSha256: createHash('sha256').update(row.path).digest('hex'), contentSha256: /^[a-f0-9]{64}$/.test(row.sha256) ? row.sha256 : '0'.repeat(64),
-            ...(readWindowsRealpathFailure(error) ? { realpath: readWindowsRealpathFailure(error) } : {}) }))
+            pathSha256: createHash('sha256').update(row.path).digest('hex'), contentSha256: /^[a-f0-9]{64}$/.test(row.sha256) ? row.sha256 : '0'.repeat(64) }))
           throw error
         }
         completed++
@@ -195,7 +207,7 @@ export async function validateExecutionGraph(pin: OpenCodeV2Pin, receipt: Execut
   signal?.throwIfAborted()
   progress?.({ phase: 'closure', completed: rows.length, total: rows.length })
   signal?.throwIfAborted()
-  const graph = await verifyOpenCodeV2ServerGraph(pin)
+  const graph = await verifyOpenCodeV2ServerGraph(pin, receipt.delivery)
   signal?.throwIfAborted()
   executionAssert(rows.some(row => row.path === graph.modulePath && row.sha256 === graph.moduleSha256) &&
     rows.some(row => row.path === graph.effectPath), 'execution_graph_incomplete')
@@ -236,7 +248,10 @@ export async function validateExecutionGraph(pin: OpenCodeV2Pin, receipt: Execut
         const file = path.join(directory, item.name)
         executionAssert(!item.isSymbolicLink(), 'execution_graph_incomplete')
         if (item.isDirectory()) await walk(file)
-        else executionAssert(item.isFile() && listed.has(file), 'execution_graph_incomplete')
+        else {
+          executionAssert(item.isFile() && listed.has(file), 'execution_graph_incomplete')
+          if (delivery) assertOpenCodeV2DeliveryFileRow(delivery, file, rowHashes.get(file)!)
+        }
       }
     }
     await walk(root)
@@ -271,13 +286,22 @@ function dependencyPackageName(name: string, specification: unknown): string {
   return alias[1]!
 }
 
-export async function validateExecutionNative(native: ValidatedExecutionNative): Promise<void> {
+export async function validateExecutionNative(native: ValidatedExecutionNative, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted()
+  openCodeV2EngineVersion(native)
   executionAssert(await filesystem.realpath(native.executablePath) === native.executablePath && /^opencode(?:\.exe)?$/.test(path.basename(native.executablePath)), 'execution_identity_mismatch')
-  const metadata = executionRecord(await readOpenCodePackageManifest(path.join(path.dirname(path.dirname(native.executablePath)), 'package.json')))
-  const platform = process.platform === 'win32' ? 'windows' : process.platform
-  executionAssert(metadata.name === native.packageName && metadata.version === native.version &&
-    native.packageName.startsWith(`@opencode/cli-${platform}-${process.arch}`), 'execution_identity_mismatch')
-  executionAssert(await hashOpenCodeFile(native.executablePath) === native.executableSha256, 'execution_identity_mismatch')
+  const raw = await readOpenCodeNativePackageMetadata(native.executablePath)
+  if (native.origin === 'standalone') {
+    executionAssert(native.packageName === null && raw === undefined, 'execution_identity_mismatch')
+  } else {
+    executionAssert(native.origin === undefined || native.origin === 'npm', 'execution_identity_mismatch')
+    const metadata = executionRecord(raw)
+    const platform = process.platform === 'win32' ? 'windows' : process.platform
+    executionAssert(typeof native.packageName === 'string' && metadata.name === native.packageName && metadata.version === native.version &&
+      native.packageName.startsWith(`@opencode/cli-${platform}-${process.arch}`), 'execution_identity_mismatch')
+  }
+  executionAssert(await hashOpenCodeFile(native.executablePath, signal) === native.executableSha256, 'execution_identity_mismatch')
+  signal?.throwIfAborted()
   const handle = await open(native.executablePath, 'r')
   try {
     const header = Buffer.alloc(4); await handle.read(header, 0, 4, 0)
@@ -288,15 +312,7 @@ export async function validateExecutionNative(native: ValidatedExecutionNative):
 }
 
 export type { ExecutionBirth } from '../execution/OpenCodeV2ExecutionContracts.js'
-/** Native Linux ticks and Darwin process versions are never compared with a wall clock. */
+/** Linux start ticks with the boot ID; elsewhere the OS process creation time in UTC milliseconds. */
 export async function readExecutionBirth(pid: number): Promise<ExecutionBirth | null> {
-  if (process.platform === 'linux' || process.platform === 'darwin') return readExecutionPlatformBirth(pid)
-  // Windows birth is a native FILETIME identity. Do not substitute a POSIX
-  // process-start clock or treat a missing PID as proof that a process exited.
-  if (pid === process.pid && process.env.OPENCODE_V2_WINDOWS_PIPE) {
-    const { windowsExecutionSelfBirth } = await import('./windows/OpenCodeV2WindowsChildControl.js')
-    return windowsExecutionSelfBirth()
-  }
-  const { windowsBirth } = await import('./windows/OpenCodeV2WindowsExecution.js')
-  return windowsBirth(pid)
+  return readExecutionPlatformBirth(pid)
 }

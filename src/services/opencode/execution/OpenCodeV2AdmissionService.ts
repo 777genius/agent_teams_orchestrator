@@ -1,3 +1,4 @@
+import { parseOpenCodeV2GroupDelivery, type OpenCodeV2GroupDelivery } from '../bridge/OpenCodeV2GroupChat.js'
 import { readOriginalTerminal, verifyNativePayload, readExecutionCut, validateCut } from './OpenCodeV2TerminalSettlement.js'
 import type { ExecutionClient, ExecutionInbox, ExecutionLog, ExecutionMessage, ExecutionQueueInput } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 import { executionWasNotSubmitted } from '../transport/OpenCodeV2ExecutionFetch.js'
@@ -6,13 +7,14 @@ import { verifyExecutionSession } from './OpenCodeV2SessionService.js'
 import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord,
   type AdmissionRecord, type IntentIdentity, type SessionAuthority } from './OpenCodeV2ExecutionContracts.js'
 
-export type QueueIntent = { identity: IntentIdentity; input: ExecutionQueueInput; delivery: 'queue' }
+export type QueueIntent = { identity: IntentIdentity; input: ExecutionQueueInput; delivery: 'queue'; group?: OpenCodeV2GroupDelivery }
 function payload(input: ExecutionQueueInput): Record<string, unknown> {
   return { text: input.text, ...(input.files === undefined ? {} : { files: input.files }),
     ...(input.agents === undefined ? {} : { agents: input.agents }), ...(input.skills === undefined ? {} : { skills: input.skills }) }
 }
 function validateIntent(intent: QueueIntent, resumePolicy: boolean): string {
-  executionAssert(Object.keys(intent).sort().join(',') === 'delivery,identity,input')
+  executionAssert(Object.keys(intent).filter(key => key !== 'group').sort().join(',') === 'delivery,identity,input')
+  if (intent.group) executionAssert(executionHash(parseOpenCodeV2GroupDelivery(intent.group, intent.identity.localMessageId)) === executionHash(intent.group), 'GROUP_INVALID_ENVELOPE')
   executionAssert(intent.delivery === 'queue' && typeof resumePolicy === 'boolean' && intent.input.resume === resumePolicy)
   executionAssert(Object.keys(intent.input).every(k => ['nativeInputID', 'text', 'resume', 'files', 'agents', 'skills'].includes(k)), 'unsupported_v1_input')
   executionAssert(intent.input.nativeInputID === intent.identity.nativeInputID && typeof intent.input.text === 'string' && intent.input.text.trim().length > 0)

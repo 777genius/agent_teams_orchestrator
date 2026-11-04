@@ -1,6 +1,7 @@
 import { lstat, readdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveClaudeMultimodelPaths } from '../OpenCodeManagedPaths.js'
+import { normalizeOpenCodeProjectIdentity } from '../OpenCodeProjectIdentity.js'
 import type { OpenCodeConnectedProvider } from '../types.js'
 import { openCodeV2Delivered, openCodeV2Wire, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 
@@ -13,6 +14,16 @@ const KEY_INTEGRATIONS: readonly Readonly<{ providerId: string; displayName: str
   Object.freeze({ providerId: 'kimi-code-plan-global', displayName: 'Kimi For Coding (kimi.ai)' }),
   Object.freeze({ providerId: 'kimi-code-plan-cn', displayName: 'Kimi For Coding (kimi.com)' }),
 ])
+
+/** V1 extension providers that a V2 launch refuses before any native work. */
+export const OPENCODE_V2_UNSUPPORTED_EXTENSION_PROVIDER_IDS: readonly string[] = Object.freeze(['kiro', 'cursor-acp'])
+/** Provider ids that exist only for V1: the V1 Kimi plan, which the V2 catalog serves through
+ * the native integrations above under their own ids, and the V1 extension providers. A V2
+ * provider list never offers them; selection still never maps one id onto another. */
+const V1_ONLY_PROVIDER_IDS: ReadonlySet<string> = new Set(['kimi-for-coding', ...OPENCODE_V2_UNSUPPORTED_EXTENSION_PROVIDER_IDS])
+export function isOpenCodeV1OnlyProviderId(providerId: string): boolean {
+  return V1_ONLY_PROVIDER_IDS.has(providerId)
+}
 
 /** The setup form's single option; V2 connect admits exactly this id or none. */
 export const OPENCODE_V2_NATIVE_KEY_OPTION_ID = 'api:native'
@@ -56,7 +67,7 @@ export async function readOpenCodeV2ConnectedProviders(project: string, version:
       const connection = receipt.connection !== null && typeof receipt.connection === 'object' ? receipt.connection as Record<string, unknown> : {}
       const proof = receipt.proof !== null && typeof receipt.proof === 'object' ? receipt.proof as Record<string, unknown> : {}
       if (receipt.state !== 'complete' || connection.state !== 'connected' || typeof connection.providerId !== 'string' ||
-        proof.projectPath !== project || proof.opencodeVersion !== version) continue
+        proof.projectPath !== normalizeOpenCodeProjectIdentity(project) || proof.opencodeVersion !== version) continue
       connected.set(connection.providerId, { id: connection.providerId, authHint: 'api', source: 'credentials', credentialScopes: ['managed'] })
     } catch { /* An unreadable receipt is not evidence of a connection. */ }
   }

@@ -1,5 +1,4 @@
 import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises'
-import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import type { CurrentConfigEntry as CurrentEntry, FloorConfigEntry as FloorEntry } from '../compatibility/OpenCodeV2WireTypes.js'
@@ -13,35 +12,25 @@ export const openCodeV2ReadOverrides = {
 
 export type OpenCodeV2ReadRoots = Awaited<ReturnType<typeof createOpenCodeV2ReadRoots>>
 
-/** V2 host/catalog acquisition always requires the strict native Windows path. */
+/** Private read roots for one V2 host/catalog acquisition. */
 export async function createOpenCodeV2ReadRoots() {
-  return allocateOpenCodeReadRoots(process.platform === 'win32')
+  return allocateOpenCodeReadRoots()
 }
 
-/** Generation is unknown until --version returns. V1 standalone/ARM64 census
- * must not acquire a V2 capability; selected V2 still passes its strict adapter. */
+/** Generation is unknown until --version returns; the probe uses the same private roots. */
 export async function createOpenCodeVersionReadRoots() {
-  const nativeWindows = process.platform === 'win32' &&
-    await (await import('./OpenCodePrivateDirectories.js')).hasWindowsPrivateProfileDirectoryDelivery()
-  return allocateOpenCodeReadRoots(nativeWindows)
+  return allocateOpenCodeReadRoots()
 }
 
-async function allocateOpenCodeReadRoots(nativeWindows: boolean) {
-  const candidate = nativeWindows ? path.join(await realpath(tmpdir()), `opencode-v2-read-${randomUUID()}`) : null
-  const root = candidate ?? await realpath(await mkdtemp(path.join(tmpdir(), 'opencode-v2-read-')))
+async function allocateOpenCodeReadRoots() {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'opencode-v2-read-')))
   const roots = Object.fromEntries(['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']
     .map(key => [key, path.join(root, key)]))
   try {
-    if (nativeWindows) {
-      const { ensureWindowsPrivateDirectories } = await import('./OpenCodePrivateDirectories.js')
-      await ensureWindowsPrivateDirectories([root, ...Object.values(roots),
-        path.join(root, 'data', 'opencode'), path.join(root, 'config', 'opencode')], [root])
-    }
-    else await Promise.all(Object.values(roots).map(dir => mkdir(dir, { mode: 0o700 })))
+    await Promise.all(Object.values(roots).map(dir => mkdir(dir, { mode: 0o700 })))
     return { root, env: privateOpenCodeReadEnvironment(root), remove: () => rm(root, { recursive: true, force: true }) }
   } catch (error) {
-    // An uncertain Windows native acquisition remains available for diagnosis.
-    if (!nativeWindows) await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true })
     throw error
   }
 }

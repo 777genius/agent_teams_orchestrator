@@ -40,6 +40,12 @@ test('compaction discovery reads the fresh bound catalog, including archive stat
     await relayGroupAssistantText(reply, binding)
     await relayGroupAssistantText(reply, binding)
     expect(canonicalIds.size).toBe(1)
+    const beforeSilence = requests
+    await relayGroupAssistantText({ ...reply, text: '[[AGENT_TEAMS_NO_REPLY]]', message: { ...reply.message, from: 'bob' } }, binding)
+    await relayGroupAssistantText({ ...reply, text: 'Reading instructions first. [[AGENT_TEAMS_NO_REPLY]]', message: { ...reply.message, from: 'bob' } }, binding)
+    expect(requests).toBe(beforeSilence)
+    await relayGroupAssistantText({ ...reply, text: 'No reply needed; result is 42.', message: { ...reply.message, from: 'bob' } }, binding)
+    await relayGroupAssistantText({ ...reply, text: '[[AGENT_TEAMS_NO_REPLY]]', message: { ...reply.message, from: 'user' } }, binding)
     archived = true
     await expect(relayGroupAssistantText(reply, binding)).rejects.toThrow('HTTP 409')
     const recovered = await getFreshGroupChatDiscoveryPrompt('synthetic-groups', 'alice', binding)
@@ -49,7 +55,7 @@ test('compaction discovery reads the fresh bound catalog, including archive stat
     const failed = await getFreshGroupChatDiscoveryPrompt('synthetic-groups', 'alice', binding)
     expect(failed).toContain('Fresh group catalog unavailable')
     expect(failed).not.toContain('Fresh group catalog: []')
-    expect(requests).toBe(6)
+    expect(requests).toBe(8)
   } finally { server.stop(true) }
 })
 
@@ -250,4 +256,19 @@ describe('group reaction consumption at the mailbox completion boundary', () => 
     expect(findGroupMailboxReplyOutcome({ ...scope, messages: [submitted, useReaction(), reactionResult(saved), send] })).toBe('pending')
     expect(complete(messages).type).toBe('finalize')
   })
+})
+
+test('group fallback excludes only proven native commentary, preserving partial and unknown answers', () => {
+  const user = createUserMessage({ content: 'peer message', uuid: 'submit-phase' })
+  const commentary = createAssistantMessage({ content: 'Reading instructions first.' })
+  Object.assign(commentary.message, { codexNativeMessagePhase: 'commentary' })
+  const final = createAssistantMessage({ content: '[[AGENT_TEAMS_NO_REPLY]]' })
+  Object.assign(final.message, { codexNativeMessagePhase: 'final_answer' })
+  const fallback = (messages: Parameters<typeof findOrdinaryDirectReplyFallback>[0]['messages']) => findOrdinaryDirectReplyFallback({ messages, submitUserMessageUuid: user.uuid, excludeNativeCommentary: true })
+  expect(fallback([user, commentary, final])).toEqual({ text: '[[AGENT_TEAMS_NO_REPLY]]' })
+  for (const phase of [undefined, 'partial_answer', 'final_answer']) {
+    const answer = createAssistantMessage({ content: 'The answer is 42.' })
+    if (phase) Object.assign(answer.message, { codexNativeMessagePhase: phase })
+    expect(fallback([user, answer, final])?.text).toContain('The answer is 42.')
+  }
 })

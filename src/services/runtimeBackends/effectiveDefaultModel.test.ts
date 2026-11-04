@@ -80,7 +80,7 @@ describe('effective inherited Anthropic model', () => {
         const launchModel = getMainLoopModel()
         expect(launchModel).not.toBe(catalog.defaultLaunchModel)
         expect(getAnthropicDefaultLaunchModel(catalog)).toBe(launchModel)
-        expect(getAnthropicEffectiveDefaultModel(catalog)).toBe(launchModel)
+        expect(getAnthropicEffectiveDefaultModel(catalog)).toBeNull()
       }),
   )
 
@@ -145,11 +145,11 @@ describe('effective inherited Anthropic model', () => {
         ).toBe('opus[1m]')
         expect(
           getAnthropicEffectiveDefaultModel({ defaultLaunchModel: 'opus[1m]' }),
-        ).not.toContain('proxy')
+        ).toBeNull()
       }),
   )
 
-  test('saved model is honored when no model env applies', () =>
+  test('saved model is not presented as an environment default', () =>
     isolated(() => {
       setFlagSettingsInline({ model: 'saved-model' })
       resetSettingsCache()
@@ -157,7 +157,14 @@ describe('effective inherited Anthropic model', () => {
         getAnthropicEffectiveDefaultModel({
           defaultLaunchModel: 'first-listed',
         }),
-      ).toBe('saved-model')
+      ).toBeNull()
+    }))
+
+  test('does not expose a built-in catalog default without environment configuration', () =>
+    isolated(() => {
+      expect(getAnthropicEffectiveDefaultModel({ defaultLaunchModel: 'opus[1m]' })).toBeNull()
+      process.env.ANTHROPIC_MODEL = 'opus'
+      expect(getAnthropicEffectiveDefaultModel({ defaultLaunchModel: 'opus[1m]' })).toBeNull()
     }))
 
   test('unknown remains null and catalog alias remains the launch fallback', () =>

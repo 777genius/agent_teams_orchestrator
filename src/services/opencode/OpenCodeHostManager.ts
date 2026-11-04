@@ -1,3 +1,4 @@
+import { OPEN_CODE_LOADING_TIMEOUT_MS } from './OpenCodeLoadingBudget.js'
 import {
   readOpenCodeAuthority, requireOpenCodeAuthority, isKnownHostRegistry,
   normalizeKnownHostRegistry, normalizePersistentHostLeases, type PersistentHostRegistryShape,
@@ -38,7 +39,6 @@ import {
   openCodeProfileManager,
 } from './OpenCodeProfileManager.js'
 import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
-import { ensureWindowsPrivateDirectories, hasWindowsPrivateProfileDirectoryDelivery } from './profile/OpenCodePrivateDirectories.js'
 import {
   buildProcessAttributionSpawnEnv,
   mintProcessAttributionId,
@@ -60,8 +60,8 @@ import type {
   OpenCodePreparedProfile,
 } from './types.js'
 
-const OPEN_CODE_HOST_HEALTH_TIMEOUT_MS = 30_000
-const OPEN_CODE_HOST_HEALTH_TIMEOUT_MAX_MS = 60_000
+const OPEN_CODE_HOST_HEALTH_TIMEOUT_MS = OPEN_CODE_LOADING_TIMEOUT_MS
+const OPEN_CODE_HOST_HEALTH_TIMEOUT_MAX_MS = OPEN_CODE_LOADING_TIMEOUT_MS
 const OPEN_CODE_HOST_HEALTH_POLL_MS = 250
 const OPEN_CODE_HOST_HEALTH_REQUEST_TIMEOUT_MS = 1_000
 const OPEN_CODE_RESOLVED_CONFIG_FINGERPRINT_REQUEST_TIMEOUT_MS = 2_500
@@ -172,6 +172,24 @@ export function isOpenCodeHostProcessGoneError(
   error: unknown,
 ): error is OpenCodeHostProcessGoneError {
   return error instanceof OpenCodeHostProcessGoneError
+}
+
+/** The host has no registry record at all (startup cleanup removes a dead
+ * host's record) and the runtime pid the caller expected is provably absent
+ * (kernel ESRCH). It keeps the generic message so callers that do not opt in
+ * see no change. A present record, a live pid and EPERM never produce it. */
+export class OpenCodeUnregisteredHostProcessGoneError extends Error {
+  readonly code = 'unregistered_host_process_gone'
+  constructor(readonly pid: number) {
+    super('OpenCode existing host authority is unavailable or changed')
+    this.name = 'OpenCodeUnregisteredHostProcessGoneError'
+  }
+}
+
+export function isOpenCodeUnregisteredHostProcessGoneError(
+  error: unknown,
+): error is OpenCodeUnregisteredHostProcessGoneError {
+  return error instanceof OpenCodeUnregisteredHostProcessGoneError
 }
 
 export type OpenCodePersistentHostReconcileOptions = {
@@ -493,6 +511,7 @@ export function buildOpenCodeHostProfileIdentity(
 }
 
 export class OpenCodeHostManager {
+  private ownedHostAdmissionClosed = false
   private readonly startupLockReleases = new Set<Promise<void>>()
   private readonly pendingLifecycleCleanups = new Set<Promise<void>>()
 
@@ -982,10 +1001,6 @@ export class OpenCodeHostManager {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
       return null
-    }
-    if (path.relative(defaultPersistentRegistryPath(), path.resolve(registryPath)) === '' &&
-      await hasWindowsPrivateProfileDirectoryDelivery()) {
-      await ensureWindowsPrivateDirectories([resolveClaudeMultimodelPaths().data, path.dirname(registryPath)])
     }
     await mkdir(path.dirname(registryPath), { recursive: true, mode: 0o700 })
     const lockPath = `${registryPath}.lock`
@@ -1710,11 +1725,13 @@ export class OpenCodeHostManager {
     abortSignal?: AbortSignal,
   ): Promise<OpenCodeHostHandle> {
     const port = await this.allocateLoopbackPort()
+    if (this.ownedHostAdmissionClosed) throw new Error('OpenCode host manager is closing')
     const baseUrl = `http://127.0.0.1:${port}`
     await this.cleanupOpenTuiTempArtifactsIfUnused(profile.tmpPath).catch(() => undefined)
     // Minted before the spawn so every process below this host inherits it,
     // including the cursor-agent trees the runtime never sees.
     const attributionId = mintProcessAttributionId()
+    if (this.ownedHostAdmissionClosed) throw new Error('OpenCode host manager is closing')
     const child = this.spawnHost(profile, port, lifetime, attributionId)
 
     const diagnostics: string[] = []
@@ -1801,9 +1818,11 @@ export class OpenCodeHostManager {
   // A new launch can retire an orphaned record only while startup of its old
   // exact host is excluded. A matching dead registry entry is removed only after
   // terminal CAS evidence; absence is never inferred from health or registry errors.
+  // requireUnregistered admits only a host with no registry record, so the
+  // operation can never remove or rewrite a registered entry.
   async withConfirmedAbsentHostAuthority<T>(
     record: { hostKey: string; runtimePid?: number | null; expectedProcessStartedAtMs?: number
-      expectedSession?: OpenCodeHostLeaseInput & { projectPath: string } },
+      expectedSession?: OpenCodeHostLeaseInput & { projectPath: string }; requireUnregistered?: boolean },
     operation: () => Promise<T>,
     signal?: AbortSignal,
   ): Promise<T> {
@@ -1817,6 +1836,9 @@ export class OpenCodeHostManager {
         const registry = requireOpenCodeAuthority(await readOpenCodeAuthority(registryPath, isKnownHostRegistry),
           'host', () => ({ schemaVersion: 1, hosts: {} }))
         const hosts = registry.hosts
+        if (record.requireUnregistered && Object.hasOwn(hosts, record.hostKey)) {
+          throw new Error('OpenCode host closure requires no registry record, but one exists')
+        }
         const registered = hosts[record.hostKey]
         if (record.expectedProcessStartedAtMs !== undefined && (!registered || typeof registered !== 'object'
           || !('processStartedAtMs' in registered) || registered.processStartedAtMs !== record.expectedProcessStartedAtMs)) {
@@ -1868,12 +1890,22 @@ export class OpenCodeHostManager {
     hostKey: string,
     profile: OpenCodePreparedProfile,
     abortSignal?: AbortSignal,
+    expectedRuntimePid?: number,
   ): Promise<OpenCodeHostHandle> {
     return this.withPersistentHostStartupLock(hostKey, async () => {
       const cached = this.hosts.get(hostKey)
+      const registry = cached ? null : await this.readPersistentRegistry()
       const record = cached
         ? this.buildPersistentHostRecord(cached.handle)
-        : (await this.readPersistentRegistry()).hosts[hostKey]
+        : registry!.hosts[hostKey]
+      // Without any record there is no birth time to compare, so only ESRCH on
+      // the caller's pinned pid is typed; a reused pid is alive and stays generic.
+      if (registry && this.persistentRegistryPath
+        && !Object.hasOwn(registry.hosts, hostKey) && !this.pendingHosts.has(hostKey)
+        && expectedRuntimePid !== undefined
+        && await raceOpenCodeAbortSignal(this.inspectProcessLiveness(expectedRuntimePid), abortSignal) === 'gone') {
+        throw new OpenCodeUnregisteredHostProcessGoneError(expectedRuntimePid)
+      }
       if (!record || record.hostKey !== hostKey
         || record.projectPath !== profile.projectPath
         || record.profileRootKey !== profile.profileRootKey
@@ -1947,9 +1979,13 @@ export class OpenCodeHostManager {
       resolveConfigFingerprint?: boolean
       prewarmManagedSubscriptionPlugins?: boolean
       existingOnly?: boolean
+      /** existingOnly: the pid stored sessions are pinned to, used only to type
+       * a missing registry record whose process is provably gone. */
+      expectedRuntimePid?: number
       abortSignal?: AbortSignal
     } = {},
   ): Promise<OpenCodeHostHandle> {
+    if (this.ownedHostAdmissionClosed) throw new Error('OpenCode host manager is closing')
     if (params.abortSignal?.aborted) {
       throwOpenCodeAbortReason(params.abortSignal)
     }
@@ -1967,7 +2003,7 @@ export class OpenCodeHostManager {
       if (!hostKey || (profile.scopeToken && !hostKey.includes(`::scope:${profile.scopeToken}::`))) {
         throw new Error('OpenCode existing host requires an exact matching scoped host key')
       }
-      return this.retainExistingHost(hostKey, profile, params.abortSignal)
+      return this.retainExistingHost(hostKey, profile, params.abortSignal, params.expectedRuntimePid)
     }
     const binaryPath = resolveOpenCodeBinaryPath()
     const preparedBinaryIdentity = profile.env.AGENT_TEAMS_CURSOR_HOST_BINARY_IDENTITY
@@ -2246,6 +2282,9 @@ export class OpenCodeHostManager {
     kept: number
     diagnostics: string[]
   }> {
+    // Final command cleanup must also fence startups waiting on profile/port preparation.
+    // Registered/shared hosts remain governed by the existing ownership checks below.
+    this.ownedHostAdmissionClosed = true
     try {
       const registry = await this.readPersistentRegistry()
       let disposed = 0

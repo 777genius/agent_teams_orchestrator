@@ -4,7 +4,9 @@ import type { ExecutionBirth } from './OpenCodeV2ExecutionBinding.js'
 import { executionPlatformRetirementBudgetMs, requireExecutionPlatformRetirement } from './OpenCodeV2ExecutionPlatform.js'
 import { retainOpenCodeV2CleanupPhase, type ExecutionCleanupPhase } from '../execution/OpenCodeV2Diagnostics.js'
 
-export type ExecutionCleanupReceipt = Readonly<{ scopeClosed: true; processRetired: true; descendantsRetired: true; pid: number; birth: ExecutionBirth }>
+/** `descendantsRetired` is true only when the child's whole process group was checked empty
+ * (POSIX). Windows retires descendants best-effort with a tree kill and reports false. */
+export type ExecutionCleanupReceipt = Readonly<{ scopeClosed: true; processRetired: true; descendantsRetired: boolean; pid: number; birth: ExecutionBirth }>
 // Receipt identity, rather than caller-controlled fields, gates durable owner
 // release. Only launch-owned kernel retirement with private close ACK can mint one.
 const cleanupReceipts = new WeakSet<ExecutionCleanupReceipt>()
@@ -90,7 +92,7 @@ export async function retireExecutionChild(port: ExecutionRetirementPort, deadli
   if (evidence.pid !== port.pid || executionHash(evidence.birth) !== executionHash(port.birth)) fail('kernel-binding')
   if (closeDeadline !== undefined && Date.now() >= closeDeadline) fail('kernel-retirement', new Error('execution_timeout'))
   const receipt: ExecutionCleanupReceipt = Object.freeze({ scopeClosed: true, processRetired: true,
-    descendantsRetired: true, pid: evidence.pid, birth: evidence.birth })
+    descendantsRetired: evidence.descendants === 'process-group', pid: evidence.pid, birth: evidence.birth })
   cleanupReceipts.add(receipt)
   return receipt
 }
