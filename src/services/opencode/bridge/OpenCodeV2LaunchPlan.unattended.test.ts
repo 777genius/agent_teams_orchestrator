@@ -62,6 +62,7 @@ function envelope(): BridgeEnvelope {
       selectedModel: 'provider/model', skipPermissions: true, members: [{ name: 'worker' }] } }
 }
 beforeEach(async () => {
+  pin = '2.1.4'
   nativeSelectionCalls = 0; nativeReceiptCalls = 0; receiptControllers = []
   launchConfig = { config: { type: 'remote', enabled: true, url: 'http://127.0.0.1:1/mcp' }, source: 'env-override' }
   authContent = '{}\n'; metadataAuthIdentity = 'absent'
@@ -151,7 +152,7 @@ for (const version of titleVersions) test(`${version} probe-owned session title 
     expect(await calls[0]!.json()).toMatchObject({ id: member.originalSessionId, title: 'Agent Teams model verification' })
   } finally { await wire.dispose() }
 })
-for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} absent selected auth routes prepared profiles through native free-model readback while sealing paid keys`, async () => {
+for (const version of ['2.1.4'] as const) test(`${version} absent selected auth routes prepared profiles through native free-model readback while sealing paid keys`, async () => {
   pin = version
   const selection = await inspectOpenCodeV2SourceAvailability(envelope())
   const parent = path.join(root, 'profiles'); await mkdir(parent)
@@ -223,7 +224,7 @@ test('controller entries refuse directories, missing and non-absolute targets be
   await expect(inspectOpenCodeV2SourceAvailability(envelope())).rejects.toThrow('controller_entry_not_absolute')
   expect(receiptControllers).toEqual([])
 })
-for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} admits Linux and Darwin selection but fences unsupported hosts before identity reads`, async () => {
+for (const version of ['2.1.4'] as const) test(`${version} admits qualified Linux x64 and Darwin ARM64 selection but fences unsupported hosts before identity reads`, async () => {
   pin = version
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
   const arch = Object.getOwnPropertyDescriptor(process, 'arch')!
@@ -231,6 +232,7 @@ for (const version of ['2.0.0', '2.0.32'] as const) test(`${version} admits Linu
   try {
     for (const host of ['linux', 'darwin'] as const) {
       Object.defineProperty(process, 'platform', { ...platform, value: host })
+      Object.defineProperty(process, 'arch', { ...arch, value: host === 'darwin' ? 'arm64' : 'x64' })
       Object.defineProperty(process.versions, 'bun', { ...bun, value: openCodeBunVersion(host) })
       const selection = await inspectOpenCodeV2SourceAvailability(envelope())
       expect(selection.native.version).toBe(version)
