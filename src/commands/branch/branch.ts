@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from 'fs/promises'
 import { getOriginalCwd, getSessionId } from '../../bootstrap/state.js'
 import type { LocalJSXCommandContext } from '../../commands.js'
 import { logEvent } from '../../services/analytics/index.js'
+import { assertCodexNativeHistoryOperationSupportedForTranscript } from '../../services/codexNative/conversationHistoryGuard.js'
 import type { LocalJSXCommandOnDone } from '../../types/command.js'
 import type {
   ContentReplacementEntry,
@@ -238,6 +239,7 @@ export async function call(
   const originalSessionId = getSessionId()
 
   try {
+    await assertCodexNativeHistoryOperationSupportedForTranscript('fork')
     const {
       sessionId,
       title,

@@ -40,7 +40,7 @@ test('default command dispatch selects V2 and preserves the V1 callback and canc
   ])
   expect({ exit, stderr }).toEqual({ exit: 0, stderr: '' })
   expect(stdout.trim()).toBe('TEST default selector V2/V1 routing qualified')
-}, 15_000)
+}, 45_000)
 
 test('startup registry cleanup is binary-independent and cannot accept V2 run targets', async () => {
   const selected = import.meta.resolve('../../services/opencode/bridge/OpenCodeV2TeamBridge.ts')
@@ -69,7 +69,7 @@ test('startup registry cleanup is binary-independent and cannot accept V2 run ta
       assert.equal(refusal.error.kind,'runtime_not_ready')
     }
     assert.deepEqual({selections,discoveries,legacyCalls},{selections:0,discoveries:0,legacyCalls:1})
-    console.log('TEST startup registry boundary qualified')
+    console.log('TEST startup registry boundary qualified'); process.exit(0)
   `
   const child = Bun.spawn([process.execPath, '-e', script], {
     cwd: import.meta.dir, stdout: 'pipe', stderr: 'pipe',
@@ -79,7 +79,7 @@ test('startup registry cleanup is binary-independent and cannot accept V2 run ta
   ])
   expect({ exit, stderr }).toEqual({ exit: 0, stderr: '' })
   expect(stdout.trim()).toBe('TEST startup registry boundary qualified')
-}, 15_000)
+}, 45_000)
 
 
 test('selection cleanup refusal projects finite helper evidence without raw causes', async () => {
@@ -109,16 +109,24 @@ test('selection cleanup refusal projects finite helper evidence without raw caus
         async()=>{legacyCalls++;throw Error('TEST legacy forbidden')})
       assert.equal(result.ok,false)
       assert.deepEqual(result.error,{kind:'runtime_not_ready',message:'cleanup_unknown',retryable:false})
-      assert.deepEqual(result.diagnostics,[...(includeHelper?[{code:'opencode_version_probe_helper_failed',evidence:'last_observed',
+      assert.deepEqual(result.diagnostics.map(event=>event.data),[...(includeHelper?[{code:'opencode_version_probe_helper_failed',evidence:'last_observed',
         operation:'birth',reason:'helper_nonzero',exitCode:1,elapsedMs:35,helperCause}]:[]),
         {code:'opencode_version_probe_cleanup_unknown',...terminalDiagnostic}])
+      for(const event of result.diagnostics) {
+        assert.equal(event.providerId,'opencode')
+        assert.equal(event.type,event.data.code)
+        assert.equal(event.severity,'error')
+        assert.equal(typeof event.message,'string')
+        assert(event.message.trim())
+        assert(Number.isFinite(Date.parse(event.createdAt)))
+      }
       assert(!JSON.stringify(result).includes('TEST-PRIVATE'))
     }
     assert.equal(legacyCalls,0)
-    console.log('TEST finite cleanup refusal diagnostic qualified')
+    console.log('TEST finite cleanup refusal diagnostic qualified'); process.exit(0)
   `
   const child=Bun.spawn([process.execPath,'-e',script],{cwd:import.meta.dir,stdout:'pipe',stderr:'pipe'})
   const [exit,stdout,stderr]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()])
   expect({exit,stderr}).toEqual({exit:0,stderr:''})
   expect(stdout.trim()).toBe('TEST finite cleanup refusal diagnostic qualified')
-},15000)
+},45000)

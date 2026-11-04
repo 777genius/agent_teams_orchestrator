@@ -5,7 +5,7 @@ import { mkdtemp, rm, readFile, rename, chmod, writeFile, mkdir, symlink, lstat,
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { discoverOpenCodeV2Run, awaitOpenCodeV2RunMemberReadiness, isTransientOpenCodeV2ControlRead, parseRunControlRequest, readRunProcessIdentity, requestOpenCodeV2Run, reserveRunControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
+import { discoverOpenCodeV2Run, awaitOpenCodeV2RunMemberReadiness, isTransientOpenCodeV2ControlRead, parseRunControlRequest, readOpenCodeV2RunStop, readRunProcessIdentity, requestOpenCodeV2Run, reserveRunControlDirectory, serveOpenCodeV2RunControl, writeRunControlFile } from './OpenCodeV2RunControl.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 import type { RunControlRecord, RunUnixControlRecord } from './OpenCodeV2RunTypes.js'
 
@@ -359,3 +359,104 @@ describe('private run control with separate synthetic CLI processes', () => {
     } })).toThrow('run_control_invalid')
   })
 })
+
+describe('lost stop reply confirmation', () => {
+  const stoppedReceipt = { kind: 'stop', state: 'stopped', members: [{ memberId: 'worker', cleanup: { scopeClosed: true,
+    processRetired: true, descendantsRetired: true, pid: 4242, birth: { format: 'darwin-pidversion', value: '4242:1', bootId: null } },
+  errors: [] }] }
+  const lostStopCases = {
+    archive: 'confirms a timely stopped archive after owner retirement',
+    late: 'confirms an archive that lands inside the reconcile window',
+    corrupt: 'surfaces the archive custody refusal instead of the transport code',
+    unknown: 'keeps the original transport code when the archive is not stopped',
+  } as const
+  for (const variant of Object.keys(lostStopCases) as (keyof typeof lostStopCases)[])
+    test(`lost stop reply ${lostStopCases[variant]}`, async () => {
+      const parent = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-stop-drop-')))
+      const root = path.join(parent, 'stop-drop-data-root-'.repeat(4))
+      await mkdir(root, { mode: 0o700 })
+      const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
+      const owner = spawn(process.execPath, [peer, `serve-drop-${variant}`, root, JSON.stringify(binding)], { stdio: ['ignore', 'pipe', 'pipe'] })
+      try {
+        await ready(owner)
+        const record = await discoverOpenCodeV2Run(root, binding.teamId, binding.runId)
+        if (!record) throw new Error('TEST_record_missing')
+        requireUnixControl(record)
+        if (variant === 'late') void (async () => {
+          await new Promise(resolve => setTimeout(resolve, 250))
+          await writeRunControlFile(directory, 'tombstone.json', { binding })
+          await writeRunControlFile(directory, 'stop.json', { binding, receipt: stoppedReceipt })
+        })()
+        const pending = requestOpenCodeV2Run(record, { operation: 'stop' }, 5000)
+        if (variant === 'archive' || variant === 'late')
+          await expect(pending).resolves.toMatchObject({ kind: 'stop', state: 'stopped', ownerRetired: true })
+        else if (variant === 'corrupt') await expect(pending).rejects.toThrow(/^run_control_(changed|invalid)$/)
+        else await expect(pending).rejects.toThrow('run_control_disconnected')
+      } finally { await stopTestChild(owner); await rm(parent, { recursive: true, force: true }) }
+    }, 30_000)
+})
+test('lost stop reply confirmation stays finite while the wall clock is frozen', async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-stop-frozen-')))
+  const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
+  // The owner never answers, so no late diagnostic write can race the cleanup below.
+  const control = await serveOpenCodeV2RunControl(directory, binding, Date.now() + 60_000, 'a'.repeat(64),
+    () => new Promise<never>(() => {}))
+  const clock = Date.now()
+  const now = spyOn(Date, 'now').mockImplementation(() => clock)
+  try {
+    // The reply never arrives and no archive lands: only the original transport code may surface.
+    await expect(requestOpenCodeV2Run(control.record, { operation: 'stop' }, 1000)).rejects.toThrow('run_control_timeout')
+  } finally {
+    now.mockRestore()
+    await control.close()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 60_000)
+test('cleanup stop and status accept the 45s budget and pin the signed deadline while send keeps the 30s cap', async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-stop-budget-')))
+  const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
+  const origin = Date.now()
+  let clock = origin
+  const signed: number[] = []
+  const control = await serveOpenCodeV2RunControl(directory, binding, origin + 60_000, 'a'.repeat(64),
+    async (_request, operationDeadline) => { signed.push(operationDeadline); throw new Error('TEST_budget_observed') })
+  const now = spyOn(Date, 'now').mockImplementation(() => clock)
+  try {
+    for (const request of [{ operation: 'stop' } as const, { operation: 'status' } as const])
+      await expect(requestOpenCodeV2Run(control.record, request, 45_000)).rejects.toThrow('run_operation_unknown')
+    expect(signed).toEqual([origin + 45_000, origin + 45_000])
+    const send = { operation: 'send' as const, memberId: 'worker', originalSessionId: 'ses_TESToriginal',
+      intent: { delivery: 'queue' as const, identity: { requestId: 'request', deliveryAttemptId: 'attempt',
+        localMessageId: 'local', nativeInputID: 'msg_TESToriginal' },
+      input: { nativeInputID: 'msg_TESToriginal', text: 'TEST budget original', resume: true } } }
+    await expect(requestOpenCodeV2Run(control.record, send, 45_000)).rejects.toThrow('run_control_invalid')
+    expect(signed).toHaveLength(2)
+  } finally {
+    now.mockRestore()
+    await control.close()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 30_000)
+test('unix stop archive requires clean member receipts before any stopped claim', async () => {
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-stop-junk-')))
+  const directory = await reserveRunControlDirectory(root, binding, 'a'.repeat(64))
+  const deadline = Date.now() + 20_000
+  const control = await serveOpenCodeV2RunControl(directory, binding, deadline, 'a'.repeat(64),
+    async () => ({ kind: 'status', state: 'starting', members: [], deadline }))
+  try {
+    await writeRunControlFile(directory, 'tombstone.json', { binding })
+    const clean = { scopeClosed: true, processRetired: true, descendantsRetired: true, pid: 4242,
+      birth: { format: 'darwin-pidversion', value: '4242:1', bootId: null } }
+    for (const receipt of [
+      { kind: 'stop', state: 'stopped', members: [] },
+      { kind: 'stop', state: 'stopped', members: [{ memberId: 'worker', cleanup: null, errors: [] }] },
+      { kind: 'stop', state: 'stopped', members: [{ memberId: 'worker', cleanup: clean, errors: ['open_sesame'] }] },
+    ]) {
+      await writeRunControlFile(directory, 'stop.json', { binding, receipt })
+      await expect(readOpenCodeV2RunStop(control.record)).rejects.toThrow('run_control_invalid')
+    }
+  } finally {
+    await control.close()
+    await rm(root, { recursive: true, force: true })
+  }
+}, 30_000)

@@ -1,3 +1,4 @@
+import { writeChildOwnedTeammateRuntimeEvent } from '../../utils/swarm/teammateRuntimeEvents.js'
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources/messages.mjs'
 
 import { isSessionPersistenceDisabled } from '../../bootstrap/state.js'
@@ -6,13 +7,16 @@ import { convertSDKMessage } from '../../remote/sdkMessageAdapter.js'
 import type { AppState } from '../../state/AppState.js'
 import type { Message, StreamEvent } from '../../types/message.js'
 import type { EffortValue } from '../../utils/effort.js'
+import { isNotEmptyMessage } from '../../utils/messages.js'
 import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
 import { EMPTY_USAGE } from '../api/emptyUsage.js'
 import type { CodexAppServerApprovalRequestHandler } from './appServerApproval.js'
 import { executeCodexNativeTurn } from './turnExecutor.js'
+import type { CodexNativeConversationScope } from './conversationScope.js'
 
 type RunCodexNativeTurnInReplParams = {
   prompt: string | ContentBlockParam[]
+  conversationScope?: CodexNativeConversationScope
   cwd: string
   model: string
   effortValue: EffortValue | undefined
@@ -49,12 +53,26 @@ export async function runCodexNativeTurnInRepl(
   deps: RunCodexNativeTurnInReplDeps = {},
 ): Promise<void> {
   const executeTurn = deps.executeTurn ?? executeCodexNativeTurn
+  const promptText = typeof params.prompt === 'string' ? params.prompt : params.prompt
+    .flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
+  if (params.conversationScope === 'group') {
+    // Diagnostic facts only: never persist model/user text or private bootstrap context.
+    void writeChildOwnedTeammateRuntimeEvent({
+      type: 'group_context_prepared', source: 'codexNative.replTurnBridge',
+      detail: JSON.stringify({ promptChars: promptText.length,
+        hasGroupHistory: promptText.includes('<group_mailbox_history>'),
+        physicalMessageId: promptText.match(/Physical inbound ID: "([0-9a-f-]{36}:g:[0-9a-f]{24})"/)?.[1] ?? null }),
+    })
+  }
   const mutableMessages = [...params.transcriptMessages]
   const persistedTranscriptMessages = [...params.transcriptMessages]
+  const initialTranscriptLength = persistedTranscriptMessages.length
   let emittedAssistantError = false
+  const emittedMessageUuids = new Set<string>()
 
   for await (const sdkMessage of executeTurn({
     prompt: params.prompt,
+    conversationScope: params.conversationScope ?? 'direct',
     cwd: params.cwd,
     model: params.model,
     effortValue: params.effortValue,
@@ -76,6 +94,33 @@ export async function runCodexNativeTurnInRepl(
     }
 
     if (shouldSuppressResultMessage(sdkMessage, emittedAssistantError)) {
+      if (
+        sdkMessage.type === 'result' &&
+        sdkMessage.subtype === 'success' &&
+        !sdkMessage.is_error &&
+        !emittedAssistantError &&
+        !params.abortSignal?.aborted &&
+        emittedMessageUuids.size === 0
+      ) {
+        // SDK output omits empty assistants, but the live REPL mailbox needs
+        // the actual successful turn receipt. Preserve its original UUID;
+        // the UI still hides it through isNotEmptyMessage. Never infer one
+        // from a result or forward a failed/cancelled turn as completion.
+        // Existing live activity already proves delivery; appending an earlier
+        // empty receipt now would reorder the transcript's parent chain.
+        for (const message of persistedTranscriptMessages.slice(
+          initialTranscriptLength,
+        )) {
+          if (
+            message.type === 'assistant' &&
+            !isNotEmptyMessage(message) &&
+            !emittedMessageUuids.has(message.uuid)
+          ) {
+            emittedMessageUuids.add(message.uuid)
+            params.onReplEvent(message)
+          }
+        }
+      }
       continue
     }
 
@@ -83,6 +128,7 @@ export async function runCodexNativeTurnInRepl(
       convertToolResults: true,
     })
     if (converted.type === 'message') {
+      emittedMessageUuids.add(converted.message.uuid)
       params.onReplEvent(converted.message)
       continue
     }

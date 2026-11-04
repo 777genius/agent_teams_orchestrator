@@ -1,3 +1,4 @@
+import { classifyOpenCodeV2ProbeFailure } from './OpenCodeV2ProbeFailure.js'
 import path from 'node:path'
 import { realpath } from 'node:fs/promises'
 import { buildOpenCodeExecutionProof } from '../OpenCodeExecutionProof.js'
@@ -36,7 +37,7 @@ export async function captureOwnedV2ProbeAuthority(client: ExecutionBridgeClient
 /** An accepted queue receipt is insufficient: mint only from the original USER,
  * actual terminal lineage, actual selected assistant and unchanged live config/auth. */
 export async function buildOwnedV2ProbeProof(input: { client: ExecutionBridgeClient; authority: SessionAuthority;
-  captured: ProbeAuthority; intent: QueueIntent; admission: AdmissionRecord; expectedText: string; capabilitySnapshotId: string }):
+  captured: ProbeAuthority; intent: QueueIntent; admission: AdmissionRecord; expectedText: string; capabilitySnapshotId: string; unattendedTeam?: boolean }):
   Promise<Readonly<{ proof: OpenCodeExecutionProof | null; failure: RunProbeFailure | null }>> {
   const { client, authority, captured, intent } = input
   executionAssert(captures.has(captured), 'probe_capture_not_owned')
@@ -44,9 +45,13 @@ export async function buildOwnedV2ProbeProof(input: { client: ExecutionBridgeCli
   if (!terminal) return { proof: null, failure: null }
   // This state comes only from the branded original-input cut. Never emit the
   // provider's raw error/message/body or classify a bare idle snapshot.
-  if (terminal.state !== 'succeeded') return { proof: null,
-    failure: terminal.state === 'failed' ? 'native_execution_failed' : 'native_execution_cancelled' }
   const cut = requireOriginalTerminalCut(terminal)
+  if (terminal.state !== 'succeeded') {
+    const failures = cut.log.events.filter(event => event.type === 'session.execution.failed' &&
+      event.seq > (input.admission.beforeCursor ?? -1))
+    return { proof: null, failure: terminal.state === 'cancelled' ? 'native_execution_cancelled' :
+      classifyOpenCodeV2ProbeFailure(authority.model.providerID, failures.length === 1 ? failures[0]!.data.error : null) }
+  }
   const after = cut.log
   executionAssert(after.watermark === terminal.cursor && executionHash({ messages: { data: cut.messages, previous: null, next: null }, log: after }) === terminal.cutHash, 'probe_terminal_cut_changed')
   const assistantIDs = new Set(after.events.filter(event => event.type === 'session.step.started' &&
@@ -72,7 +77,7 @@ export async function buildOwnedV2ProbeProof(input: { client: ExecutionBridgeCli
   const host = { hostKey: authority.host.hostInstanceId, profileRootKey: captured.profile.profileRootKey,
     projectPath: authority.host.directory, projectBehaviorFingerprint: captured.profile.projectBehaviorFingerprint,
     baseUrl: endpoint.baseUrl, port: Number(new URL(endpoint.baseUrl).port), pid: endpoint.nativePID,
-    version: authority.host.pin, state: 'healthy' as const, profile: captured.profile,
+    version: authority.host.selectedCli.version, state: 'healthy' as const, profile: captured.profile,
     resolvedConfigFingerprint: captured.configFingerprint, diagnostics: [] }
   const snapshot: OpenCodeProvisioningSnapshot = { detected: true, hostHealthy: true,
     projectPath: authority.host.directory, profile: captured.profile, host,
@@ -81,7 +86,7 @@ export async function buildOwnedV2ProbeProof(input: { client: ExecutionBridgeCli
   // This proof stays private until the owning run's actual branded kernel
   // retirement and original owner process retirement have both succeeded.
   const proof = await buildOpenCodeExecutionProof({ selectedModel: `${authority.model.providerID}/${authority.model.id}`,
-    snapshot, capabilitySnapshotId: input.capabilitySnapshotId, verifiedAt: new Date().toISOString() }, {
+    snapshot, capabilitySnapshotId: input.capabilitySnapshotId, verifiedAt: new Date().toISOString(), unattendedTeam: input.unattendedTeam === true }, {
       resolveBinaryPath: () => authority.host.selectedCli.path, resolveBinaryIdentity: resolveOpenCodeBinaryHostIdentity,
     })
   return { proof, failure: null }

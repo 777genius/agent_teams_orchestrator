@@ -19,10 +19,11 @@ afterEach(() => {
   Object.defineProperty(process, 'platform', { value: originalPlatform })
 })
 
-function fixture(platform: NodeJS.Platform, durations: number[], closeAt = 1, initialBirthMs = 0) {
+function fixture(platform: NodeJS.Platform, durations: number[], closeAt = 1, initialBirthMs = 0,
+  options: { initialBirth?: number; posixQuery?: (budget: number) => Promise<string> } = {}) {
   Object.defineProperty(process, 'platform', { value: platform })
   let clock = 1_000_000, removed = 0, calls = 0
-  const budgets: number[] = []
+  const budgets: number[] = [], signals: number[] = []
   let reportFailure: ((failure: NativeHelperFailure) => void) | undefined
   const child = new EventEmitter() as ChildProcess
   Object.assign(child, { pid: 900_001, stdout: new PassThrough() })
@@ -50,20 +51,21 @@ function fixture(platform: NodeJS.Platform, durations: number[], closeAt = 1, in
     return { platform, selfPid: process.pid, now: () => clock, birth: async () => {
         clock += initialBirthMs
         if (initialBirthMs) close()
-        return null
+        return options.initialBirth ?? null
       },
-      tree: query, signal: () => { throw new Error('TEST unowned process signal') },
+      tree: query, signal: target => { signals.push(target); throw new Error('TEST unowned process signal') },
       alive: () => 'gone', taskkill: async () => { throw new Error('TEST unowned process kill') },
       sleep: async ms => { clock += ms } }
   })
   const posix = spyOn(native, 'query').mockImplementation(async (_command, _args, budget) => {
+    if (options.posixQuery) { budgets.push(budget); return options.posixQuery(budget) }
     await query(budget)
     return ''
   })
   restore.push(() => date.mockRestore(), () => launcher.mockRestore(), () => spawn.mockRestore(),
     () => ports.mockRestore(), () => posix.mockRestore())
   const roots = { root: '/TEST/private', env: {}, remove: async () => { removed++ } } as OpenCodeV2ReadRoots
-  return { run: () => readOpenCodeOwnedVersion('/TEST/native', roots), budgets,
+  return { run: () => readOpenCodeOwnedVersion('/TEST/native', roots), budgets, signals, close, advance: (ms: number) => { clock += ms },
     removed: () => removed, elapsed: () => clock - 1_000_000 }
 }
 
@@ -95,11 +97,72 @@ test('a hung Windows helper exhausts the original remainder without a retirement
   expect(f.removed()).toBe(0)
 })
 
+test('Darwin census can exceed two seconds while retaining physical cleanup proof', async () => {
+  const f = fixture('darwin', [2200])
+  expect(await f.run()).toBe('1.18.34\n')
+  expect(f.budgets).toEqual([5000])
+  expect(f.removed()).toBe(1)
+})
+
+test('Darwin cold native version can take thirty-two seconds and still requires physical retirement', async () => {
+  const f = fixture('darwin', [1000], 1, 32_000)
+  expect(await f.run()).toBe('1.18.34\n')
+  expect(f.elapsed()).toBe(33_000)
+  expect(f.budgets).toEqual([5000])
+  expect(f.removed()).toBe(1)
+})
+
+test('Darwin census budget is clipped to the original probe deadline', async () => {
+  const initialBirthMs = versionAcquisitionMs('darwin') + VERSION_CLEANUP_MS - 4000
+  const f = fixture('darwin', [1500], 1, initialBirthMs)
+  expect(await f.run()).toBe('1.18.34\n')
+  expect(f.budgets).toEqual([4000])
+  expect(f.elapsed()).toBe(initialBirthMs + 1500)
+  expect(f.removed()).toBe(1)
+})
+
+test('a hung Darwin census retains ownership without extending the probe deadline', async () => {
+  const f = fixture('darwin', [6000])
+  await expect(f.run()).rejects.toBeInstanceOf(OpenCodeVersionProbeCleanupError)
+  expect(f.budgets).toEqual([5000])
+  expect(f.elapsed()).toBe(5000)
+  expect(f.removed()).toBe(0)
+})
+
 test('POSIX process-table helpers keep their two-second cap', async () => {
   const f = fixture('linux', [1000])
   expect(await f.run()).toBe('1.18.34\n')
   expect(f.budgets).toEqual([2000])
   expect(f.removed()).toBe(1)
+})
+
+for (const reason of ['helper_timeout', 'helper_error'] as const) test(`POSIX ${reason} stays pending until helper close and refuses cleanup with finite diagnostics`, async () => {
+  const query = native.query
+  const helper = Object.assign(new EventEmitter(), { pid: 900_099, stdout: new PassThrough(), kill: () => true })
+  let launched!: () => void
+  const started = new Promise<void>(resolve => { launched = resolve })
+  const f = fixture('linux', [], 1, 0, { initialBirth: 10, posixQuery: budget =>
+    query('TEST-helper', [], budget, (() => { launched(); return helper }) as never) })
+  let settled = false
+  const work = f.run().then(() => { settled = true; throw new Error('TEST expected census refusal') }, error => { settled = true; return error })
+  await started
+  f.close()
+  f.advance(2000)
+  helper.emit('error', new Error(reason === 'helper_timeout' ? 'Native helper timed out' : 'TEST-PRIVATE path and provider body'))
+  await Promise.resolve()
+  expect(settled).toBe(false)
+  expect(f.removed()).toBe(0)
+  expect(f.signals).toEqual([])
+  helper.emit('close', 1)
+  const failure = await work
+  expect(failure).toBeInstanceOf(OpenCodeVersionProbeCleanupError)
+  expect(failure.helperFailure).toEqual({ operation: 'tree', reason, exitCode: null, elapsedMs: 2000 })
+  expect(failure.terminalDiagnostic).toMatchObject({ phase: 'census', guard: 'census_helper_failed', closed: true,
+    ended: true, exitCode: 0, birthsCount: 1, candidatesCount: 0, pendingCount: 0, lastGroupCount: null, remainingMs: 6000 })
+  expect(JSON.stringify(getOpenCodeVersionProbeDiagnostics(failure))).not.toContain('TEST-PRIVATE')
+  expect(f.budgets).toEqual([2000])
+  expect(f.signals).toEqual([])
+  expect(f.removed()).toBe(0)
 })
 
 function acquisitionFixture(mode: 'closed' | 'open' | 'exit-only' | 'late-close' | 'abort') {
@@ -324,7 +387,7 @@ test('darwin gone group member with reparented PPID requires absence and final c
   expect(f.trees()).toBeGreaterThanOrEqual(4)
   expect(f.removed()).toBe(1)
   expect(f.signalled).toEqual([])
-  expect(f.budgets.every(budget => budget > 0 && budget <= 2000)).toBe(true)
+  expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
   expect(f.events.slice(-2)).toEqual(['census:empty', 'remove'])
 })
 
@@ -604,7 +667,8 @@ test('Windows gone relay leaves a live child without parent birth and retains th
   // The hardened sameBirth anchor check reads the root state before the relay's
   // missing identity is observed gone.
   expect(f.aliveReads).toEqual([900_010, 900_011])
-  expect(f.trees()).toBe(1)
+  // The bounded recapture window adds one fresh census before the refusal.
+  expect(f.trees()).toBe(2)
   expect(f.leafReads()).toBe(1)
   expect(f.removed()).toBe(0)
   expect(f.signalled).toEqual([])
@@ -633,4 +697,103 @@ test('parent identity diagnostic projection bounds ancestry and excludes unrecog
     },
   })
   expect(JSON.stringify(diagnostic)).not.toContain('PRIVATE')
+})
+
+// CI census captures can race the parents' identity reads: a parent birth comes
+// back null behind a transient gone probe, or a child birth read is stale and
+// precedes its parent. The parent_identity guard may then recapture a bounded
+// number of times with the parents inside the capture window before granting
+// any signal authority, and must still refuse an unconfirmed genealogy.
+function parentIdentityRaceFixture(mode: 'parent-resolves' | 'child-resolves' | 'parent-persists') {
+  Object.defineProperty(process, 'platform', { value: 'win32' })
+  const root = 900_030, relay = 900_031, leaf = 900_032
+  let clock = 1_000_000, removed = 0, trees = 0, closed = false
+  const reads = new Map<number, number>(), signalled: number[] = [], budgets: number[] = []
+  const child = new EventEmitter() as ChildProcess
+  Object.assign(child, { pid: root, stdout: new PassThrough() })
+  const rows = [{ pid: root, ppid: process.pid }, { pid: relay, ppid: root }, { pid: leaf, ppid: relay }]
+  const readOf = (target: number) => {
+    reads.set(target, (reads.get(target) ?? 0) + 1)
+    return reads.get(target)!
+  }
+  const date = spyOn(Date, 'now').mockImplementation(() => clock)
+  const launcher = spyOn(portable, 'resolveDirectWindowsLauncher').mockReturnValue({ command: '/TEST/native', argsPrefix: [] })
+  const spawn = spyOn(portable, 'spawnPortableCli').mockImplementation(() => {
+    queueMicrotask(() => child.stdout!.emit('data', Buffer.from('1.19.0\n')))
+    return child
+  })
+  const ports = spyOn(native, 'nativePorts').mockImplementation(() => ({
+    platform: 'win32', selfPid: process.pid, now: () => clock,
+    birth: async (target: number, budget: number) => {
+      budgets.push(budget); clock += 10
+      const attempt = readOf(target)
+      if (target === root) return 10
+      if (target === relay) {
+        // The parent identity read races the capture window: null behind a
+        // transient gone probe, or persistently unreadable in the bad mode.
+        if (mode === 'parent-persists') return null
+        if (mode === 'parent-resolves' && attempt === 1) return null
+        return 20
+      }
+      if (target === leaf) {
+        if (attempt === 1) {
+          child.emit('exit', 0); child.emit('close', 0); closed = true
+          // A stale first read can precede its captured parent's birth.
+          return mode === 'child-resolves' ? 5 : 30
+        }
+        return 30
+      }
+      return null
+    },
+    tree: async (budget: number) => { budgets.push(budget); trees++; return trees <= 3 ? rows : [] },
+    alive: (target: number) => (!closed && (target === root || (target === relay && mode === 'child-resolves'))
+      ? 'alive' : 'gone') as 'alive' | 'gone' | 'unknown',
+    signal: (target: number) => { signalled.push(target); throw new Error('TEST must not signal uncaptured candidate') },
+    taskkill: async () => { throw new Error('TEST must not kill uncaptured candidate') },
+    sleep: async (ms: number) => { clock += ms },
+  }))
+  restore.push(() => date.mockRestore(), () => launcher.mockRestore(), () => spawn.mockRestore(), () => ports.mockRestore())
+  const roots = { root: '/TEST/private', env: {}, remove: async () => { removed++ } } as OpenCodeV2ReadRoots
+  return { run: () => readOpenCodeOwnedVersion('/TEST/native', roots), removed: () => removed,
+    trees: () => trees, reads, signalled, budgets, root, relay, leaf }
+}
+
+test('Windows parent_identity capture race recovers through bounded recapture with parents in the window', async () => {
+  const f = parentIdentityRaceFixture('parent-resolves')
+  expect(await f.run()).toBe('1.19.0\n')
+  // One raced capture, one bounded recapture, one confirmation recheck.
+  expect(f.reads.get(f.relay)).toBe(3)
+  expect(f.reads.get(f.leaf)).toBe(3)
+  expect(f.trees()).toBeGreaterThanOrEqual(4)
+  expect(f.removed()).toBe(1)
+  expect(f.signalled).toEqual([])
+  expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
+})
+
+test('Windows child_before_parent capture race recovers through bounded recapture', async () => {
+  const f = parentIdentityRaceFixture('child-resolves')
+  expect(await f.run()).toBe('1.19.0\n')
+  expect(f.reads.get(f.leaf)).toBe(3)
+  expect(f.removed()).toBe(1)
+  expect(f.signalled).toEqual([])
+})
+
+test('Windows parent_identity race that never confirms stays unknown after bounded recapture', async () => {
+  const f = parentIdentityRaceFixture('parent-persists')
+  let failure: unknown
+  try { await f.run() } catch (error) { failure = error }
+  expect(failure).toBeInstanceOf(OpenCodeVersionProbeCleanupError)
+  expect((failure as OpenCodeVersionProbeCleanupError).terminalDiagnostic).toMatchObject({
+    phase: 'addition_identity', guard: 'parent_identity', birthsCount: 1,
+    parentIdentity: {
+      reason: 'missing_parent_birth', pid: 900_032, ppid: 900_031, parentPid: 900_031,
+      childBirth: 30, parentBirth: null, parentCandidate: true, anchorPid: 900_030, additionIndex: 1,
+    },
+  })
+  // The refusal is bounded: at most three captures with parents in the window.
+  expect(f.reads.get(f.relay)).toBe(3)
+  expect(f.trees()).toBe(3)
+  expect(f.removed()).toBe(0)
+  expect(f.signalled).toEqual([])
+  expect(f.budgets.every(budget => budget > 0 && budget <= 5000)).toBe(true)
 })

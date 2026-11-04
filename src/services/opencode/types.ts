@@ -131,6 +131,8 @@ export type OpenCodeInventorySnapshot = {
   agents: OpenCodeAgentSummary[]
   authStorePath: string | null
   probeError: string | null
+  /** The V2 read was refused for a cause the user must fix (see OpenCodeV2RefusalReason); not transient. */
+  probeRefusal?: boolean
   diagnostics: string[]
 }
 

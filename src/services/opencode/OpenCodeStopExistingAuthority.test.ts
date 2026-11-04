@@ -2,7 +2,11 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, expect, test } from 'bun:test'
-import { OpenCodeHostManager } from './OpenCodeHostManager.js'
+import {
+  isOpenCodeHostProcessGoneError,
+  OpenCodeHostManager,
+  OpenCodeHostProcessGoneError,
+} from './OpenCodeHostManager.js'
 import { executeOpenCodeBridgeCommandEnvelope } from './OpenCodeBridgeCommandHandler.js'
 import { openCodeSessionStore } from './OpenCodeSessionStore.js'
 import { openCodeSessionBridge } from './OpenCodeSessionBridge.js'
@@ -156,6 +160,80 @@ test('existing-only host retention verifies identity and never spawns or cleans 
     }
     expect(spawned).toBe(0)
     expect(killed).toBe(0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('existing-only retention types a dead registered process as gone only on ESRCH proof', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-stop-gone-'))
+  const registryPath = path.join(root, 'hosts.json')
+  const profile = { ...baseProfile, projectPath: root, canonicalProjectPath: root, workingDirectoryPath: root }
+  try {
+    await writeFile(registryPath, JSON.stringify({ schemaVersion: 1, processIdentityFormat: 'platform-native-v2',
+      hosts: { [host.hostKey]: { ...host, profile: undefined, projectPath: root,
+        managedConfigFingerprint: profile.managedConfigFingerprint,
+        resolvedConfigFingerprint: profile.managedConfigFingerprint,
+        processStartedAtMs: 1000, updatedAt: new Date().toISOString() } } }))
+    // isProcessAlive=false is any failed signal, including EPERM on a live
+    // process. Only the kernel's ESRCH may become closure evidence.
+    for (const liveness of ['gone', 'unknown', 'alive'] as const) {
+      const manager = new OpenCodeHostManager({
+        persistentRegistryPath: registryPath,
+        spawnHostProcess: () => { throw new Error('must not spawn') },
+        killProcess: () => { throw new Error('must not kill') },
+        isProcessAlive: () => false,
+        inspectProcessLiveness: async () => liveness,
+        readProcessStartTimeMs: async () => 1000,
+        fetchJson: async () => { throw new Error('must not probe a dead host') },
+      })
+      let caught: unknown = null
+      try {
+        await manager.ensureHost({ projectPath: root, preparedProfile: profile, hostKey: host.hostKey, existingOnly: true })
+      } catch (error) {
+        caught = error
+      }
+      expect(isOpenCodeHostProcessGoneError(caught)).toBe(liveness === 'gone')
+      if (liveness === 'gone') {
+        expect((caught as Error).message).toBe('OpenCode existing host process is gone')
+        expect((caught as { code?: string }).code).toBe('host_process_gone')
+        expect((caught as OpenCodeHostProcessGoneError).pid).toBe(host.pid)
+      } else {
+        expect((caught as Error).message).toBe('OpenCode existing host process identity is unavailable or changed')
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('existing-only retention retries a transient identity read failure instead of rejecting', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'opencode-stop-identity-retry-'))
+  const registryPath = path.join(root, 'hosts.json')
+  const profile = { ...baseProfile, projectPath: root, canonicalProjectPath: root, workingDirectoryPath: root }
+  let identityReads = 0
+  try {
+    await writeFile(registryPath, JSON.stringify({ schemaVersion: 1, processIdentityFormat: 'platform-native-v2',
+      hosts: { [host.hostKey]: { ...host, profile: undefined, projectPath: root,
+        managedConfigFingerprint: profile.managedConfigFingerprint,
+        resolvedConfigFingerprint: profile.managedConfigFingerprint,
+        processStartedAtMs: 1000, updatedAt: new Date().toISOString() } } }))
+    const manager = new OpenCodeHostManager({
+      persistentRegistryPath: registryPath,
+      spawnHostProcess: () => { throw new Error('must not spawn') },
+      killProcess: () => { throw new Error('must not kill') },
+      isProcessAlive: () => true,
+      readProcessStartTimeMs: async () => {
+        identityReads += 1
+        if (identityReads === 1) throw new Error('transient identity read failure')
+        return 1000
+      },
+      sleepMs: async () => {},
+      fetchJson: async () => ({ status: 200, data: { healthy: true, version: '1.4.0' } }),
+    })
+    const acquired = await manager.ensureHost({ projectPath: root, preparedProfile: profile, hostKey: host.hostKey, existingOnly: true })
+    expect(acquired.pid).toBe(host.pid)
+    expect(identityReads).toBeGreaterThanOrEqual(2)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

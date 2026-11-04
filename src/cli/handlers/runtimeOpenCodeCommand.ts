@@ -44,6 +44,7 @@ export function startRuntimeCommandKeepAlive(deps: {
 export async function drainRuntimeOpenCodeCommandCleanup(deps: {
   disposeUnregisteredOwnedHosts?: () => Promise<unknown>
   drainPendingLateLockReleases?: () => Promise<void>
+  drainPendingHostLifecycleCleanups?: () => Promise<void>
   setTimeout?: RuntimeCommandSetTimeout
   clearTimeout?: RuntimeCommandClearTimeout
   timeoutMs?: number
@@ -54,6 +55,8 @@ export async function drainRuntimeOpenCodeCommandCleanup(deps: {
     ?? (() => openCodeHostManager.disposeUnregisteredOwnedHosts())
   const drainPendingLateLockReleases = deps.drainPendingLateLockReleases
     ?? (() => openCodeSessionStore.drainPendingLateLockReleases())
+  const drainPendingHostLifecycleCleanups = deps.drainPendingHostLifecycleCleanups
+    ?? (() => openCodeHostManager.drainPendingLifecycleCleanups())
   const setTimeoutFn = deps.setTimeout ?? setTimeout
   const clearTimeoutFn = deps.clearTimeout ?? clearTimeout
   const timeoutMs = deps.timeoutMs ?? OPENCODE_COMMAND_CLEANUP_TIMEOUT_MS
@@ -75,7 +78,11 @@ export async function drainRuntimeOpenCodeCommandCleanup(deps: {
           }
         }, error => { onDisposeError(error) }),
         drainPendingLateLockReleases(),
-      ]).then(() => 'completed' as const),
+      ]).then(async () => {
+        // A retained host may exit while the sibling session drain awaits I/O.
+        await drainPendingHostLifecycleCleanups()
+        return 'completed' as const
+      }),
       new Promise<'timed_out'>(resolve => {
         timeout = setTimeoutFn(() => resolve('timed_out'), timeoutMs)
         timeout.unref?.()

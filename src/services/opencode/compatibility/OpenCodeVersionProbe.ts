@@ -2,7 +2,7 @@ import type { ChildProcess } from 'node:child_process'
 import { open } from 'node:fs/promises'
 import path from 'node:path'
 import { resolveDirectWindowsLauncher, spawnPortableCli } from '../../../utils/portableCli.js'
-import { nativePorts, query, type NativeGeneration, type NativeHelperFailure, type NativeRow } from '../OpenCodeCursorAgentTreeKill.js'
+import { classifyNativeHelperFailure, nativePorts, query, type NativeGeneration, type NativeHelperFailure, type NativeRow } from '../OpenCodeCursorAgentTreeKill.js'
 import type { OpenCodeV2ReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
 import { boundOpenCodeRead } from '../transport/OpenCodeBoundedFetch.js'
 
@@ -26,7 +26,7 @@ export type OpenCodeProbeTerminalDiagnostic = Readonly<{
   guard: 'deadline' | 'protected_candidate' | 'candidate_alive' | 'candidate_unknown' | 'strict_candidate_census'
     | 'identity_missing' | 'identity_changed_live' | 'anchor_missing' | 'protected_addition' | 'parent_identity'
     | 'ancestry_changed' | 'signal_failed_live' | 'final_pending' | 'final_retirement' | 'census_unreadable'
-    | 'roots_remove' | 'unexpected'
+    | 'census_helper_failed' | 'roots_remove' | 'unexpected'
   closed?: boolean
   ended?: boolean
   exitCode?: number | null
@@ -81,12 +81,15 @@ export function getOpenCodeVersionProbeDiagnostics(error: unknown) {
 
 /** `--version` must print and close within this window. On a busy Windows
  * runner the native exe alone took 3-4 s and more than 5 s through the
- * runtime; the app's own version check allows 30 s. POSIX keeps 5 s. */
+ * runtime. Darwin cold starts on loaded hosts can exceed 30 s; give native
+ * acquisition bounded headroom without changing helper or cleanup budgets. */
 export function versionAcquisitionMs(platform: NodeJS.Platform = process.platform): number {
-  return platform === 'win32' ? 15_000 : 5_000
+  return platform === 'darwin' ? 60_000 : platform === 'win32' ? 15_000 : 5_000
 }
 /** Ownership cleanup keeps at least 3 s after acquisition. */
 export const VERSION_CLEANUP_MS = 3_000
+/** A raced capture-validation may recapture at most this often. */
+export const PARENT_IDENTITY_CAPTURES = 3
 
 type Member = NativeRow & { group: number | null; retired: boolean }
 // An observation deadline is not a retirement receipt. Keep unresolved owners
@@ -119,7 +122,7 @@ async function versionLauncher(executable: string): Promise<{ command: string; a
 
 /** Private --version admission, including children which inherit its stdout. */
 export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCodeV2ReadRoots,
-  signal?: AbortSignal): Promise<string> {
+  signal?: AbortSignal, acquisitionDeadlineMs?: number): Promise<string> {
   let child: ChildProcess | undefined
   let retired = false
   let helperFailure: NativeHelperFailure | null = null
@@ -138,7 +141,12 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     const launcher = await versionLauncher(executable)
     signal?.throwIfAborted()
     const ports = nativePorts({}, failure => { helperFailure = failure })
-    const acquisitionMs = versionAcquisitionMs(), deadlineMs = acquisitionMs + VERSION_CLEANUP_MS
+    // A passive display read may reduce acquisition, while owned retirement
+    // retains its normal cleanup allowance. Ordinary callers keep their budget.
+    if (acquisitionDeadlineMs !== undefined && (!Number.isFinite(acquisitionDeadlineMs) || acquisitionDeadlineMs <= Date.now()))
+      throw new Error('selection_unavailable')
+    const acquisitionMs = Math.min(versionAcquisitionMs(), acquisitionDeadlineMs === undefined ? Infinity : Math.max(1, acquisitionDeadlineMs - Date.now()))
+    const deadlineMs = acquisitionMs + VERSION_CLEANUP_MS
     const started = Date.now(), deadline = started + deadlineMs
     const acquisitionDeadline = started + acquisitionMs
     const preexisting = new Map<number, NativeGeneration>()
@@ -193,8 +201,8 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
     const pid = child.pid
     // Match processKill.ts's 5s Windows process-birth query budget: cold
     // PowerShell/WMI startup can exceed 2s. Every helper still uses the
-    // probe remainder; POSIX queries keep their 2s cap.
-    const helperTimeout = process.platform === 'win32' ? 5000 : 2000
+    // probe remainder; Darwin census also needs cold-start headroom. Linux keeps 2s.
+    const helperTimeout = process.platform === 'win32' || process.platform === 'darwin' ? 5000 : 2000
     let ended = false, closed = false, code: number | null = null
     let phase: OpenCodeProbeTerminalDiagnostic['phase'] = 'initial_birth'
     let terminalDiagnostic: OpenCodeProbeTerminalDiagnostic | undefined
@@ -296,7 +304,21 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
         .map(row => ({ ...row, group: null, retired: false }))
       // The detached POSIX spawn creates an isolated group. Unlike a PPID walk,
       // PGID membership still includes orphans after the leader has exited.
-      const text = await observe(query('ps', ['-e', '-o', 'pid=', '-o', 'ppid=', '-o', 'pgid=', '-o', 'stat='], Math.min(2000, cap())))
+      const started = Date.now()
+      let queryFailed = false
+      const census = query('ps', ['-e', '-o', 'pid=', '-o', 'ppid=', '-o', 'pgid=', '-o', 'stat='], Math.min(helperTimeout, cap()))
+        .catch(error => {
+          helperFailure = classifyNativeHelperFailure('tree', error, Math.min(deadlineMs, Date.now() - started))
+          queryFailed = true
+          throw error
+        })
+      let text: string
+      try { text = await observe(census) }
+      catch (error) {
+        // An observation deadline does not prove the helper has settled.
+        if (queryFailed) terminalDiagnostic = snapshot('census', 'census_helper_failed')
+        throw error
+      }
       const seen = new Set<number>()
       return text.trim().split('\n').filter(Boolean).map(line => {
         const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s*$/.exec(line)
@@ -437,48 +459,77 @@ export async function readOpenCodeOwnedVersion(executable: string, roots: OpenCo
           await ports.sleep(Math.min(25, cap()))
           continue
         }
-        const capturedAdditions: Member[] = []
-        const additionBirths = new Map<number, number>()
-        phase = 'addition_identity'
-        for (const row of additions) {
-          if (row.pid === process.pid || row.pid === process.ppid) throw cleanupUnknown('protected_addition')
-          const identity = await birth(row.pid)
-          if (identity === null) {
-            if (ports.alive(row.pid) !== 'gone') throw cleanupUnknown('identity_missing')
-            cap()
-            unownedCandidates.add(row.pid)
-            continue
-          }
-          additionBirths.set(row.pid, identity)
-          capturedAdditions.push(row)
-        }
         // Native census order does not guarantee parents precede children.
         // Validate the complete capture before publishing any signal authority.
-        for (const row of capturedAdditions) {
-          const parentBirth = process.platform === 'win32'
-            ? births.get(row.ppid) ?? additionBirths.get(row.ppid) : births.get(anchor!.pid)
-          const identity = additionBirths.get(row.pid)!
-          if (parentBirth === undefined || identity < parentBirth) {
-            // Explain this refusal using only the already captured census and
-            // births. No further OS reads confer ownership or signal authority.
-            const ancestry: Array<ParentIdentityDiagnostic['ancestry'][number]> = []
-            const seen = new Set<number>()
-            let ancestor: Member | undefined = row
-            while (ancestor && ancestry.length < 8 && !seen.has(ancestor.pid)) {
-              seen.add(ancestor.pid)
-              ancestry.push({ pid: ancestor.pid, ppid: ancestor.ppid,
-                capturedBirth: births.get(ancestor.pid) ?? null, censusIndex: rows.indexOf(ancestor) })
-              ancestor = ancestor.pid === pid ? undefined : rows.find(current => current.pid === ancestor!.ppid)
+        // A native capture can also race the parents' identity reads, so an
+        // unconfirmed batch is recaptured with its parents inside the capture
+        // window at most PARENT_IDENTITY_CAPTURES times before the refusal.
+        let capturedAdditions: Member[] = []
+        const additionBirths = new Map<number, number>()
+        let parentIdentity: ParentIdentityDiagnostic | undefined
+        let captureRows = rows, captureAdditions = additions
+        for (let attempt = 1;; attempt++) {
+          capturedAdditions = []
+          additionBirths.clear()
+          phase = 'addition_identity'
+          for (const row of captureAdditions) {
+            if (row.pid === process.pid || row.pid === process.ppid) throw cleanupUnknown('protected_addition')
+            const identity = await birth(row.pid)
+            if (identity === null) {
+              if (ports.alive(row.pid) !== 'gone') throw cleanupUnknown('identity_missing')
+              cap()
+              unownedCandidates.add(row.pid)
+              continue
             }
-            const parentPid = process.platform === 'win32' ? row.ppid : anchor!.pid
-            throw cleanupUnknown('parent_identity', {
-              reason: parentBirth === undefined ? 'missing_parent_birth' : 'child_before_parent',
-              pid: row.pid, ppid: row.ppid, parentPid, childBirth: identity, parentBirth: parentBirth ?? null,
-              parentCandidate: unownedCandidates.has(parentPid), anchorPid: anchor!.pid,
-              additionIndex: additions.indexOf(row), ancestry, ancestryTruncated: ancestor !== undefined,
-            })
+            additionBirths.set(row.pid, identity)
+            capturedAdditions.push(row)
           }
+          parentIdentity = undefined
+          for (const row of capturedAdditions) {
+            const parentBirth = process.platform === 'win32'
+              ? births.get(row.ppid) ?? additionBirths.get(row.ppid) : births.get(anchor!.pid)
+            const identity = additionBirths.get(row.pid)!
+            if (parentBirth === undefined || identity < parentBirth) {
+              // Explain this refusal using only the already captured census and
+              // births. No further OS reads confer ownership or signal authority.
+              const ancestry: Array<ParentIdentityDiagnostic['ancestry'][number]> = []
+              const seen = new Set<number>()
+              let ancestor: Member | undefined = row
+              while (ancestor && ancestry.length < 8 && !seen.has(ancestor.pid)) {
+                seen.add(ancestor.pid)
+                ancestry.push({ pid: ancestor.pid, ppid: ancestor.ppid,
+                  capturedBirth: births.get(ancestor.pid) ?? null, censusIndex: captureRows.indexOf(ancestor) })
+                ancestor = ancestor.pid === pid ? undefined : captureRows.find(current => current.pid === ancestor!.ppid)
+              }
+              const parentPid = process.platform === 'win32' ? row.ppid : anchor!.pid
+              parentIdentity = {
+                reason: parentBirth === undefined ? 'missing_parent_birth' : 'child_before_parent',
+                pid: row.pid, ppid: row.ppid, parentPid, childBirth: identity, parentBirth: parentBirth ?? null,
+                parentCandidate: unownedCandidates.has(parentPid), anchorPid: anchor!.pid,
+                additionIndex: captureAdditions.indexOf(row), ancestry, ancestryTruncated: ancestor !== undefined,
+              }
+              break
+            }
+          }
+          if (!parentIdentity || attempt >= PARENT_IDENTITY_CAPTURES) break
+          // Unreliable birth data: recapture only while a fresh full census
+          // still shows the captured rows and their parents inside the window.
+          const retryRows = await table()
+          const windowed = capturedAdditions.every(row => {
+            const parentPid = process.platform === 'win32' ? row.ppid : anchor!.pid
+            return retryRows.some(current => current.pid === row.pid && current.ppid === row.ppid) &&
+              (births.has(parentPid) || retryRows.some(current => current.pid === parentPid))
+          })
+          if (!windowed) break
+          captureRows = retryRows
+          captureAdditions = members(retryRows).filter(row => !births.has(row.pid))
         }
+        if (parentIdentity) {
+          phase = 'addition_identity'
+          throw cleanupUnknown('parent_identity', parentIdentity)
+        }
+        // A genealogy confirmed by recapture is no longer census-only.
+        for (const row of capturedAdditions) unownedCandidates.delete(row.pid)
         for (const [target, identity] of additionBirths) births.set(target, identity)
         if (additions.length) {
           const confirmationRows = await table()

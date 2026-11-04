@@ -3,8 +3,8 @@ import { Info as NativeProviderInfo } from '@opencode/schema/config/provider'
 import { Capabilities as NativeCapabilities } from '@opencode/schema/model'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
-import type { ConfigEntry as FloorEntry } from '@opencode/client-v2-floor'
-import type { ConfigEntry as CurrentEntry } from '@opencode/client'
+import { isOpenCodeV2Pin, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
+import type { CurrentConfigEntry as CurrentEntry, FloorConfigEntry as FloorEntry } from '../compatibility/OpenCodeV2WireTypes.js'
 import type { ExecutionSelection } from '../host/OpenCodeV2ExecutionBinding.js'
 import type { ExecutionMcpConfig } from '../transport/OpenCodeV2ExecutionClientFactory.js'
 
@@ -12,7 +12,7 @@ export type ExecutionConfigInfo = Extract<FloorEntry, { type: 'document' }>['inf
   Extract<CurrentEntry, { type: 'document' }>['info']
 export type ExecutionProviderModels = NonNullable<NonNullable<ExecutionConfigInfo['providers']>[string]['models']>
 export type ExecutionConfigInput = {
-  pin: '2.0.0' | '2.0.32'
+  pin: OpenCodeV2Pin
   selection: ExecutionSelection
   /** Autonomous team profiles cannot wait for an interactive form response. */
   unattendedTeam?: boolean
@@ -20,13 +20,30 @@ export type ExecutionConfigInput = {
   provider?: Readonly<{ package?: string; baseURL?: string; models?: ExecutionProviderModels }>
 }
 
+/** V2 teammates get the same tools as V1 teammates in auto approval mode
+ * (buildOpenCodeTeammatePermission('auto')): everything is denied except reading and
+ * searching files, editing them, running shell commands, the todo list and the team
+ * controller tools. Subagents and paths outside the project stay denied. The last
+ * matching rule wins, so the catch-all deny comes first.
+ * Code mode (`execute`) stays denied: it also offers tools that skip permission checks
+ * (fetch, worktree removal). The team MCP server is therefore registered with
+ * `codemode: false`, so its tools are direct tools the rules above admit by name. */
+export const OPENCODE_V2_TEAMMATE_PERMISSIONS: ExecutionSelection['permissions'] = Object.freeze([
+  { action: '*', resource: '*', effect: 'deny' as const },
+  ...['read', 'glob', 'grep', 'todowrite', 'edit', 'shell'].map(action => ({ action, resource: '*', effect: 'allow' as const })),
+  { action: 'subagent', resource: '*', effect: 'deny' as const },
+  { action: 'external_directory', resource: '*', effect: 'deny' as const },
+  ...['agent-teams_*', 'agent_teams_*', 'mcp__agent-teams__*', 'mcp__agent_teams__*']
+    .map(action => ({ action, resource: '*', effect: 'allow' as const })),
+].map(rule => Object.freeze(rule)))
+
 /** Selected profile overrides, never ambient HOME/config/auth discovery. The profile owner
  * persists this document before acquiring its lease. Readiness verifies the selected rules. */
 export function createOpenCodeV2ExecutionConfig(input: ExecutionConfigInput): {
   info: ExecutionConfigInfo; content: string; sha256: string
 } {
   const { pin, selection, controller } = input
-  if ((pin !== '2.0.0' && pin !== '2.0.32') || !/^[A-Za-z0-9_-]{1,256}$/.test(selection.agent) ||
+  if (!isOpenCodeV2Pin(pin) || !/^[A-Za-z0-9_-]{1,256}$/.test(selection.agent) ||
     controller.server !== 'agent-teams' || !selection.model.providerID || !selection.model.id ||
     selection.permissions.length === 0) throw new Error('v2_execution_selection_invalid')
   if (selection.model.variant !== undefined && !selection.model.variant) throw new Error('v2_execution_selection_invalid')
@@ -48,9 +65,8 @@ export function createOpenCodeV2ExecutionConfig(input: ExecutionConfigInput): {
   }
   const selectedModel = { providerID: selection.model.providerID, model: selection.model.id,
     ...(selection.model.variant === undefined ? {} : { variant: selection.model.variant }) }
-  const nativeMcp = mcp.type === 'local'
-    ? { ...mcp, command: [...mcp.command], ...(process.platform === 'win32' ? { disabled: true } : {}) }
-    : { ...mcp, ...(process.platform === 'win32' ? { disabled: true } : {}) }
+  // Direct tools, never code mode: see OPENCODE_V2_TEAMMATE_PERMISSIONS.
+  const nativeMcp = mcp.type === 'local' ? { ...mcp, command: [...mcp.command], codemode: false } : { ...mcp, codemode: false }
   const info = {
     update: 'disable', share: 'disabled', snapshots: false, warming: false,
     plugins: input.unattendedTeam === true ? ['-opencode.tool.question'] : [],

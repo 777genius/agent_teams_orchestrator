@@ -27,7 +27,20 @@ describe('buildCodexNativeMcpConfigOverrides', () => {
       'mcp_servers.agent-teams.command="/usr/local/bin/node"',
       'mcp_servers.agent-teams.args=["/tmp/agent-teams/index.js"]',
       'mcp_servers.agent-teams.env.TEAMS_ENV="1"',
+      'mcp_servers.agent-teams.required=true',
       'mcp_servers.agent-teams.default_tools_approval_mode="approve"',
+    ])
+  })
+
+  test('does not require unrelated optional MCP servers', () => {
+    const overrides = buildCodexNativeMcpConfigOverrides({
+      mcpConfigEntries: [JSON.stringify({ mcpServers: {
+        optional: { command: '/TEST/optional', args: [] },
+      } })],
+    })
+    expect(overrides).toEqual([
+      'mcp_servers.optional.command="/TEST/optional"',
+      'mcp_servers.optional.args=[]',
     ])
   })
 
@@ -82,6 +95,7 @@ describe('buildCodexNativeMcpConfigOverrides', () => {
       expect(overrides).toEqual([
         'mcp_servers.agent-teams.command="/opt/homebrew/bin/node"',
         'mcp_servers.agent-teams.args=["/tmp/mcp/index.js"]',
+        'mcp_servers.agent-teams.required=true',
         'mcp_servers.agent-teams.default_tools_approval_mode="approve"',
       ])
     } finally {

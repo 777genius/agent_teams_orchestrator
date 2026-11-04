@@ -1,7 +1,7 @@
 import { parseOpenCodePromptFileParts, SUPPORTED_COMMANDS, validateEnvelope, type BridgeEnvelope } from './bridge/OpenCodeBridgeProtocol.js'
 import { openCodeDeliveryJournalRecoveryData, teamDiagnosticToOutcomeString, commandStatusFromOutcomeStatus, isAcceptedOutcomeStatus, outcomeSendMessageDataToCommandData, commandStatusMismatchReason, type CommandStatusCommandData, markSendMessageOutcome, type SendMessageCommandData, type SendMessageOutcomeBase, type TeamDiagnostic } from './bridge/OpenCodeBridgeDeliveryJournal.js'
 import { drainStartupTaskkills, pendingStartupTaskkillPids } from '../../utils/processKill.js'
-import { buildOpenCodeGroupChatRunProof, type OpenCodeGroupChatRunProof } from './OpenCodeGroupChatCapability.js'
+import { buildOpenCodeGroupChatRunProof, readOwnedOAuthGroupControlBinding, type OpenCodeGroupChatRunProof } from './OpenCodeGroupChatCapability.js'
 import { isBoundGroupChatControl, readFreshGroupChatCatalog } from '../../utils/groupChatControlClient.js'
 import { assertValidGroupMailboxRows, buildGroupMailboxPrompt, hasGroupMailboxMarker } from '../../utils/groupMailbox.js'
 import { OpenCodeStartupCleanupBudget } from './OpenCodeStartupCleanupBudget.js'
@@ -63,16 +63,22 @@ import { resolveOpenCodeProviderScopedModel } from './OpenCodeModelResolver.js'
 import { parseOpenCodeProviderScopedModelRef } from './OpenCodeModelRef.js'
 import { canonicalizeOpenCodeProviderId } from './OpenCodeProviderIdentity.js'
 import { resolveOpenCodeCursorManagedAssets } from './OpenCodeCursorManagedAssets.js'
-import { buildManagedConfigFingerprint, canonicalizeOpenCodeProjectPath, openCodeProfileManager } from './OpenCodeProfileManager.js'
+import { applyOpenCodeManagedPathsToAppMcpLaunchConfig, buildManagedConfigFingerprint, canonicalizeOpenCodeProjectPath, openCodeProfileManager } from './OpenCodeProfileManager.js'
+import { resolveClaudeMultimodelPaths } from './OpenCodeManagedPaths.js'
 import { normalizeOpenCodePermissions } from './OpenCodePermissionNormalizer.js'
 import { openCodeProvisioningProbe, type OpenCodeAuthorityRejection } from './OpenCodeProvisioningProbe.js'
 import { normalizeOpenCodeProjectIdentity } from './OpenCodeProjectIdentity.js'
-import { openCodeHostManager } from './OpenCodeHostManager.js'
+import {
+  isOpenCodeHostProcessGoneError,
+  isOpenCodeUnregisteredHostProcessGoneError,
+  openCodeHostManager,
+} from './OpenCodeHostManager.js'
 import {
   PROCESS_ATTRIBUTION_SCHEMA_VERSION,
   resolveProcessAttributionDirectory,
 } from './OpenCodeProcessAttributionStore.js'
 import {
+  beforeOpenCodePromptSubmission,
   isOpenCodeRuntimeDeadlineError,
   OpenCodeRuntimeDeadline,
   raceOpenCodeAbortSignal,
@@ -660,7 +666,7 @@ function buildOpenCodeRuntimeIdentityBlock(input: {
           'If the briefing says there are no actionable tasks, stay idle silently.',
         ]
       : [
-          input.groupChatId ? 'For this group delivery, use group_chat_send in the explicit group with the physical inbound relayOfMessageId for requested or substantive replies. For an optional informational acknowledgement, use group_chat_react with the same group and physical inbound relayOfMessageId. After success stop; never send an extra OK or answer a reaction.' : 'For this delivered app message, prioritize the requested visible reply through message_send.',
+          input.groupChatId ? 'For this group delivery, use group_chat_send in the explicit group with the physical inbound relayOfMessageId for requested or substantive replies. For an optional informational acknowledgement, use group_chat_react with the same group and physical inbound relayOfMessageId. After success stop; never send an extra OK or answer a reaction. When a peer message needs no response, finish with exactly [[AGENT_TEAMS_NO_REPLY]] as the entire final text; never publish this marker through a message tool. Do not explain that no reply is needed.' : 'For this delivered app message, prioritize the requested visible reply through message_send.',
           'Only send a visible message when you are replying to this delivered app message or reporting real task/blocker/result context.',
           'Do not send unrelated readiness, understood, idle, or no-task acknowledgements.',
         ]),
@@ -734,11 +740,70 @@ function expectedCapabilitySnapshotId(body: Record<string, unknown>): string | n
     ?? asString(body.expectedCapabilitySnapshotId)
 }
 
+type StoredLaneAuthority = {
+  snapshot: OpenCodeProvisioningSnapshot | null
+  records: OpenCodeSessionRecord[]
+  release: (keepAlive?: boolean) => Promise<void> | void
+  confirmedStopRuntime?: ConfirmedStopRuntime
+  deliveryRuntime?: ReturnType<typeof createRuntimeSnapshot>
+  hostGone?: boolean
+  /** Set with hostGone when the host has no registry record left; the pid
+   * every stored session of the run is pinned to. */
+  unregisteredHostPid?: number
+  signal?: AbortSignal
+  assertOwner?: () => Promise<void>
+  ownedOAuthHost?: { hostKey: string; pid: number; baseUrl: string }
+}
+
+// Receipts attest a confirmed Stop. When none exist, cleanup binds the exact
+// desktop-persisted launch capability instead, never a capability derived from
+// current provider state.
+async function resolveStoredStopRuntime(
+  authorityRecords: OpenCodeSessionRecord[],
+  legacyInput: { teamsPath: string; teamId: string; laneId: string; runId: string },
+  options: { legacyCursor: boolean },
+): Promise<ConfirmedStopRuntime> {
+  const receiptRuntime = options.legacyCursor
+    ? undefined
+    : authorityRecords.find(record => record.stopAuthority)?.stopAuthority?.runtime
+  if (receiptRuntime) return receiptRuntime
+  const legacyVersion = authorityRecords[0]?.opencodeVersion ?? null
+  return {
+    providerId: 'opencode',
+    binaryPath: 'opencode',
+    binaryFingerprint: legacyVersion ? `version:${legacyVersion}` : null,
+    version: legacyVersion,
+    capabilitySnapshotId: await readOpenCodeLegacyStopCapability(legacyInput),
+  }
+}
+
+function assertStoredStopRuntimeMatchesLane(input: {
+  authorityRecords: OpenCodeSessionRecord[]
+  runtime: ConfirmedStopRuntime
+  body: Record<string, unknown>
+  preconditions: ReturnType<typeof parseOpenCodeBridgePreconditions>
+  allowReceiptlessRecords: boolean
+}): void {
+  const { authorityRecords, runtime, body, preconditions, allowReceiptlessRecords } = input
+  if (runtime.providerId !== 'opencode'
+    || !/^opencode:[a-f0-9]{32}$/.test(runtime.capabilitySnapshotId)
+    || authorityRecords.some(record => !/^[a-f0-9]{64}$/.test(record.expectedBehaviorFingerprint ?? '')
+      || (record.stopAuthority
+        ? record.stopAuthority.expectedBehaviorFingerprint !== record.expectedBehaviorFingerprint
+          || hashStable(record.stopAuthority.runtime) !== hashStable(runtime)
+        : !allowReceiptlessRecords))
+    || expectedCapabilitySnapshotId(body) !== runtime.capabilitySnapshotId
+    || (preconditions?.expectedBehaviorFingerprint
+      && authorityRecords.some(record => record.expectedBehaviorFingerprint !== preconditions.expectedBehaviorFingerprint))) {
+    throw new Error('OpenCode confirmed stop authority mismatch')
+  }
+}
+
 async function probeStoredLaneAuthority(
   envelope: BridgeEnvelope,
   command: string,
   phaseContext?: OpenCodePhaseContext,
-) {
+): Promise<StoredLaneAuthority> {
   const body = envelope.body
   const teamId = asString(body.teamId) ?? asString(body.teamName)
   const laneId = asString(body.laneId)
@@ -813,32 +878,22 @@ async function probeStoredLaneAuthority(
   if (command === 'opencode.stopTeam' && (selectedModel.providerId === 'cursor-acp'
     || authorityRecords.every(record => record.stopAuthority || isOpenCodeSessionStopped(record)))) {
     const allHaveReceipt = authorityRecords.every(record => record.stopAuthority)
-    if (!allHaveReceipt && selectedModel.providerId !== 'cursor-acp') {
+    // Every session already terminal completes idempotently even when
+    // process-absence retirement minted no receipt: no live session remains
+    // whose Stop this request must attest.
+    const allTerminal = authorityRecords.every(record => isOpenCodeSessionStopped(record))
+    if (!allHaveReceipt && selectedModel.providerId !== 'cursor-acp' && !allTerminal) {
       throw new Error('OpenCode confirmed stop authority mismatch')
     }
     // Pre-fix Cursor records lack the receipt, but the desktop persists the
     // original launch capability. Preserve that exact capability for cleanup.
     const legacyCursor = selectedModel.providerId === 'cursor-acp' && !allHaveReceipt
-    const legacyVersion = firstAuthority.opencodeVersion ?? null
-    const runtime: ConfirmedStopRuntime = legacyCursor ? {
-      providerId: 'opencode', binaryPath: 'opencode', version: legacyVersion,
-      binaryFingerprint: legacyVersion ? `version:${legacyVersion}` : null,
-      capabilitySnapshotId: await readOpenCodeLegacyStopCapability({
-        teamsPath: getTeamsDir(), teamId, laneId, runId,
-      }),
-    } : firstAuthority.stopAuthority!.runtime
-    if (runtime.providerId !== 'opencode'
-      || !/^opencode:[a-f0-9]{32}$/.test(runtime.capabilitySnapshotId)
-      || authorityRecords.some(record => !/^[a-f0-9]{64}$/.test(record.expectedBehaviorFingerprint ?? '')
-        || (record.stopAuthority
-          ? record.stopAuthority.expectedBehaviorFingerprint !== record.expectedBehaviorFingerprint
-            || hashStable(record.stopAuthority.runtime) !== hashStable(runtime)
-          : !legacyCursor))
-      || expectedCapabilitySnapshotId(body) !== runtime.capabilitySnapshotId
-      || (preconditions?.expectedBehaviorFingerprint
-        && authorityRecords.some(record => record.expectedBehaviorFingerprint !== preconditions.expectedBehaviorFingerprint))) {
-      throw new Error('OpenCode confirmed stop authority mismatch')
-    }
+    const runtime = await resolveStoredStopRuntime(authorityRecords,
+      { teamsPath: getTeamsDir(), teamId, laneId, runId }, { legacyCursor })
+    assertStoredStopRuntimeMatchesLane({
+      authorityRecords, runtime, body, preconditions,
+      allowReceiptlessRecords: legacyCursor || allTerminal,
+    })
     for (const record of authorityRecords.filter(record => !isOpenCodeSessionStopped(record))) {
       await openCodeHostManager.resolveOwnedSessionEndpoint(record.hostKey, {
         teamId: record.teamId, laneId: record.laneId, memberName: record.memberName,
@@ -868,6 +923,7 @@ async function probeStoredLaneAuthority(
     // before arming the next prompt under the OAuth publication lock.
     const ownerChecks: Array<() => Promise<void>> = []
     let snapshot = buildSendMessageStoredSessionSnapshot(projectPath, firstAuthority)
+    let ownedOAuthHost: StoredLaneAuthority['ownedOAuthHost']
     for (const record of authorityRecords) {
       if (!record.opencodeVersion || !record.managedConfigFingerprint
         || record.resolvedBehaviorFingerprint !== record.managedConfigFingerprint
@@ -877,9 +933,10 @@ async function probeStoredLaneAuthority(
         || record.projectBehaviorFingerprint !== firstAuthority.projectBehaviorFingerprint) {
         throw new Error('OpenCode observation launch authority is unavailable')
       }
-      await openCodeSessionBridge.withOwnedOAuthSessionObservation(record, async ({ baseUrl }, assertOwner) => {
+      await openCodeSessionBridge.withOwnedOAuthSessionObservation(record, async ({ baseUrl, runtimePid }, assertOwner) => {
         ownerChecks.push(assertOwner)
         if (record === authorityRecords[0]) {
+          ownedOAuthHost = { hostKey: record.hostKey, pid: runtimePid, baseUrl }
           const client = openCodeClientFactory.create(baseUrl, phaseContext ? {
             signal: phaseContext.signal, remainingMs: phaseContext.remainingMs,
           } : undefined)
@@ -892,16 +949,49 @@ async function probeStoredLaneAuthority(
     const deliveryRuntime = createRuntimeSnapshot(snapshot, authorityRecords[0])
     validateOpenCodeBridgeStateChangingPreconditions({ body, runtime: createRuntimePreconditionSnapshot(snapshot, { deliveryRuntime }) })
     return { snapshot, records: authorityRecords, deliveryRuntime, signal: phaseContext?.signal,
-      assertOwner: async () => { for (const check of ownerChecks) await check() },
+      ownedOAuthHost, assertOwner: async () => { for (const check of ownerChecks) await check() },
       release: async (_keepAlive?: boolean) => {} }
   }
-  const retained = await openCodeProvisioningProbe.probeRetainingHost(projectPath, {
-    selectedModel: selectedModel.raw, toolApprovalMode: mode, phaseContext,
-    existingHostKey,
-    ...(expectedRuntimePid !== undefined ? { expectedRuntimePid } : {}),
-    ...(command === 'opencode.stopTeam' ? { attachAppMcp: false } : {}),
-  })
-  return { snapshot: retained.snapshot, records: authorityRecords, release: retained.release }
+  try {
+    const retained = await openCodeProvisioningProbe.probeRetainingHost(projectPath, {
+      selectedModel: selectedModel.raw, toolApprovalMode: mode, phaseContext,
+      existingHostKey,
+      ...(expectedRuntimePid !== undefined ? { expectedRuntimePid } : {}),
+      ...(command === 'opencode.stopTeam' ? { attachAppMcp: false } : {}),
+    })
+    return { snapshot: retained.snapshot, records: authorityRecords, release: retained.release }
+  } catch (error) {
+    // Absence is closure evidence only for the exact process every stored
+    // session is pinned to. Records without a runtime pid stay fail-closed.
+    if (command !== 'opencode.stopTeam' || expectedRuntimePid === undefined) throw error
+    const registeredHostGone = isOpenCodeHostProcessGoneError(error) && error.pid === expectedRuntimePid
+    // Startup cleanup deletes a dead host's registry record, after which the
+    // check above can never succeed again. Without a record, every session of
+    // the run must name the same pid and that pid must be ESRCH-gone. OAuth
+    // lanes keep their strict release path, so they stay fail-closed here.
+    const unregisteredHostGone = !registeredHostGone
+      && isOpenCodeUnregisteredHostProcessGoneError(error) && error.pid === expectedRuntimePid
+      && selectedModel.providerId !== 'xai'
+      && authorityRecords.every(record => record.runtimePid === expectedRuntimePid)
+    if (!registeredHostGone && !unregisteredHostGone) throw error
+    // The host process is provably absent. A Stop request may close
+    // the lane from stored authority plus desktop-owned launch capability; no
+    // confirmed Stop receipt is minted from process absence.
+    const runtime = await resolveStoredStopRuntime(authorityRecords,
+      { teamsPath: getTeamsDir(), teamId, laneId, runId }, { legacyCursor: false })
+    assertStoredStopRuntimeMatchesLane({
+      authorityRecords, runtime, body, preconditions,
+      allowReceiptlessRecords: true,
+    })
+    return {
+      snapshot: null,
+      records: authorityRecords,
+      confirmedStopRuntime: runtime,
+      hostGone: true,
+      ...(unregisteredHostGone ? { unregisteredHostPid: expectedRuntimePid } : {}),
+      release: async () => {},
+    }
+  }
 }
 
 // Bind delivery to the member captured before provisioning, including across
@@ -952,7 +1042,7 @@ async function withStoredLaneAuthority<T>(
   operation: (authority: Awaited<ReturnType<typeof probeStoredLaneAuthority>>) => Promise<T>,
 ): Promise<T> {
   const signal = externalSignal ? AbortSignal.any([deadline.signal, externalSignal]) : deadline.signal
-  const retained = await deadline.runPhase('host_start', async context => {
+  const acquire = () => deadline.runPhase('host_start', async context => {
     const phaseContext = { ...context, signal, throwIfExpired: () => {
       signal.throwIfAborted()
       context.throwIfExpired()
@@ -969,6 +1059,9 @@ async function withStoredLaneAuthority<T>(
     }
     return retained
   })
+  const retained = command === 'opencode.sendMessage'
+    ? await beforeOpenCodePromptSubmission(acquire)
+    : await acquire()
   try {
     signal.throwIfAborted()
     const value = await operation(retained)
@@ -1686,19 +1779,57 @@ async function listAppMcpToolsFromResolvedLaunchConfig(
   }
 }
 
+/** xAI observations have no retained profile, but the host was prepared
+ * with managed data/cache paths. Compare and tools/list against that same
+ * effective local MCP config, never the unprepared bridge env projection. */
+async function resolveOpenCodeGroupAppMcpLaunchConfig(
+  snapshot: OpenCodeProvisioningSnapshot,
+): Promise<ResolvedAppMcpLaunchConfig> {
+  if (snapshot.host) return getRetainedAppMcpLaunchConfig(snapshot.host)
+  return applyOpenCodeManagedPathsToAppMcpLaunchConfig(
+    await resolveOpenCodeAppMcpLaunchConfig(),
+    resolveClaudeMultimodelPaths(),
+  )
+}
+
+/** Resolve the group-control owner from the same MCP launch configuration
+ * selected by the live host, not from an unrelated child or stale bridge hint. */
+async function readOpenCodeGroupControlBinding(
+  snapshot: OpenCodeProvisioningSnapshot,
+  launchConfig: ResolvedAppMcpLaunchConfig,
+  signal?: AbortSignal,
+): Promise<{ controlUrl: string; context: string } | null> {
+  if (!snapshot.host) {
+    return readOwnedOAuthGroupControlBinding(launchConfig.config, process.env, signal)
+  }
+  const env = { ...snapshot.host.profile.env, ...launchConfig.config.environment }
+  return isBoundGroupChatControl(env.AGENT_TEAMS_BOUND_CONTROL_URL, env.AGENT_TEAMS_BOUND_CONTEXT_JSON)
+    ? { controlUrl: env.AGENT_TEAMS_BOUND_CONTROL_URL!, context: env.AGENT_TEAMS_BOUND_CONTEXT_JSON! }
+    : null
+}
+
 async function readLiveGroupChatRunProofs(
   snapshot: OpenCodeProvisioningSnapshot | null,
   records: OpenCodeSessionRecord[],
   phaseContext?: OpenCodePhaseContext,
+  ownedOAuthHost?: StoredLaneAuthority['ownedOAuthHost'],
 ): Promise<OpenCodeGroupChatRunProof[]> {
-  if (!snapshot?.host || !isAppMcpConnected(snapshot)) return []
+  if (!snapshot || (!snapshot.host && !ownedOAuthHost)
+    || (snapshot.host && !isAppMcpConnected(snapshot))) return []
   try {
-    const launchConfig = getRetainedAppMcpLaunchConfig(snapshot.host)
-    const binding = { ...snapshot.host.profile.env, ...launchConfig.config.environment }
-    if (!isBoundGroupChatControl(binding.AGENT_TEAMS_BOUND_CONTROL_URL, binding.AGENT_TEAMS_BOUND_CONTEXT_JSON)) return []
+    const launchConfig = await resolveOpenCodeGroupAppMcpLaunchConfig(snapshot)
+    const baseEnv = snapshot.host?.profile.env ?? process.env
+    if (ownedOAuthHost) {
+      // SessionBridge attests this exact endpoint. Verify its loaded MCP config
+      // against the app-controlled launch source before invoking tools/list.
+      const liveMcp = asRecord(asRecord(snapshot.config)?.mcp)?.[OPEN_CODE_APP_MCP_SERVER_NAME]
+      if (!asRecord(liveMcp) || hashStable(liveMcp) !== hashStable(launchConfig.config)) return []
+    }
+    const binding = await readOpenCodeGroupControlBinding(snapshot, launchConfig, phaseContext?.signal)
+    if (!binding) return []
     // Deliberately bypass the persisted/version-scoped tools cache for this run.
-    const observed = await listAppMcpToolsFromResolvedLaunchConfig(launchConfig, phaseContext, snapshot.host.profile.env)
-    const client = openCodeClientFactory.create(snapshot.host.baseUrl, phaseContext ? {
+    const observed = await listAppMcpToolsFromResolvedLaunchConfig(launchConfig, phaseContext, baseEnv)
+    const client = openCodeClientFactory.create(snapshot.host?.baseUrl ?? ownedOAuthHost!.baseUrl, phaseContext ? {
       signal: phaseContext.signal, remainingMs: phaseContext.remainingMs,
     } : {})
     const mcp = await client.getMcp()
@@ -1710,8 +1841,15 @@ async function readLiveGroupChatRunProofs(
       const current = await openCodeSessionStore.get(record.teamId, record.laneId ?? 'primary', record.memberName)
       if (!current || current.runId !== record.runId || current.hostKey !== record.hostKey ||
           current.runtimePid !== record.runtimePid || current.opencodeSessionId !== record.opencodeSessionId) continue
+      if (ownedOAuthHost && (current.profileScope?.providerId !== 'xai'
+        || current.hostKey !== ownedOAuthHost.hostKey || current.runtimePid !== ownedOAuthHost.pid)) continue
       const proof = buildOpenCodeGroupChatRunProof(
         { ...snapshot, mcp }, current, observed.map(canonicalizeAppMcpToolId),
+        ownedOAuthHost && !snapshot.host ? {
+          hostKey: ownedOAuthHost.hostKey, pid: ownedOAuthHost.pid,
+          controlUrl: binding.controlUrl,
+          controlContext: binding.context,
+        } : undefined,
       )
       if (proof) proofs.push(proof)
     }
@@ -4423,6 +4561,8 @@ async function runStop(
       }
     })
     : null
+  const hostGone = retained?.hostGone === true
+  const unregisteredHostPid = hostGone ? retained?.unregisteredHostPid : undefined
   let authorityReleased = false
   const releaseAuthority = async () => {
     if (authorityReleased) return
@@ -4499,6 +4639,71 @@ async function runStop(
             'warning',
           ))
         }
+      } else if (hostGone) {
+        // The host process is provably gone, so there is no live session to
+        // abort or observe. Close the exact stored owner instead: strict lease
+        // release (or fenced proof that no record is left) plus terminal CAS.
+        // Process absence retires the session; it is not a confirmed Stop
+        // receipt, so none is minted. Nothing is killed on this path.
+        runtimeDeadline.throwIfExpired('stop_cleanup')
+        const beforeClose = await raceOpenCodeAbortSignal(
+          openCodeSessionStore.get(teamId, laneId, record.memberName),
+          stopSignal,
+        )
+        if (!isExactStopSession(beforeClose, record) || (unregisteredHostPid !== undefined
+          && (record.runtimePid !== unregisteredHostPid || beforeClose.runtimePid !== unregisteredHostPid))) {
+          diagnostics.push(teamDiagnostic(
+            'opencode_stop_identity_changed',
+            `${record.memberName}: session identity changed before dead-host closure`,
+            'error',
+          ))
+          memberDiagnostics.push('identity changed before dead-host closure')
+          return { record, stopped: false, diagnostics: memberDiagnostics }
+        }
+        if (runtimeDeadline.remainingMs() < OPEN_CODE_STOP_ATOMIC_CLEANUP_RESERVE_MS) {
+          const closeStep = unregisteredHostPid === undefined ? 'strict lease release' : 'dead-host closure'
+          memberDiagnostics.push('deadline expired')
+          diagnostics.push(teamDiagnostic(
+            'opencode_stop_deadline',
+            `${record.memberName}: insufficient budget for ${closeStep}; remaining=${runtimeDeadline.remainingMs()}ms`,
+            'error',
+          ))
+          return { record, stopped: false, diagnostics: memberDiagnostics }
+        }
+        let terminal: OpenCodeSessionRecord | null
+        if (unregisteredHostPid !== undefined) {
+          // No registry record means no lease is left to release. Re-prove
+          // under the host startup and registry fences that the record is still
+          // absent and the pinned pid is ESRCH-gone, then apply the same CAS.
+          terminal = await openCodeHostManager.withConfirmedAbsentHostAuthority(
+            { hostKey: record.hostKey, runtimePid: unregisteredHostPid, requireUnregistered: true },
+            () => openCodeSessionStore.markStoppedIfSession(record),
+            stopSignal,
+          )
+        } else {
+          await openCodeSessionBridge.releaseSession(record, { strictLeaseRelease: true })
+          terminal = await openCodeSessionStore.markStoppedIfSession(record)
+        }
+        if (!terminal) {
+          const current = await openCodeSessionStore.get(teamId, laneId, record.memberName)
+          if (isExactStopSession(current, record) && current.staleReason === 'runtime_process_gone') {
+            memberDiagnostics.push('runtime disappeared without confirmed Stop')
+            diagnostics.push(teamDiagnostic(
+              'opencode_stop_status_unconfirmed',
+              `${record.memberName}: runtime retirement is not confirmed Stop evidence`,
+              'warning',
+            ))
+            return { record, stopped: false, diagnostics: memberDiagnostics }
+          }
+          diagnostics.push(teamDiagnostic(
+            'opencode_stop_identity_changed',
+            `${record.memberName}: session identity changed before confirmation`,
+            'error',
+          ))
+          memberDiagnostics.push('identity changed before confirmation')
+          return { record, stopped: false, diagnostics: memberDiagnostics }
+        }
+        stopped = true
       } else {
         runtimeDeadline.throwIfExpired('stop_abort')
         const beforeAbort = await raceOpenCodeAbortSignal(
@@ -4726,9 +4931,19 @@ async function runStop(
   // Keep the process alive on release so cleanup can honor other lanes' leases.
   await releaseAuthority()
 
+  // Stale cleanup deletes every dead registry record, while a retried gone-host
+  // Stop can re-prove absence only from that exact record. Keep it until every
+  // member of this lane is closed.
+  const deadHostEvidenceNeeded = hostGone && memberResults.some(result => !result.stopped)
   const cleanupAllowed = runtimeDeadline.remainingMs() >= OPEN_CODE_STOP_HOST_CLEANUP_RESERVE_MS
-    && !stopSignal.aborted
-  if (!cleanupAllowed) {
+    && !stopSignal.aborted && !deadHostEvidenceNeeded
+  if (deadHostEvidenceNeeded) {
+    diagnostics.push(teamDiagnostic(
+      'opencode_host_cleanup_warning',
+      'OpenCode host cleanup deferred so a Stop retry can re-prove the gone host',
+      'warning',
+    ))
+  } else if (!cleanupAllowed) {
     diagnostics.push(teamDiagnostic(
       'opencode_stop_deadline',
       `OpenCode host cleanup skipped because only ${runtimeDeadline.remainingMs()}ms remained`,
@@ -5072,7 +5287,7 @@ async function runSendMessage(
 
   const groupChatId = asString(body.groupChatId)
   if (groupChatId) {
-    const [capability] = await readLiveGroupChatRunProofs(snapshot, [deliveryRecord])
+    const [capability] = await readLiveGroupChatRunProofs(snapshot, [deliveryRecord], undefined, authority?.ownedOAuthHost)
     if (!authority || !capability || capability.runId !== runId ||
         capability.runKey !== asString(body.groupRunKey) ||
         body.groupChatProtocolVersion !== 1 || !asString(body.groupMessageId) ||
@@ -5093,12 +5308,12 @@ async function runSendMessage(
     : null
 
   let groupCatalog: unknown
-  if (groupChatId && snapshot.host) {
-    const launchConfig = getRetainedAppMcpLaunchConfig(snapshot.host)
-    const env = { ...snapshot.host.profile.env, ...launchConfig.config.environment }
-    try { groupCatalog = await readFreshGroupChatCatalog(teamId, memberName, {
-      controlUrl: env.AGENT_TEAMS_BOUND_CONTROL_URL, context: env.AGENT_TEAMS_BOUND_CONTEXT_JSON,
-    }) } catch { /* Unavailable is explicit in the handoff prompt. */ }
+  if (groupChatId && (snapshot.host || authority?.ownedOAuthHost)) {
+    try {
+      const launchConfig = await resolveOpenCodeGroupAppMcpLaunchConfig(snapshot)
+      const binding = await readOpenCodeGroupControlBinding(snapshot, launchConfig)
+      if (binding) groupCatalog = await readFreshGroupChatCatalog(teamId, memberName, binding)
+    } catch { /* Unavailable is explicit in the handoff prompt. */ }
     await assertStoredDeliveryAuthority(deliveryRecord, authority)
   }
   const groupPrompt = groupChatId ? buildGroupMailboxPrompt({
@@ -6074,7 +6289,7 @@ async function handleEnvelope(
                 remainingMs: () => runtimeDeadline.remainingMs(),
                 throwIfExpired: () => runtimeDeadline.throwIfExpired('mcp_preflight'),
                 phase: 'mcp_preflight',
-              })
+              }, retained.ownedOAuthHost)
               for (const capability of groupChatRunProofs) {
                 const record = retained.records.find(row => row.memberName === capability.memberName)!
                 await assertStoredDeliveryAuthority(record, retained)

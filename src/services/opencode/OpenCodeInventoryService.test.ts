@@ -1,5 +1,5 @@
-import { describe, expect, test } from 'bun:test'
-import { access, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { describe, expect, spyOn, test } from 'bun:test'
+import { access, mkdir, mkdtemp, readFile, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -10,6 +10,7 @@ import {
   execOpenCodePortableCommand,
   filterOpenCodeConnectedProvidersForRuntime,
   getOpenCodeInventoryCommandTimeoutMs,
+  getOpenCodeRemainingInventoryCommandTimeoutMs,
   getOpenCodeRefreshModelsArgs,
   getOpenCodeVerboseModelsArgs,
   OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
@@ -23,6 +24,8 @@ import {
   parseOpenCodeModelsOutput,
   parseOpenCodeModelsVerboseOutput,
   parseOpenCodeProvidersOutput,
+  OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS,
+  seedOpenCodeModelsCache,
   supportsOpenCodeSuperGrokOAuth,
   withOpenCodeInventoryProbeTimeout,
 } from './OpenCodeInventoryService.js'
@@ -86,6 +89,21 @@ function inventorySnapshot(
 }
 
 describe('OpenCodeInventoryService parsers', () => {
+  test('verbose and fallback model commands consume the same remaining full-inventory budget', () => {
+    let remaining = OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS
+    const timeRemaining = () => remaining
+    expect(getOpenCodeRemainingInventoryCommandTimeoutMs(['models', '--verbose'], timeRemaining))
+      .toBe(OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS)
+    remaining = 28_000
+    expect(getOpenCodeRemainingInventoryCommandTimeoutMs(['models'], timeRemaining)).toBe(28_000)
+    remaining = 8_000
+    expect(getOpenCodeRemainingInventoryCommandTimeoutMs(['version'], timeRemaining)).toBe(8_000)
+    remaining = 0
+    expect(() => getOpenCodeRemainingInventoryCommandTimeoutMs(['models'], timeRemaining))
+      .toThrow('OpenCode inventory probe timed out')
+  })
+
+
   test('requires an OpenCode version with native SuperGrok OAuth support', () => {
     expect(supportsOpenCodeSuperGrokOAuth('1.15.6')).toBe(false)
     expect(supportsOpenCodeSuperGrokOAuth('v1.15.7')).toBe(true)
@@ -123,16 +141,17 @@ describe('OpenCodeInventoryService parsers', () => {
     })
   })
 
-  test('keeps the full inventory timeout aligned with sequential OpenCode probes', () => {
+  test('budgets cold full inventory independently of summary and per-command probes', () => {
     expect(OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS).toBeGreaterThanOrEqual(
       OPEN_CODE_PROBE_TIMEOUT_MS * 3,
     )
     expect(OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS).toBeGreaterThan(
       OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS,
     )
-    expect(OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS).toBeGreaterThanOrEqual(
-      OPEN_CODE_PROBE_TIMEOUT_MS * 5,
-    )
+    expect(OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS).toBe(180_000)
+    expect(OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS).toBe(30_000)
+    expect(OPEN_CODE_PROBE_TIMEOUT_MS).toBe(10_000)
+    expect(OPEN_CODE_MODEL_LIST_TIMEOUT_MS).toBe(180_000)
   })
 
   test('queries the full OpenCode model inventory, not only the opencode provider', () => {
@@ -242,6 +261,72 @@ describe('OpenCodeInventoryService parsers', () => {
     expect(isOpenCodeInventoryTimeoutSnapshot(result)).toBe(false)
   })
 
+  test('cold full preparation can exceed sixty seconds while the whole probe remains bounded', async () => {
+    let now = 0, nextId = 0, aborted = false
+    const timers = new Map<number, { at: number; callback: () => void }>()
+    const schedule = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, ms = 0) => {
+      const id = ++nextId
+      timers.set(id, { at: now + ms, callback })
+      return id
+    }) as unknown as typeof setTimeout)
+    const clear = spyOn(globalThis, 'clearTimeout').mockImplementation((id) => { timers.delete(Number(id)) })
+    const advance = async (target: number) => {
+      for (;;) {
+        const next = [...timers].filter(([, timer]) => timer.at <= target).sort((a, b) => a[1].at - b[1].at)[0]
+        if (!next) break
+        now = next[1].at; timers.delete(next[0]); next[1].callback()
+        await Promise.resolve(); await Promise.resolve()
+      }
+      now = target
+    }
+    try {
+      const completed = inventorySnapshot({ models: ['TEST/cold-model'] })
+      const coldPreparation = new Promise<OpenCodeInventorySnapshot>(resolve => {
+        setTimeout(() => resolve(completed), 65_000)
+      })
+      const coldResult = withOpenCodeInventoryProbeTimeout(coldPreparation, {
+        timeoutMs: OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS, onTimeout: () => { aborted = true },
+      })
+      await advance(65_000)
+      expect(await coldResult).toBe(completed)
+      expect(aborted).toBe(false)
+      expect(timers.size).toBe(0)
+
+      let resolveLate!: (value: OpenCodeInventorySnapshot) => void
+      const hung = withOpenCodeInventoryProbeTimeout(new Promise(resolve => { resolveLate = resolve }), {
+        timeoutMs: OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS, onTimeout: () => { aborted = true },
+      })
+      await advance(65_000 + 179_999)
+      expect(aborted).toBe(false)
+      await advance(65_000 + 180_000)
+      const timedOut = await hung
+      expect(aborted).toBe(true)
+      expect(isOpenCodeInventoryTimeoutSnapshot(timedOut)).toBe(true)
+      resolveLate(completed)
+      expect(await hung).toBe(timedOut)
+      expect(timers.size).toBe(0)
+    } finally { clear.mockRestore(); schedule.mockRestore() }
+  })
+
+  test('retains command timing when deadline cleanup replaces the active step', () => {
+    let now = 0
+    const progress = createOpenCodeInventoryProbeProgressTracker(() => now)
+    const leaveCommand = progress.enterStep('opencode providers list')
+    now = 10_000
+    const leaveCleanup = progress.enterStep('clean up OpenCode inventory command')
+    leaveCommand()
+    now = 10_500
+    expect(progress.snapshot()).toEqual({
+      elapsedMs: 10_500,
+      currentStep: 'clean up OpenCode inventory command',
+      currentStepElapsedMs: 500,
+      completedSteps: [{ label: 'opencode providers list', durationMs: 10_000 }],
+    })
+    leaveCleanup()
+    leaveCleanup()
+    expect(progress.snapshot().completedSteps).toHaveLength(2)
+  })
+
   test('reports the active OpenCode inventory step and aborts on probe timeout', async () => {
     let now = 100
     const progress = createOpenCodeInventoryProbeProgressTracker(() => now)
@@ -263,7 +348,7 @@ describe('OpenCodeInventoryService parsers', () => {
 
     expect(aborted).toBe(true)
     expect(result.probeError).toBe(
-      'OpenCode inventory probe timed out after 1ms during opencode providers list',
+      'OpenCode inventory probe timed out after 1ms during opencode providers list Current OpenCode inventory step: opencode providers list has been running for 41ms. Completed OpenCode inventory steps before timeout: prepare managed OpenCode profile (3ms).',
     )
     expect(result.diagnostics).toContain(
       'Current OpenCode inventory step: opencode providers list has been running for 41ms.',
@@ -739,4 +824,107 @@ llama.cpp/qwen3-coder:a3b local
     ).toBe(32768)
     expect(isOpenCodeModelFree('opencode/qwen3.6-plus-free', [])).toBe(false)
   })
+})
+
+describe('OpenCode Models.dev cache seeding', () => {
+  async function withCacheHome<T>(run: (cacheHome: string, cacheFile: string) => Promise<T>): Promise<T> {
+    const cacheHome = await mkdtemp(path.join(tmpdir(), 'TEST-opencode-models-cache-'))
+    try {
+      return await run(cacheHome, path.join(cacheHome, 'opencode', 'models.json'))
+    } finally {
+      await rm(cacheHome, { recursive: true, force: true })
+    }
+  }
+  const profile = (xdgCacheHome: string, env: Record<string, string> = {}) =>
+    ({
+      xdgCacheHome,
+      projectPath: '/TEST/user-project',
+      workingDirectoryPath: '/TEST/profile/catalog-workspace',
+      env: { XDG_CACHE_HOME: xdgCacheHome, ...env },
+    }) as unknown as OpenCodePreparedProfile
+
+  test('a cold profile is refreshed once, plugin-free and outside the user project, before it is used', () =>
+    withCacheHome(async (cacheHome, cacheFile) => {
+      const calls: { args: string[]; cwd: string; config: unknown }[] = []
+      const exec = async (_binary: string, args: string[], used: OpenCodePreparedProfile) => {
+        calls.push({ args, cwd: used.projectPath, config: JSON.parse(used.env.OPENCODE_CONFIG_CONTENT ?? 'null') })
+        await new Promise(resolve => setTimeout(resolve, 20))
+        await mkdir(path.dirname(cacheFile), { recursive: true })
+        await writeFile(cacheFile, '{"opencode":{}}')
+        return { stdout: 'Models cache refreshed\n', stderr: '', code: 0 }
+      }
+      const input = { binaryPath: '/TEST/opencode', profile: profile(cacheHome), exec }
+      // Concurrent catalog reads share one refresh.
+      expect(await Promise.all([seedOpenCodeModelsCache(input), seedOpenCodeModelsCache(input)]))
+        .toEqual(['seeded', 'seeded'])
+      expect(calls).toEqual([{
+        args: getOpenCodeRefreshModelsArgs(),
+        cwd: '/TEST/profile/catalog-workspace',
+        config: { autoupdate: false, plugin: [], mcp: {} },
+      }])
+      // An existing cache is left to OpenCode's own refresh.
+      expect(await seedOpenCodeModelsCache(input)).toBe('present')
+      expect(calls).toHaveLength(1)
+    }))
+
+  test('a Models.dev source chosen through OpenCode environment is never seeded', () =>
+    withCacheHome(async cacheHome => {
+      let calls = 0
+      const seed = (env: Record<string, string>) => seedOpenCodeModelsCache({
+        binaryPath: '/TEST/opencode', profile: profile(cacheHome, env),
+        exec: async () => { calls += 1; return { stdout: '', stderr: '', code: 1 } },
+      })
+      for (const env of [{ OPENCODE_DISABLE_MODELS_FETCH: '1' }, { OPENCODE_DISABLE_MODELS_FETCH: 'TRUE' },
+        { OPENCODE_MODELS_URL: 'https://models.example' }, { OPENCODE_MODELS_PATH: '/TEST/models.json' }])
+        expect(await seed(env)).toBe('not-applicable')
+      expect(calls).toBe(0)
+      // OpenCode itself treats only "1" and "true" as disabling the fetch.
+      expect(await seed({ OPENCODE_DISABLE_MODELS_FETCH: 'false' })).toBe('unavailable')
+      expect(calls).toBe(1)
+    }))
+
+  test('a failed refresh keeps the previous behavior and is not retried inside the backoff window', () =>
+    withCacheHome(async cacheHome => {
+      const marker = path.join(cacheHome, 'opencode', '.models-cache-seed-failed')
+      let calls = 0
+      let clock = Date.now()
+      const input = { binaryPath: '/TEST/opencode', profile: profile(cacheHome), now: () => clock, exec: async () => {
+        calls += 1
+        return { stdout: '', stderr: 'getaddrinfo ENOTFOUND models.dev', code: 1 }
+      } }
+      const markAt = async (time: number) => utimes(marker, time / 1000, time / 1000)
+      expect(await seedOpenCodeModelsCache(input)).toBe('unavailable')
+      expect((await stat(marker)).isFile()).toBe(true)
+      await markAt(clock)
+      clock += OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS - 60_000
+      expect(await seedOpenCodeModelsCache(input)).toBe('unavailable')
+      expect(calls).toBe(1)
+      const stale = Date.now() - 2 * OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS
+      await markAt(stale)
+      // Just past the window, so a longer window would fail here.
+      clock = stale + OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS + 60_000
+      expect(await seedOpenCodeModelsCache({ ...input, exec: async () => { calls += 1; throw new Error('spawn failed') } }))
+        .toBe('unavailable')
+      expect(calls).toBe(2)
+      // The new failure moves the marker, restarting the window.
+      expect((await stat(marker)).mtimeMs).toBeGreaterThan(stale + OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS)
+      // A marker dated in the future (clock moved back) does not block seeding.
+      await markAt(clock + 2 * 60 * 60_000)
+      expect(await seedOpenCodeModelsCache(input)).toBe('unavailable')
+      expect(calls).toBe(3)
+      for (const missing of [{ binaryPath: null, profile: profile(cacheHome) }, { binaryPath: '/TEST/opencode', profile: null }])
+        expect(await seedOpenCodeModelsCache({ ...missing, exec: async () => { throw new Error('must not run') } }))
+          .toBe('unavailable')
+    }))
+
+  test('a seed cancelled by its caller does not start the backoff', () =>
+    withCacheHome(async cacheHome => {
+      const marker = path.join(cacheHome, 'opencode', '.models-cache-seed-failed')
+      const controller = new AbortController()
+      expect(await seedOpenCodeModelsCache({
+        binaryPath: '/TEST/opencode', profile: profile(cacheHome), abortSignal: controller.signal,
+        exec: async () => { controller.abort(); return { stdout: '', stderr: '', code: 1, error: 'OpenCode command aborted' } },
+      })).toBe('unavailable')
+      expect(await stat(marker).then(() => true, () => false)).toBe(false)
+    }))
 })

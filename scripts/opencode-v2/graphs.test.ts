@@ -4,21 +4,25 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { verifyOpenCodePackage, verifyOpenCodeV2ServerGraph } from '../../src/services/opencode/host/OpenCodeV2ServerGraph.js'
+import { openCodeV2StagedVersions } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
+import manifest from '../../package.json' with { type: 'json' }
 
 // A stable root Effect must never evaluate the floor server's RC schema AST.
 // Exercise the actual installed schema through each server's own runtime.
-test('current stable and floor RC server graphs decode with their own physical Effect', async () => {
-  const effects = new Set<string>()
-  for (const [pin, version] of [['2.0.0', '4.0.0-rc.112'], ['2.0.32', '4.0.1']] as const) {
+test('every staged server graph decodes with its own declared physical Effect', async () => {
+  const effects = new Map<string, Set<string>>()
+  for (const pin of openCodeV2StagedVersions(manifest.dependencies)) {
     const graph = await verifyOpenCodeV2ServerGraph(pin)
-    await verifyOpenCodePackage(graph.effectPath, 'effect', version)
-    effects.add(graph.effectPath)
+    await verifyOpenCodePackage(graph.effectPath, 'effect', graph.effectVersion)
+    effects.set(graph.effectVersion, (effects.get(graph.effectVersion) ?? new Set()).add(graph.effectPath))
     const entry = await realpath(Bun.resolveSync('@opencode/schema/config/provider', path.dirname(graph.modulePath)))
     const { Schema }: typeof import('effect') = await import(pathToFileURL(graph.effectPath).href)
     const { Info }: typeof import('@opencode/schema/config/provider') = await import(pathToFileURL(entry).href)
     expect(Schema.decodeUnknownSync(Info)({ models: { 'TEST-model': {} } }).models).toHaveProperty('TEST-model')
   }
-  expect(effects.size).toBe(2)
+  // Graphs on different Effect releases never share one physical Effect instance.
+  expect(effects.size).toBeGreaterThan(1)
+  expect(new Set([...effects.values()].flatMap(paths => [...paths])).size).toBe(effects.size)
 })
 
 test('AI cannot return programs from a second physical Effect with the correct version', async () => {

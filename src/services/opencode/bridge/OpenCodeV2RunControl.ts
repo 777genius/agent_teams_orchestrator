@@ -1,316 +1,51 @@
+import { parseOpenCodeV2GroupDelivery } from './OpenCodeV2GroupChat.js'
 import { openCodeBunVersion } from '../../../constants/openCodeBunVersion.js'
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import { constants, type Dirent } from 'node:fs'
-import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, unlink } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { chmod, lstat, mkdir, open, readFile, realpath, rename, unlink } from 'node:fs/promises'
 import { createConnection, createServer, type Socket } from 'node:net'
 import path from 'node:path'
 import { canonicalExecutionJSON, executionAssert, executionHash, executionRecord, assertIntentIdentity, openCodeV2RunInitializationMs, type ExecutionContext } from '../execution/OpenCodeV2ExecutionContracts.js'
 import type { QueueIntent } from '../execution/OpenCodeV2AdmissionService.js'
 import type { ExecutionMention } from '../transport/OpenCodeV2ExecutionClientFactory.js'
-import type { RunAnyProcessIdentity, RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunMemberStatus, RunProcessIdentity, RunStopMember, RunUnixControlRecord, RunWindowsControlRecord } from './OpenCodeV2RunTypes.js'
-import type { SelectedExecutionProfile } from '../host/OpenCodeV2ExecutionBinding.js'
+import type { RunAnyProcessIdentity, RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunMemberStatus, RunOwnerFailure, RunOwnerRetirement, RunProcessIdentity, RunStopMember, RunUnixControlRecord } from './OpenCodeV2RunTypes.js'
+import type { ExecutionBirth, SelectedExecutionProfile } from '../host/OpenCodeV2ExecutionBinding.js'
+import { readProcessStartTimeMs } from '../../../utils/processKill.js'
+import { openCodeV2ProviderFailureCategory } from '../execution/OpenCodeV2Diagnostics.js'
+import { OPEN_CODE_V2_PROVIDER_OPERATIONS, OPEN_CODE_V2_PROVIDER_STAGES } from '../transport/OpenCodeV2ProviderWire.js'
 import { OpenCodeV2RunNonces } from './OpenCodeV2RunNonces.js'
-import { CONTROLLER_INBOX_MAX_BYTES, retainedControllerPath, selectedControllerInboxRoot,
-  type ControllerInboxBinding, type ControllerToolProof } from './OpenCodeV2ControllerTools.js'
-import { createWindowsNativeBroker, resolveWindowsNativeArtifact, type WindowsNativeBroker } from '../host/windows/OpenCodeV2WindowsNativeBroker.js'
-import { ensureWindowsPrivateDirectories } from '../profile/OpenCodePrivateDirectories.js'
-import type { WindowsLaunchPlan } from '../host/windows/OpenCodeV2WindowsExecution.js'
+import { retainedControllerPath } from './OpenCodeV2ControllerTools.js'
 export type { RunBinding, RunControlRecord, RunControlRequest, RunControlResult, RunLaunchPlan } from './OpenCodeV2RunTypes.js'
 
-const MAX_FRAME = 512 * 1024
-// Graph preparation and native startup share one absolute budget. Individual control operations remain capped at 30s.
+const MAX_RECORD = 512 * 1024
+// Frames carry full control replies and share the broker packet budget.
+const MAX_FRAME = 16 * 1024 * 1024
+// Graph preparation and native startup share one absolute budget. Individual
+// control operations remain capped at 30s; cleanup stop/status extend to 45s.
 export const OPEN_CODE_V2_RUN_INITIALIZATION_MS = openCodeV2RunInitializationMs(process.platform)
 const MAX_OPERATION_MS = 30_000
+const MAX_STOP_OPERATION_MS = 45_000
+// A lost stop reply is confirmed once from the durable archive within this window.
+const STOP_RECONCILE_MS = 10_000
 const digest = (bytes: string | Buffer) => createHash('sha256').update(bytes).digest('hex')
-type WindowsServingAdmission = Readonly<{ record: RunWindowsControlRecord; profiles: readonly WindowsProfileAdmission[] }>
-type WindowsRunComposition = { readonly broker: WindowsNativeBroker; readonly stateId: string; serving?: WindowsServingAdmission }
-const windowsRuns = new Map<string, Promise<WindowsRunComposition>>()
-type WindowsProfileAdmission = Readonly<{ projectDirectory?: string; root: string; databasePath: string; sha256: string; directories: readonly string[] }>
-const WINDOWS_PROFILE_DIRECTORY_ENV_KEYS = [
-  'HOME', 'USERPROFILE', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
-  'TMPDIR', 'TMP', 'TEMP', 'APPDATA', 'LOCALAPPDATA',
-] as const
-type WindowsProfileConfigInspection = Readonly<{
-  schema: 1; ok: true; state: 'complete' | 'absent' | 'incomplete'; root: string; databasePath: string
-  configPath: string; privateAcl: true; reparse: false; rootIdentity: unknown; configIdentity: unknown
-}>
-function parseWindowsFileIdentity(value: unknown): Readonly<{ volumeSerial: string; fileId: string; ownerSid: string }> {
-  const row = executionRecord(value); keys(row, ["volumeSerial", "fileId", "ownerSid"])
-  const decimal = String(row.volumeSerial), hex = String(row.fileId), sid = String(row.ownerSid)
-  executionAssert(decimal.length > 0 && decimal.length <= 20 && [...decimal].every(char => char >= "0" && char <= "9") &&
-    hex.length === 32 && [...hex].every(char => "0123456789abcdef".includes(char)) &&
-    sid.startsWith("S-1-") && !sid.includes("\0"), "run_control_endpoint_changed")
-  return Object.freeze({ volumeSerial: decimal, fileId: hex, ownerSid: sid })
+const WINDOWS = process.platform === 'win32'
+/** Windows has no uid, mode bits or pathname sockets: the run control files live in
+ * the user's own profile and the endpoint is loopback TCP. Every request is still
+ * authenticated with the private challenge secret. */
+const currentUid = (): number => {
+  if (WINDOWS) return 0
+  const uid = process.getuid?.(); executionAssert(uid !== undefined, 'run_source_unix_required'); return uid
 }
-const isWindowsRecord = (record: RunControlRecord): record is RunWindowsControlRecord =>
-  'platform' in record && record.platform === 'win32'
-const isUnixRecord = (record: RunControlRecord): record is RunUnixControlRecord => !isWindowsRecord(record)
-const windowsRecord = (record: RunControlRecord): RunWindowsControlRecord => {
-  if (process.platform !== 'win32' || !isWindowsRecord(record)) throw new Error('run_control_invalid')
-  return record
+const unixRecord = (record: RunControlRecord): RunUnixControlRecord => record
+const tcpEndpoint = (port: number) => `tcp://127.0.0.1:${port}`
+function endpointPort(socketPath: string): number {
+  const match = /^tcp:\/\/127\.0\.0\.1:([1-9]\d{0,4})$/.exec(socketPath)
+  executionAssert(match && Number(match[1]) <= 65535, 'run_control_invalid')
+  return Number(match[1])
 }
-const unixRecord = (record: RunControlRecord): RunUnixControlRecord => {
-  if (process.platform === 'win32' || !isUnixRecord(record)) throw new Error('run_control_invalid')
-  return record
-}
-function windowsDataRoot(directory: string): string {
-  const runs = path.dirname(directory), version = path.dirname(runs), opencode = path.dirname(version), dataRoot = path.dirname(opencode)
-  executionAssert(path.basename(runs) === 'runs' && path.basename(version) === 'v2' && path.basename(opencode) === 'opencode' &&
-    path.isAbsolute(dataRoot), 'run_control_invalid')
-  return dataRoot
-}
-type WindowsCompositionSelection =
-  | Readonly<{ mode: 'reserve' | 'serve' | 'client'; dataRoot: string; binding: RunBinding; profiles: readonly WindowsProfileAdmission[] }>
-  | Readonly<{ mode: 'discover'; dataRoot: string; teamId: string; runId: string; profiles: readonly WindowsProfileAdmission[] }>
-function windowsProfileAdmission(profile: SelectedExecutionProfile): WindowsProfileAdmission {
-  const environmentDirectories = WINDOWS_PROFILE_DIRECTORY_ENV_KEYS.map(key => profile.env[key])
-  const directories = Object.freeze([...new Set([
-    profile.root, profile.config.directory, path.win32.dirname(profile.databasePath), ...environmentDirectories,
-  ])])
-  executionAssert(process.platform === 'win32' && path.win32.isAbsolute(profile.root) &&
-    path.win32.isAbsolute(profile.databasePath) && /^[a-f0-9]{64}$/.test(profile.config.sha256) &&
-    directories.length > 0 && directories.length <= 64 && directories.every(value =>
-      typeof value === 'string' && value.length > 0 && !value.includes('\0') && path.win32.isAbsolute(value)), 'run_control_selection_missing')
-  return Object.freeze({ projectDirectory: profile.directory, root: profile.root, databasePath: profile.databasePath, sha256: profile.config.sha256, directories })
-}
-function parseWindowsProfileConfigInspection(value: unknown, root: string, databasePath: string): WindowsProfileConfigInspection {
-  const row = executionRecord(value)
-  keys(row, ['schema', 'ok', 'state', 'root', 'databasePath', 'configPath', 'privateAcl', 'reparse', 'rootIdentity', 'configIdentity'])
-  executionAssert(row.schema === 1 && row.ok === true && ['complete', 'absent', 'incomplete'].includes(String(row.state)) &&
-    row.root === root && row.databasePath === databasePath &&
-    row.configPath === path.win32.join(root, 'config', 'opencode', 'opencode.json') &&
-    row.privateAcl === true && row.reparse === false &&
-    (row.configIdentity === null || parseWindowsFileIdentity(row.configIdentity) !== undefined), 'run_control_selection_missing')
-  parseWindowsFileIdentity(row.rootIdentity)
-  return row as unknown as WindowsProfileConfigInspection
-}
-async function windowsProfileAdmissionsForDataRoot(dataRoot: string, broker: WindowsNativeBroker,
-  deadline: number): Promise<readonly WindowsProfileAdmission[]> {
-  const profilesRoot = path.win32.join(dataRoot, 'opencode', 'v2', 'profiles')
-  const entries = await readdir(profilesRoot, { withFileTypes: true }).catch((error: unknown) => {
-    if (executionRecord(error).code === 'ENOENT') return [] as Dirent[]; throw error
-  })
-  const profiles: WindowsProfileAdmission[] = []
-  executionAssert(entries.every(entry => !entry.isSymbolicLink()), 'run_control_selection_missing')
-  const candidates = entries.filter(entry => entry.isDirectory()).slice(0, 32)
-  for (const entry of candidates) {
-    executionAssert(Date.now() < deadline, 'run_control_selection_missing')
-    const root = path.win32.join(profilesRoot, entry.name)
-    const configDirectory = path.win32.join(root, 'config', 'opencode')
-    const configPath = path.win32.join(configDirectory, 'opencode.json')
-    const databasePath = path.win32.join(root, 'data', 'opencode', 'opencode.db')
-    const inspected = parseWindowsProfileConfigInspection(await broker.request('ownerInspectProfileConfig',
-      { root, databasePath }, deadline), root, databasePath)
-    // Native held ownership/DACL/reparse evidence proves only these two
-    // incomplete states may be skipped. Malformed and foreign complete files
-    // continue to the full selected-profile/config-hash contract and fail it.
-    if (inspected.state !== 'complete') continue
-    const [rootInfo, configInfo, configBytes] = await Promise.all([lstat(root), lstat(configPath), readFile(configPath)])
-    executionAssert(rootInfo.isDirectory() && !rootInfo.isSymbolicLink() && await realpath(root) === root &&
-      configInfo.isFile() && !configInfo.isSymbolicLink() && configInfo.nlink === 1, 'run_control_selection_missing')
-    const directories = [...new Set([root, ...['home', 'config', 'data', 'cache', 'state', 'tmp', 'appdata', 'localappdata']
-      .map(name => path.win32.join(root, name)), configDirectory])]
-    profiles.push({ root, databasePath, sha256: digest(configBytes), directories })
-  }
-  return profiles
-}
-async function windowsAdmitProfiles(broker: WindowsNativeBroker, profiles: readonly WindowsProfileAdmission[],
-  deadline: number, teamId: string): Promise<readonly string[]> {
-  executionAssert(profiles.length > 0 && profiles.length <= 32, 'run_control_selection_missing')
-  executionAssert(new Set(profiles.map(profile => `${profile.root}|${profile.databasePath}|${profile.sha256}`)).size === profiles.length,
-    'run_control_selection_missing')
-  const ids: string[] = []
-  for (const profile of profiles) {
-    await broker.request('ownerValidateSelectedProfile', {
-      root: profile.root, databasePath: profile.databasePath, directories: profile.directories,
-      ...(profile.projectDirectory ? { projectDirectory: profile.projectDirectory } : {}),
-    }, deadline)
-    const selected = await broker.request('ownerSelectConfig', {
-      root: profile.root, databasePath: profile.databasePath, sha256: profile.sha256, teamId,
-    }, deadline) as { schema?: unknown; ok?: unknown; selectionId?: unknown; root?: unknown; path?: unknown; sha256?: unknown }
-    executionAssert(selected.schema === 1 && selected.ok === true && typeof selected.selectionId === 'string' &&
-      /^[1-9]\d{0,19}$/.test(selected.selectionId) && selected.root === profile.root &&
-      selected.path === path.win32.join(profile.root, 'config', 'opencode', 'opencode.json') &&
-      selected.sha256 === profile.sha256, 'run_control_selection_missing')
-    ids.push(selected.selectionId)
-  }
-  return ids
-}
-/** Join the sealed cohort on this fresh broker before any native custody
- * re-check. Member launch grants the cohort's package SIDs on the selected
- * profile paths; without the attach, a broker created for discovery or
- * composition would refuse those grants as foreign. Never submits
- * selectionIds — selection state stays the admitted selection's own. */
-async function attachWindowsRunCohort(broker: WindowsNativeBroker, directory: string,
-  dataRoot: string, teamId: string, runId: string, deadline: number): Promise<void> {
-  const value = await broker.request('runStateSelect', {
-    mode: 'attach', directory, dataRoot, teamId, runId,
-  }, deadline) as { absent?: true; stateId?: string }
-  executionAssert(value && (value.absent === true || typeof value.stateId === 'string'),
-    'run_control_native_unknown')
-}
-async function windowsComposition(directory: string, select?: WindowsCompositionSelection,
-  deadline = Date.now() + MAX_OPERATION_MS): Promise<WindowsRunComposition> {
-  const existing = windowsRuns.get(directory)
-  if (existing) return existing
-  if (!select) throw new Error('run_control_native_pending')
-  const created = (async () => {
-    executionAssert(process.platform === 'win32' && process.versions.bun === openCodeBunVersion(), 'run_control_native_pending')
-    // Concrete native composition is private to this module. Neither the
-    // artifact nor a caller port can qualify a run or mint retained authority.
-    const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
-    broker.events.on('error', () => {})
-    try {
-      await attachWindowsRunCohort(broker, directory, select.dataRoot,
-        select.mode === 'discover' ? select.teamId : select.binding.teamId,
-        select.mode === 'discover' ? select.runId : select.binding.runId, deadline)
-      const selectionIds = await windowsAdmitProfiles(broker, select.profiles, deadline,
-        select.mode === 'discover' ? select.teamId : select.binding.teamId)
-      const input = select.mode === 'reserve'
-        ? { directory, dataRoot: select.dataRoot, binding: select.binding, selectionIds, sharedControllerRootCohort: true }
-        : select.mode === 'discover'
-          ? { directory, dataRoot: select.dataRoot, mode: select.mode, teamId: select.teamId, runId: select.runId, selectionIds }
-          : { directory, dataRoot: select.dataRoot, mode: select.mode, binding: select.binding, selectionIds }
-      const value = await broker.request(select.mode === 'reserve' ? 'runStateAcquire' : 'runStateSelect',
-        input, deadline) as { stateId: string }
-      executionAssert(value && typeof value.stateId === 'string', 'run_control_native_unknown')
-      return { broker, stateId: value.stateId }
-    } catch (error) { await broker.close().catch(() => {}); throw error }
-  })()
-  windowsRuns.set(directory, created)
-  try { return await created } catch (error) { windowsRuns.delete(directory); throw error }
-}
-async function windowsDiscover(directory: string, dataRoot: string, teamId: string, runId: string): Promise<RunControlRecord | null> {
-  executionAssert(process.platform === 'win32' && process.versions.bun === openCodeBunVersion(), 'run_control_native_pending')
-  const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
-  broker.events.on('error', () => {})
-  try {
-    const deadline = Date.now() + MAX_OPERATION_MS
-    await attachWindowsRunCohort(broker, directory, dataRoot, teamId, runId, deadline)
-    const profiles = await windowsProfileAdmissionsForDataRoot(dataRoot, broker, deadline)
-    // Only discovery may submit zero selections. Native code must certify a
-    // missing namespace without issuing state; a present fence still vetoes it.
-    const selectionIds = profiles.length === 0 ? [] : await windowsAdmitProfiles(broker, profiles, deadline, teamId)
-    const result = await broker.request('runStateDiscover', {
-      directory, dataRoot, teamId, runId, selectionIds,
-    }, Date.now() + MAX_OPERATION_MS) as { absent?: true; stateId?: string; record?: unknown }
-    if (result.absent === true) { await broker.close(); return null }
-    executionAssert(typeof result.stateId === 'string' && result.record !== undefined, 'run_control_native_unknown')
-    const record = parseRecord(result.record)
-    windowsRuns.set(directory, Promise.resolve({ broker, stateId: result.stateId }))
-    return record
-  } catch (error) { await broker.close().catch(() => {}); throw error }
-}
-async function windowsRead(directory: string, name: string): Promise<unknown> {
-  const state = await windowsComposition(directory)
-  const value = await state.broker.request('runStateReadRecord', {
-    stateId: state.stateId, directory, name,
-  }, Date.now() + MAX_OPERATION_MS) as { value: unknown }
-  return value.value
-}
-async function windowsWrite(directory: string, name: string, value: unknown): Promise<void> {
-  const state = await windowsComposition(directory)
-  await state.broker.request('runStateWriteRecord', {
-    stateId: state.stateId, directory, name, bytes: canonicalExecutionJSON(value) + '\n',
-  }, Date.now() + MAX_OPERATION_MS)
-}
-async function windowsCompositionFor(record: RunWindowsControlRecord,
-  deadline = Date.now() + MAX_OPERATION_MS): Promise<WindowsRunComposition> {
-  const existing = windowsRuns.get(record.directory)
-  if (existing) return existing
-  const discoveryBroker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
-  discoveryBroker.events.on('error', () => {})
-  let profiles: readonly WindowsProfileAdmission[]
-  try {
-    await attachWindowsRunCohort(discoveryBroker, record.directory, windowsDataRoot(record.directory),
-      record.binding.teamId, record.binding.runId, deadline)
-    profiles = await windowsProfileAdmissionsForDataRoot(windowsDataRoot(record.directory), discoveryBroker, deadline)
-  } finally { await discoveryBroker.close() }
-  return windowsComposition(record.directory, {
-    mode: 'client', dataRoot: windowsDataRoot(record.directory), binding: record.binding,
-    profiles,
-  }, deadline)
-}
-/** Read through the already serving native owner. Comparison values never select
- * another profile, run state, broker or controller path. */
-export async function readWindowsRunControllerInbox(directory: string, profile: SelectedExecutionProfile,
-  proof: ControllerToolProof, binding: ControllerInboxBinding, deadline: number, signal?: AbortSignal): Promise<Buffer | null> {
-  const check = () => { signal?.throwIfAborted(); executionAssert(Date.now() < deadline, 'run_controller_timeout') }
-  check()
-  executionAssert(process.platform === 'win32', 'run_controller_inbox_unknown')
-  const root = selectedControllerInboxRoot(profile, proof, binding)
-  const pending = windowsRuns.get(directory)
-  executionAssert(pending, 'run_controller_inbox_unknown')
-  const state = await pending, serving = state.serving
-  check()
-  executionAssert(serving && serving.record.directory === directory &&
-    serving.record.binding.teamId === binding.teamId && serving.record.binding.runId === binding.runId,
-    'run_state_start_changed')
-  const selected = serving.profiles.filter(candidate => candidate.root === profile.root &&
-    candidate.databasePath === profile.databasePath && candidate.sha256 === profile.config.sha256)
-  executionAssert(selected.length === 1 && digest(profile.config.content) === selected[0]!.sha256,
-    'run_state_start_changed')
-  const admitted = selected[0]!
-  const value = await state.broker.request('runStateReadControllerInbox', {
-    stateId: state.stateId, directory, teamId: serving.record.binding.teamId, runId: serving.record.binding.runId,
-    root: admitted.root, databasePath: admitted.databasePath, sha256: admitted.sha256,
-  }, Math.min(deadline, Date.now() + MAX_OPERATION_MS), signal)
-  check()
-  executionAssert(value !== null && typeof value === 'object' && !Array.isArray(value), 'run_controller_inbox_unknown')
-  const row = executionRecord(value)
-  executionAssert(Object.keys(row).sort().join(',') === 'bytesBase64,ok,schema,state' &&
-    row.schema === 1 && row.ok === true, 'run_controller_inbox_unknown')
-  if (row.state === 'not_applicable') {
-    executionAssert(root === null && row.bytesBase64 === null, 'run_controller_inbox_unknown')
-    return null
-  }
-  executionAssert(root !== null, 'run_controller_inbox_unknown')
-  if (row.state === 'absent') {
-    executionAssert(row.bytesBase64 === null, 'run_controller_inbox_unknown')
-    return Buffer.from('[]')
-  }
-  executionAssert(row.state === 'regular' && typeof row.bytesBase64 === 'string' &&
-    row.bytesBase64.length > 0 && row.bytesBase64.length <= 4 * Math.ceil(CONTROLLER_INBOX_MAX_BYTES / 3),
-    'run_controller_inbox_unknown')
-  const bytes = Buffer.from(row.bytesBase64, 'base64')
-  executionAssert(bytes.length > 0 && bytes.length <= CONTROLLER_INBOX_MAX_BYTES &&
-    bytes.toString('base64') === row.bytesBase64, 'run_controller_inbox_unknown')
-  check()
-  return bytes
-}
-/** Called only after the one Windows execution plan and selected-profile
- * qualification exist. This lookup supplies comparison values; it cannot mint
- * or convey filesystem authority. */
-export async function selectWindowsRunMemberPreflightForPlan(plan: WindowsLaunchPlan,
-  context: ExecutionContext, profile: SelectedExecutionProfile): Promise<Readonly<{
-    selectors: Readonly<{ mode: 'memberPreflight'; directory: string; dataRoot: string
-      binding: RunBinding; root: string; databasePath: string; sha256: string }>
-  }> | null> {
-  executionAssert(process.platform === 'win32' && plan && context.teamId.length > 0 && context.runId.length > 0,
-    'run_control_native_unknown')
-  const known: WindowsServingAdmission[] = []
-  const matches: Array<Readonly<{ serving: WindowsServingAdmission; profile: WindowsProfileAdmission }>> = []
-  for (const pending of windowsRuns.values()) {
-    const state = await pending, serving = state.serving
-    if (!serving || serving.record.binding.teamId !== context.teamId || serving.record.binding.runId !== context.runId) continue
-    known.push(serving)
-    const profiles = serving.profiles.filter(candidate => candidate.root === profile.root &&
-      candidate.databasePath === profile.databasePath && candidate.sha256 === profile.config.sha256)
-    executionAssert(profiles.length <= 1, 'run_state_start_changed')
-    if (profiles.length === 1) matches.push({ serving, profile: profiles[0]! })
-  }
-  // A known team/run serving state is never an ordinary no-cohort lookup:
-  // missing, changed, or ambiguous profile/record state fails closed.
-  executionAssert(known.length === 0 || known.length === 1 && matches.length === 1, 'run_state_start_changed')
-  const match = matches[0]
-  if (!match) return null
-  const directory = match.serving.record.directory
-  return Object.freeze({
-    selectors: Object.freeze({
-      mode: 'memberPreflight', directory, dataRoot: windowsDataRoot(directory),
-      binding: match.serving.record.binding, root: match.profile.root, databasePath: match.profile.databasePath, sha256: match.profile.sha256,
-    }),
-  })
+/** Windows reads only PID and start time of another process; the HMAC secret authenticates it. */
+function sameRunProcess(left: RunProcessIdentity, right: RunProcessIdentity): boolean {
+  return WINDOWS ? left.pid === right.pid && left.startTicks === right.startTicks : executionHash(left) === executionHash(right)
 }
 const keys = (row: Record<string, unknown>, names: readonly string[]) => executionAssert(
   Object.keys(row).sort().join(',') === [...names].sort().join(','), 'run_control_invalid')
@@ -346,6 +81,14 @@ function parseIdentity(value: unknown): RunProcessIdentity {
   return result
 }
 async function readUnixProcessIdentity(pid = process.pid): Promise<RunProcessIdentity> {
+  if (WINDOWS) {
+    executionAssert(Number.isSafeInteger(pid) && pid > 0, 'run_process_unknown')
+    const started = await readProcessStartTimeMs(pid)
+    if (started === null) throw Object.assign(new Error('run_process_unknown'), { code: 'ESRCH' })
+    const self = pid === process.pid, executablePath = self ? await realpath(process.execPath) : 'windows-process'
+    return { pid, startTicks: String(started), bootId: 'windows', executablePath,
+      executableSha256: self ? digest(await readFile(executablePath)) : '0'.repeat(64) }
+  }
   if (process.platform === 'darwin') {
     executionAssert(Number.isSafeInteger(pid) && pid > 0, 'run_process_unknown')
     const { dlopen, FFIType, ptr, toArrayBuffer } = await import('bun:ffi')
@@ -413,69 +156,24 @@ async function readUnixProcessIdentity(pid = process.pid): Promise<RunProcessIde
   return result
 }
 export async function readRunProcessIdentity(pid = process.pid): Promise<RunAnyProcessIdentity> {
-  if (process.platform === 'win32') {
-    executionAssert(Number.isSafeInteger(pid) && pid > 0, 'run_process_unknown')
-    const broker = createWindowsNativeBroker(await resolveWindowsNativeArtifact())
-    broker.events.on('error', () => {})
-    try {
-      const identity = parseWindowsIdentity(await broker.request('runStateProcessIdentity', { pid }, Date.now() + 30_000))
-      executionAssert(identity.appContainer === false, 'run_process_appcontainer')
-      return identity
-    } finally { await broker.close() }
-  }
   return readUnixProcessIdentity(pid)
 }
 function parseRecord(value: unknown): RunControlRecord {
   const row = executionRecord(value)
-  if (Object.hasOwn(row, 'platform')) {
-    keys(row, ['schema', 'protocol', 'binding', 'process', 'directory', 'deadline', 'sourceSha256', 'platform', 'endpoint'])
-    executionAssert(row.schema === 1 && row.protocol === 1 && row.platform === 'win32', 'run_control_invalid')
-    return parseWindowsRecord(row)
-  }
   keys(row, ['schema', 'protocol', 'binding', 'process', 'directory', 'socketPath', 'socketDevice', 'socketInode', 'deadline', 'uid', 'sourceSha256'])
   executionAssert(row.schema === 1 && row.protocol === 1, 'run_control_invalid')
   return { schema: 1, protocol: 1, binding: parseRunBinding(row.binding), process: parseIdentity(row.process),
     directory: string(row.directory), socketPath: string(row.socketPath), socketDevice: integer(row.socketDevice), socketInode: integer(row.socketInode),
     deadline: integer(row.deadline), uid: integer(row.uid), sourceSha256: string(row.sourceSha256) }
 }
-function parseWindowsIdentity(value: unknown): import('./OpenCodeV2RunTypes.js').RunWindowsProcessIdentity {
-  const row = executionRecord(value)
-  keys(row, ['pid', 'processCreationTime', 'executablePath', 'executableSha256', 'userSid', 'appContainer'])
-  const created = executionRecord(row.processCreationTime)
-  keys(created, ['kind', 'value', 'bootId'])
-  const result = { pid: integer(row.pid), processCreationTime: { kind: 'windows-filetime' as const, value: string(created.value), bootId: null },
-    executablePath: string(row.executablePath), executableSha256: string(row.executableSha256), userSid: string(row.userSid), appContainer: false as const }
-  executionAssert(result.pid > 0 && /^[0-9]+$/.test(result.processCreationTime.value) && /^[a-f0-9]{64}$/.test(result.executableSha256) &&
-    created.kind === 'windows-filetime' && created.bootId === null && row.appContainer === false, 'run_control_invalid')
-  return result
-}
-function parseWindowsRecord(row: Record<string, unknown>): RunWindowsControlRecord {
-  const endpoint = executionRecord(row.endpoint)
-  keys(endpoint, ['kind', 'name', 'helper', 'bun'])
-  executionAssert(endpoint.kind === 'windows-native-pipe', 'run_control_invalid')
-  return { schema: 1, protocol: 1, platform: 'win32', binding: parseRunBinding(row.binding),
-    process: parseWindowsIdentity(row.process), directory: string(row.directory), deadline: integer(row.deadline),
-    sourceSha256: string(row.sourceSha256), endpoint: { kind: 'windows-native-pipe', name: string(endpoint.name),
-      helper: parseWindowsIdentity(endpoint.helper), bun: parseWindowsIdentity(endpoint.bun) } }
-}
-function parseWindowsEndpointProof(value: unknown, record: RunWindowsControlRecord): void {
-  const row = executionRecord(value)
-  keys(row, ['schema', 'valid', 'ownerSid', 'endpointHash', 'rootIdentity', 'runIdentity', 'binding', 'helper', 'bun', 'held'])
-  const rootIdentity = parseWindowsFileIdentity(row.rootIdentity), runIdentity = parseWindowsFileIdentity(row.runIdentity)
-  executionAssert(row.schema === 1 && row.valid === true && row.held === true &&
-    row.ownerSid === record.process.userSid && rootIdentity.ownerSid === row.ownerSid &&
-    runIdentity.ownerSid === row.ownerSid &&
-    row.endpointHash === executionHash(record) && executionHash(row.binding) === executionHash(record.binding) &&
-    executionHash(parseWindowsIdentity(row.helper)) === executionHash(record.endpoint.helper) &&
-    executionHash(parseWindowsIdentity(row.bun)) === executionHash(record.endpoint.bun), 'run_control_endpoint_changed')
-}
-function sameStopReceipt(left: Extract<RunControlResult, { kind: 'stop' }>,
+// Either side may carry the late public downgrade; a proven archive keeps the proof.
+export function sameStopReceipt(left: Extract<RunControlResult, { kind: 'stop' }>,
   right: Extract<RunControlResult, { kind: 'stop' }>): boolean {
   return executionHash(left.members) === executionHash(right.members) &&
     (left.state === right.state || left.state === 'stopped' && right.state === 'cleanup_unknown' &&
-      right.ownerRetired === false)
+      right.ownerRetired === false || left.state === 'cleanup_unknown' && right.state === 'stopped')
 }
-function parseWindowsStopReceipt(value: unknown): Extract<RunControlResult, { kind: 'stop' }> {
+function parseUnixStopReceipt(value: unknown): Extract<RunControlResult, { kind: 'stop' }> {
   const receipt = executionRecord(value)
   keys(receipt, ['kind', 'state', 'members'])
   executionAssert(receipt.kind === 'stop' && (receipt.state === 'stopped' || receipt.state === 'cleanup_unknown'), 'run_control_invalid')
@@ -490,11 +188,12 @@ function parseWindowsStopReceipt(value: unknown): Extract<RunControlResult, { ki
       const row = executionRecord(member.cleanup)
       keys(row, ['scopeClosed', 'processRetired', 'descendantsRetired', 'pid', 'birth'])
       const birth = executionRecord(row.birth); keys(birth, ['format', 'value', 'bootId'])
-      executionAssert(row.scopeClosed === true && row.processRetired === true && row.descendantsRetired === true &&
-        integer(row.pid) > 0 && birth.format === 'windows-filetime' && birth.bootId === null &&
-        /^[1-9]\d{0,19}$/.test(string(birth.value)), 'run_control_invalid')
-      cleanup = { scopeClosed: true, processRetired: true, descendantsRetired: true, pid: integer(row.pid),
-        birth: { format: 'windows-filetime', value: string(birth.value), bootId: null } }
+      executionAssert(row.scopeClosed === true && row.processRetired === true && typeof row.descendantsRetired === 'boolean' &&
+        integer(row.pid) > 0 && ['linux-start-ticks', 'darwin-pidversion', 'windows-filetime', 'utc-ms'].includes(String(birth.format)) &&
+        (birth.bootId === null || typeof birth.bootId === 'string'), 'run_control_invalid')
+      cleanup = { scopeClosed: true, processRetired: true, descendantsRetired: row.descendantsRetired, pid: integer(row.pid),
+        birth: { format: String(birth.format) as ExecutionBirth['format'], value: string(birth.value),
+          bootId: birth.bootId === null ? null : string(birth.bootId) } }
     }
     return { memberId: string(member.memberId), cleanup, errors: errors.map(string) }
   })
@@ -503,7 +202,7 @@ function parseWindowsStopReceipt(value: unknown): Extract<RunControlResult, { ki
   return { kind: 'stop', state: receipt.state, members }
 }
 function parseIntent(value: unknown): QueueIntent {
-  const row = executionRecord(value); keys(row, ['identity', 'input', 'delivery'])
+  const row = executionRecord(value); optionalKeys(row, ['identity', 'input', 'delivery'], ['group'])
   const identity = executionRecord(row.identity)
   const typedIdentity = { requestId: string(identity.requestId), deliveryAttemptId: string(identity.deliveryAttemptId), localMessageId: string(identity.localMessageId), nativeInputID: string(identity.nativeInputID) }
   keys(identity, ['requestId', 'deliveryAttemptId', 'localMessageId', 'nativeInputID']); assertIntentIdentity(typedIdentity)
@@ -531,6 +230,10 @@ function parseIntent(value: unknown): QueueIntent {
   const result: QueueIntent = { identity: typedIdentity, input: { nativeInputID: typedIdentity.nativeInputID, text, resume: input.resume,
     ...(files ? { files } : {}), ...(agents ? { agents } : {}), ...(skills ? { skills } : {}) }, delivery: 'queue' }
   executionAssert(Buffer.byteLength(canonicalExecutionJSON(result.input)) <= 256 * 1024, 'run_control_invalid')
+  if (row.group !== undefined) {
+    const group = parseOpenCodeV2GroupDelivery(executionRecord(row.group), typedIdentity.localMessageId)
+    executionAssert(group && executionHash(group) === executionHash(row.group), 'GROUP_INVALID_ENVELOPE'); result.group = group
+  }
   return result
 }
 export function parseRunControlRequest(value: unknown): RunControlRequest {
@@ -554,7 +257,7 @@ export function parseRunControlRequest(value: unknown): RunControlRequest {
     executionAssert(submissionOwner === undefined || intent && /^[a-zA-Z0-9._-]{1,200}$/.test(submissionOwner), 'run_control_invalid')
     return { operation, memberId, originalSessionId, nativeInputID, ...(intent ? { intent } : {}), ...(submissionOwner ? { submissionOwner } : {}) }
   }
-  if (operation === 'transcript' || operation === 'permissions' || operation === 'mcp' || operation === 'probeEvidence') {
+  if (operation === 'transcript' || operation === 'permissions' || operation === 'mcp' || operation === 'probeEvidence' || operation === 'groupProof') {
     keys(row, ['operation', 'memberId', 'originalSessionId']); return { operation, memberId, originalSessionId }
   }
   executionAssert(operation === 'permissionReply' && (row.decision === 'allow' || row.decision === 'deny'), 'run_control_invalid')
@@ -567,13 +270,20 @@ export function runControlDirectory(dataRoot: string, teamId: string, runId: str
 }
 async function privatePath(file: string, kind: 'directory' | 'file' | 'socket', uid: number) {
   const stat = await lstat(file)
-  executionAssert(!stat.isSymbolicLink() && stat.uid === uid && (stat.mode & 0o077) === 0 &&
+  executionAssert(!stat.isSymbolicLink() && (WINDOWS || stat.uid === uid && (stat.mode & 0o077) === 0) &&
     (kind === 'directory' ? stat.isDirectory() : kind === 'socket' ? stat.isSocket() : stat.isFile() && stat.nlink === 1), 'run_control_foreign')
   return stat
 }
-/** Both transports address the held directory vnode, even for long durable paths. */
-async function openSocketDirectory(directory: string, uid: number) {
-  executionAssert((process.platform === 'linux' || process.platform === 'darwin') && process.versions.bun === '1.3.11', 'run_source_unix_bun_required')
+/** POSIX transports address the held directory vnode, even for long durable paths.
+ * Windows listens on loopback TCP; `port` selects the published endpoint for a client. */
+async function openSocketDirectory(directory: string, uid: number, port?: number) {
+  executionAssert(process.versions.bun === openCodeBunVersion(), 'run_source_bun_required')
+  if (WINDOWS) {
+    await privatePath(directory, 'directory', uid)
+    return { fd: { close: async () => {} }, assertCurrent: async () => {},
+      connect: () => { executionAssert(port !== undefined, 'run_control_invalid'); return createConnection({ host: '127.0.0.1', port }) },
+      listen: (server: ReturnType<typeof createServer>, ready: () => void) => server.listen(0, '127.0.0.1', ready) }
+  }
   const before = await privatePath(directory, 'directory', uid)
   executionAssert(await realpath(directory) === directory, 'run_control_foreign')
   const fd = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
@@ -609,46 +319,28 @@ async function openSocketDirectory(directory: string, uid: number) {
 }
 async function readPrivate(file: string, uid: number): Promise<Buffer> {
   const before = await privatePath(file, 'file', uid)
-  executionAssert(before.size <= MAX_FRAME, 'run_control_invalid')
+  executionAssert(before.size <= MAX_RECORD, 'run_control_invalid')
   const fd = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW)
   try {
     const stat = await fd.stat()
     executionAssert(stat.dev === before.dev && stat.ino === before.ino, 'run_control_changed')
-    const bytes = await fd.readFile(); executionAssert(bytes.length <= MAX_FRAME, 'run_control_invalid'); return bytes
+    const bytes = await fd.readFile(); executionAssert(bytes.length <= MAX_RECORD, 'run_control_invalid'); return bytes
   } finally { await fd.close() }
 }
 export async function writeRunControlFile(directory: string, name: string, value: unknown): Promise<void> {
   executionAssert(/^[a-z-]+\.json$/.test(name), 'run_control_invalid')
-  if (process.platform === 'win32') return windowsWrite(directory, name, value)
-  const uid = process.getuid?.(); executionAssert(uid !== undefined, 'run_source_linux_required')
+  const uid = currentUid()
   await privatePath(directory, 'directory', uid)
   const temporary = path.join(directory, `${name}.${randomUUID()}`), target = path.join(directory, name)
   const fd = await open(temporary, 'wx', 0o600)
   try { await fd.writeFile(canonicalExecutionJSON(value) + '\n'); await fd.sync() } finally { await fd.close() }
   await rename(temporary, target)
-  const parent = await open(directory, 'r'); try { await parent.sync() } finally { await parent.close() }
+  if (!WINDOWS) { const parent = await open(directory, 'r'); try { await parent.sync() } finally { await parent.close() } }
 }
 /** Only explicit launch creates this non-expiring fence. Observe/stop never do. */
 export async function reserveRunControlDirectory(dataRoot: string, binding: RunBinding, sourceSha256: string,
   profiles: readonly SelectedExecutionProfile[] = []): Promise<string> {
-  if (process.platform === 'win32') {
-    executionAssert(await realpath(dataRoot) === dataRoot, 'run_control_native_unknown')
-    const directory = runControlDirectory(dataRoot, binding.teamId, binding.runId)
-    executionAssert(profiles.length > 0, 'run_control_selection_missing')
-    const admittedProfiles = profiles.map(windowsProfileAdmission)
-    // Explicit reservation prepares parents only. Native acquisition below is
-    // still the sole exclusive creator of the non-expiring run leaf/fence.
-    await ensureWindowsPrivateDirectories([dataRoot, path.join(dataRoot, 'opencode'),
-      path.join(dataRoot, 'opencode', 'v2'), path.dirname(directory)])
-    const state = await windowsComposition(directory, {
-      mode: 'reserve', dataRoot, binding, profiles: admittedProfiles,
-    })
-    await state.broker.request('runStateReserve', {
-      stateId: state.stateId, binding, sourceSha256, directory, dataRoot, sharedControllerRootCohort: true,
-    }, Date.now() + MAX_OPERATION_MS)
-    return directory
-  }
-  const uid = process.getuid?.(); executionAssert(uid !== undefined && await realpath(dataRoot) === dataRoot, 'run_source_linux_required')
+  const uid = currentUid(); executionAssert(await realpath(dataRoot) === dataRoot, 'run_control_foreign')
   const directory = runControlDirectory(dataRoot, binding.teamId, binding.runId)
   let parent = dataRoot
   for (const part of ['opencode', 'v2', 'runs']) {
@@ -658,8 +350,8 @@ export async function reserveRunControlDirectory(dataRoot: string, binding: RunB
       // V1's registry shares this ancestor and may create it as 0755. It holds
       // no V2 secrets; its namespace must remain owned and non-writable to others.
       const shared = await lstat(parent)
-      executionAssert(shared.isDirectory() && !shared.isSymbolicLink() && shared.uid === uid &&
-        (shared.mode & 0o022) === 0 && await realpath(parent) === parent, 'run_control_foreign')
+      executionAssert(shared.isDirectory() && !shared.isSymbolicLink() && (WINDOWS || shared.uid === uid &&
+        (shared.mode & 0o022) === 0) && await realpath(parent) === parent, 'run_control_foreign')
     } else await privatePath(parent, 'directory', uid)
   }
   await mkdir(directory, { mode: 0o700 })
@@ -670,14 +362,7 @@ export async function reserveRunControlDirectory(dataRoot: string, binding: RunB
 }
 export async function discoverOpenCodeV2Run(dataRoot: string, teamId: string, runId: string): Promise<RunControlRecord | null> {
   const directory = runControlDirectory(dataRoot, teamId, runId)
-  if (process.platform === 'win32') {
-    const record = await windowsDiscover(directory, dataRoot, teamId, runId)
-    if (record === null) return null
-    const native = windowsRecord(record)
-    executionAssert(native.directory === directory && native.binding.teamId === teamId && native.binding.runId === runId, 'run_control_foreign')
-    return record
-  }
-  const uid = process.getuid?.(); executionAssert(uid !== undefined, 'run_source_linux_required')
+  const uid = currentUid()
   try { await privatePath(directory, 'directory', uid) }
   catch (error) { if (executionRecord(error).code === 'ENOENT') return null; throw error }
   // An existing launch fence with no published endpoint remains UNKNOWN, not
@@ -687,25 +372,18 @@ export async function discoverOpenCodeV2Run(dataRoot: string, teamId: string, ru
   executionAssert(unix.directory === directory && unix.binding.teamId === teamId && unix.binding.runId === runId && unix.uid === uid, 'run_control_foreign')
   return record
 }
-async function validateEndpoint(record: RunControlRecord, deadline = Date.now() + MAX_OPERATION_MS,
-  composition?: WindowsRunComposition): Promise<void> {
-  if (process.platform === 'win32') {
-    const native = windowsRecord(record), state = composition ?? await windowsCompositionFor(native, deadline)
-    const proof = await state.broker.request('runStateValidateEndpoint', {
-      stateId: state.stateId, directory: native.directory, endpointHash: executionHash(record),
-    }, deadline)
-    parseWindowsEndpointProof(proof, native)
-    return
-  }
+async function validateEndpoint(record: RunControlRecord): Promise<void> {
   const unix = unixRecord(record)
-  const uid = process.getuid?.(); executionAssert(uid === unix.uid, 'run_control_foreign')
+  const uid = currentUid(); executionAssert(uid === unix.uid, 'run_control_foreign')
   await privatePath(unix.directory, 'directory', unix.uid)
   const current = parseRecord(JSON.parse((await readPrivate(path.join(unix.directory, 'control.json'), unix.uid)).toString('utf8')))
-  executionAssert(isUnixRecord(current) && executionHash(current) === executionHash(unix) &&
-    unix.socketPath === path.join(unix.directory, 'control.sock'), 'run_control_changed')
-  const socket = await privatePath(unix.socketPath, 'socket', unix.uid)
-  executionAssert(socket.dev === unix.socketDevice && socket.ino === unix.socketInode, 'run_control_changed')
-  executionAssert(executionHash(await readUnixProcessIdentity(unix.process.pid)) === executionHash(unix.process), 'run_owner_stale')
+  executionAssert(executionHash(current) === executionHash(unix) &&
+    (WINDOWS ? tcpEndpoint(endpointPort(unix.socketPath)) === unix.socketPath : unix.socketPath === path.join(unix.directory, 'control.sock')), 'run_control_changed')
+  if (!WINDOWS) {
+    const socket = await privatePath(unix.socketPath, 'socket', unix.uid)
+    executionAssert(socket.dev === unix.socketDevice && socket.ino === unix.socketInode, 'run_control_changed')
+  }
+  executionAssert(sameRunProcess(await readUnixProcessIdentity(unix.process.pid), unix.process), 'run_owner_stale')
 }
 const signature = (secret: Buffer, value: unknown) => createHmac('sha256', secret).update(canonicalExecutionJSON(value)).digest('hex')
 function authentic(secret: Buffer, value: unknown, mac: unknown): boolean {
@@ -738,17 +416,13 @@ function writeFrame(socket: Socket, value: unknown): void {
   const bytes = canonicalExecutionJSON(value) + '\n'; executionAssert(Buffer.byteLength(bytes) <= MAX_FRAME, 'run_control_frame_too_large')
   socket.write(bytes)
 }
-async function runOwnerRetired(record: RunControlRecord, deadline = Date.now() + MAX_OPERATION_MS): Promise<boolean> {
-  if (process.platform === 'win32') {
-    const native = windowsRecord(record), state = await windowsCompositionFor(native, deadline)
-    return (await state.broker.request('runStateOwnerRetired', {
-      stateId: state.stateId, directory: native.directory,
-    }, deadline) as { retired: boolean }).retired
-  }
+async function runOwnerRetired(record: RunControlRecord, _deadline = Date.now() + MAX_OPERATION_MS): Promise<boolean> {
   const unix = unixRecord(record)
   let live = true
-  try { live = executionHash(await readUnixProcessIdentity(unix.process.pid)) === executionHash(unix.process) }
+  try { live = sameRunProcess(await readUnixProcessIdentity(unix.process.pid), unix.process) }
   catch (error) { if (executionRecord(error).code === 'ENOENT' || executionRecord(error).code === 'ESRCH') live = false }
+  // The TCP endpoint closes with its process; only POSIX leaves a pathname to check.
+  if (WINDOWS) return !live
   const endpoint = await lstat(unix.socketPath).catch((error: unknown) => {
     if (executionRecord(error).code === 'ENOENT') return null; throw error
   })
@@ -765,32 +439,158 @@ async function observeRunOwnerRetired(record: RunControlRecord, deadline: number
 /** Read-only, exact-run stop retry. An archive never regains execution authority. */
 export async function readOpenCodeV2RunStop(record: RunControlRecord,
   deadline = Date.now() + MAX_OPERATION_MS): Promise<Extract<RunControlResult, { kind: 'stop' }> | null> {
-  if (process.platform === 'win32') {
-    const native = windowsRecord(record), state = await windowsCompositionFor(native, deadline)
-    const value = await state.broker.request('runStateReadStop', {
-      stateId: state.stateId, directory: native.directory, endpointHash: executionHash(record),
-    }, deadline) as { absent?: true; receipt?: unknown }
-    if (value.absent === true) return null
-    const receipt = parseWindowsStopReceipt(value.receipt)
-    const retired = await observeRunOwnerRetired(record, deadline)
-    executionAssert(receipt.ownerRetired !== true || retired, 'run_control_invalid')
-    return { ...receipt, state: receipt.state === 'stopped' && retired ? 'stopped' : 'cleanup_unknown', ownerRetired: retired }
-  }
   const unix = unixRecord(record)
   await privatePath(unix.directory, 'directory', unix.uid)
   const current = parseRecord(JSON.parse((await readPrivate(path.join(unix.directory, 'control.json'), unix.uid)).toString('utf8')))
-  executionAssert(isUnixRecord(current) && executionHash(current) === executionHash(unix), 'run_control_changed')
+  executionAssert(executionHash(current) === executionHash(unix), 'run_control_changed')
   let archive: Record<string, unknown>
   try { archive = executionRecord(JSON.parse((await readPrivate(path.join(unix.directory, 'stop.json'), unix.uid)).toString('utf8'))) }
   catch (error) { if (executionRecord(error).code === 'ENOENT') return null; throw error }
   keys(archive, ['binding', 'receipt'])
   const tombstone = executionRecord(JSON.parse((await readPrivate(path.join(unix.directory, 'tombstone.json'), unix.uid)).toString('utf8')))
   executionAssert(executionHash(archive.binding) === executionHash(unix.binding) && executionHash(tombstone.binding) === executionHash(unix.binding), 'run_control_foreign')
-  const receipt = executionRecord(archive.receipt)
-  executionAssert(receipt.kind === 'stop' && (receipt.state === 'stopped' || receipt.state === 'cleanup_unknown') && Array.isArray(receipt.members) && receipt.members.length <= 32, 'run_control_invalid')
-  const result = receipt as Extract<RunControlResult, { kind: 'stop' }>
+  const receipt = parseUnixStopReceipt(archive.receipt)
   const retired = await runOwnerRetired(record, deadline)
-  return { ...result, state: result.state === 'stopped' && retired ? 'stopped' : 'cleanup_unknown', ownerRetired: retired }
+  return { ...receipt, state: receipt.state === 'stopped' && retired ? 'stopped' : 'cleanup_unknown', ownerRetired: retired }
+}
+/** Windows reads only the start time of another process, and its `null` covers a gone,
+ * exited and inaccessible process alike. It never proves absence: `null` stays UNKNOWN,
+ * so retirement and probe replacement fail closed on Windows. */
+export async function readWindowsRunProcessPresence(identity: RunProcessIdentity,
+  readStartTime: (pid: number) => Promise<number | null> = pid => readProcessStartTimeMs(pid)): Promise<'same' | 'replaced'> {
+  const started = await readStartTime(identity.pid)
+  executionAssert(started !== null, 'run_process_unknown')
+  return String(started) === identity.startTicks ? 'same' : 'replaced'
+}
+/** Kernel presence of the exact published process instance, without hashing its image.
+ * POSIX: 'absent' only on the kernel's ESRCH (Darwin) or a missing /proc entry while
+ * procfs answers (Linux). 'replaced' when another instance or boot holds the PID.
+ * Windows never reports 'absent' (see above). Query failures throw and stay UNKNOWN. */
+async function readRunProcessPresence(identity: RunProcessIdentity): Promise<'same' | 'replaced' | 'absent'> {
+  const pid = identity.pid
+  executionAssert(Number.isSafeInteger(pid) && pid > 0, 'run_process_unknown')
+  if (WINDOWS) return readWindowsRunProcessPresence(identity)
+  if (process.platform === 'darwin') {
+    const { dlopen, FFIType, ptr, toArrayBuffer } = await import('bun:ffi')
+    const native = dlopen('/usr/lib/libSystem.B.dylib', {
+      proc_pidinfo: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+      sysctlbyname: { args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u64], returns: FFIType.i32 },
+      __error: { args: [], returns: FFIType.ptr },
+    })
+    try {
+      const info = Buffer.alloc(56), boot = Buffer.alloc(128), length = Buffer.alloc(8)
+      length.writeBigUInt64LE(128n)
+      const written = native.symbols.proc_pidinfo(pid, 17, 0, ptr(info), info.length)
+      if (written !== info.length) {
+        // errno is defined only for the failure return; a short read stays UNKNOWN.
+        executionAssert(written <= 0, 'run_process_unknown')
+        const pointer = native.symbols.__error()
+        executionAssert(pointer !== null, 'run_process_unknown')
+        if (new DataView(toArrayBuffer(pointer, 0, 4)).getInt32(0, true) === 3) return 'absent'
+        throw Object.assign(new Error('run_process_unknown'), { code: 'EACCES' })
+      }
+      executionAssert(native.symbols.sysctlbyname(ptr(Buffer.from('kern.bootsessionuuid\0')), ptr(boot), ptr(length), null, 0) === 0, 'run_process_unknown')
+      const bootId = boot.toString('utf8').split('\0')[0]!.toLowerCase()
+      // The same unique process ID:PID version fields the identity read publishes.
+      return bootId === identity.bootId && `${info.readBigUInt64LE(16)}:${info.readInt32LE(32)}` === identity.startTicks ? 'same' : 'replaced'
+    } finally { native.close() }
+  }
+  executionAssert(process.platform === 'linux', 'run_source_linux_required')
+  let stat: string
+  try { stat = await readFile(`/proc/${pid}/stat`, 'utf8') }
+  catch (error) {
+    const code = executionRecord(error).code
+    if (code !== 'ENOENT' && code !== 'ESRCH') throw error
+    // A missing entry proves absence only while procfs itself answers.
+    await readFile('/proc/self/stat', 'utf8'); return 'absent'
+  }
+  const bootId = (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim()
+  const startTicks = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19]
+  executionAssert(startTicks && /^[0-9]+$/.test(startTicks), 'run_process_unknown')
+  return bootId === identity.bootId && startTicks === identity.startTicks ? 'same' : 'replaced'
+}
+/** Only closed categories and provider wire facts: an unknown category reads as
+ * `provider_operation_unknown`; a malformed record is refused. */
+export function parseOpenCodeV2RunOwnerFailure(value: unknown): RunOwnerFailure {
+  const row = executionRecord(value); optionalKeys(row, ['category'], ['operation'])
+  executionAssert(typeof row.category === 'string', 'run_control_invalid')
+  const category = openCodeV2ProviderFailureCategory(row.category)
+  if (row.operation === undefined) return { category }
+  const operation = executionRecord(row.operation); keys(operation, ['operation', 'stage', 'status'])
+  const name = OPEN_CODE_V2_PROVIDER_OPERATIONS.find(value => value === operation.operation)
+  const stage = OPEN_CODE_V2_PROVIDER_STAGES.find(value => value === operation.stage)
+  const status = operation.status === null ? null : typeof operation.status === 'number' ? operation.status : Number.NaN
+  executionAssert(name && stage && (status === null || Number.isSafeInteger(status) && status >= 100 && status <= 599), 'run_control_invalid')
+  return { category, operation: { operation: name, stage, status } }
+}
+/** The owner's own closed initialization cause, written before its stop archive. */
+async function readRunOwnerFailure(unix: RunUnixControlRecord): Promise<RunOwnerFailure | null> {
+  let bytes: Buffer
+  try { bytes = await readPrivate(path.join(unix.directory, 'owner-failure.json'), unix.uid) }
+  catch (error) { if (executionRecord(error).code === 'ENOENT') return null; throw error }
+  let value: unknown
+  try { value = JSON.parse(bytes.toString('utf8')) } catch { throw new Error('run_control_invalid') }
+  const row = executionRecord(value); keys(row, ['binding', 'failure'])
+  executionAssert(executionHash(row.binding) === executionHash(unix.binding), 'run_control_foreign')
+  return parseOpenCodeV2RunOwnerFailure(row.failure)
+}
+/** 'stopping': the same process is alive after publishing its tombstone. 'unproven': a
+ * live owner without a tombstone, or a PID held by another process without the owner's
+ * own retirement archive. */
+async function inspectRunOwnerExit(record: RunControlRecord): Promise<RunOwnerRetirement | 'stopping' | 'unproven'> {
+  const unix = unixRecord(record)
+  await privatePath(unix.directory, 'directory', unix.uid)
+  const current = parseRecord(JSON.parse((await readPrivate(path.join(unix.directory, 'control.json'), unix.uid)).toString('utf8')))
+  executionAssert(executionHash(current) === executionHash(unix), 'run_control_changed')
+  const presence = await readRunProcessPresence(unix.process)
+  if (presence === 'same') {
+    return await privatePath(path.join(unix.directory, 'tombstone.json'), 'file', unix.uid).then(() => 'stopping' as const,
+      (error: unknown) => { if (executionRecord(error).code === 'ENOENT') return 'unproven' as const; throw error })
+  }
+  if (presence === 'replaced' && (await readOpenCodeV2RunStop(record))?.ownerRetired !== true) return 'unproven'
+  // The cause is observational: an unreadable record never blocks a proven retirement.
+  return { failure: await readRunOwnerFailure(unix).catch(() => null) }
+}
+/** Read-only proof that the exact original owner process is gone: the kernel has no
+ * process for its PID, or its own stop archive proves retirement after the PID changed
+ * hands. A live owner or a tombstone alone stays unretired; this never authenticates,
+ * signals or replaces any process. */
+export async function readOpenCodeV2RunOwnerRetirement(record: RunControlRecord): Promise<RunOwnerRetirement | null> {
+  const inspected = await inspectRunOwnerExit(record)
+  return typeof inspected === 'string' ? null : inspected
+}
+const ownerRetirements = new WeakMap<Error, RunOwnerRetirement>()
+function ownerRetiredError(retirement: RunOwnerRetirement): Error {
+  const error = new Error('run_owner_retired'); ownerRetirements.set(error, retirement); return error
+}
+/** Only an error minted here from a proven retirement carries the owner's closed cause. */
+export function readOpenCodeV2RunOwnerRetiredError(error: unknown): RunOwnerRetirement | undefined {
+  return error instanceof Error ? ownerRetirements.get(error) : undefined
+}
+/** Follow an owner that is leaving until its exit is proven, within the stop reconcile
+ * window. `stopping` is the owner's own authenticated state. An unproven owner or an
+ * unreadable proof returns null at once, so callers keep their previous result. */
+async function awaitRunOwnerExit(record: RunControlRecord, deadline: number, stopping: boolean): Promise<RunOwnerRetirement | null> {
+  const until = Math.min(deadline, Date.now() + STOP_RECONCILE_MS)
+  while (Date.now() < until) {
+    let inspected: Awaited<ReturnType<typeof inspectRunOwnerExit>>
+    try { inspected = await inspectRunOwnerExit(record) } catch { return null }
+    if (typeof inspected !== 'string') return inspected
+    if (inspected === 'unproven' && !stopping) return null
+    await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(1, until - Date.now()))))
+  }
+  return null
+}
+// Failures an exiting owner produces: a removed endpoint or file, an absent process,
+// or an identity read that changed or failed between its two kernel reads.
+const ownerExitMessages = new Set(['run_process_changed', 'run_process_unknown', 'run_owner_stale'])
+async function classifyRunOwnerExit(record: RunControlRecord, failure: unknown, deadline: number): Promise<unknown> {
+  const code = failure !== null && typeof failure === 'object' ? (failure as { code?: unknown }).code : undefined
+  if (!(code === 'ENOENT' || code === 'ESRCH' || failure instanceof Error && ownerExitMessages.has(failure.message))) return failure
+  // Only a proven exit replaces the original error; a PID held by another process
+  // without the owner's own retirement archive stays a process change.
+  const retirement = await awaitRunOwnerExit(record, deadline, false)
+  return retirement ? ownerRetiredError(retirement) : failure
 }
 /** Endpoint publication precedes native initialization. Observe only this authenticated
  * original owner until its original member is ready; this never submits or replaces input. */
@@ -806,12 +606,12 @@ export async function awaitOpenCodeV2RunMemberReadiness(record: RunControlRecord
   while (Date.now() < deadline) {
     let status: RunControlResult
     try { status = await requestOpenCodeV2Run(record, { operation: 'status' },
-      Math.min(process.platform === 'win32' ? MAX_OPERATION_MS : 5000, deadline - Date.now())) }
+      Math.min(5000, deadline - Date.now())) }
     catch (error) {
       // Authentication and framing share this budget. Expiry can close the
       // final read before a reply; expiry never authorizes input submission.
       if (Date.now() >= deadline) return null
-      if (!isTransientOpenCodeV2ControlRead(error)) throw error
+      if (!isTransientOpenCodeV2ControlRead(error)) throw await classifyRunOwnerExit(record, error, deadline)
       await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
       continue
     }
@@ -827,7 +627,12 @@ export async function awaitOpenCodeV2RunMemberReadiness(record: RunControlRecord
         member.bootstrap.missingNativeMessageID === true && member.runtimePid !== undefined, 'run_readiness_unknown')
       return Date.now() < deadline ? member : null
     }
-    if (status.state !== 'starting') return null
+    if (status.state !== 'starting') {
+      // A stopping or stopped original never becomes ready; report its proven exit.
+      const retirement = await awaitRunOwnerExit(record, deadline, true)
+      if (retirement) throw ownerRetiredError(retirement)
+      return null
+    }
     await new Promise(resolve => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
   }
   return null
@@ -835,44 +640,21 @@ export async function awaitOpenCodeV2RunMemberReadiness(record: RunControlRecord
 
 export async function requestOpenCodeV2Run(record: RunControlRecord, request: RunControlRequest, timeoutMs = MAX_OPERATION_MS): Promise<RunControlResult> {
   request = parseRunControlRequest(request)
-  executionAssert(Number.isSafeInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= MAX_OPERATION_MS, 'run_control_invalid')
   const cleanup = request.operation === 'stop' || request.operation === 'status'
-  const deadline = Math.min(Date.now() + timeoutMs, record.deadline + (cleanup ? MAX_OPERATION_MS : 0))
-  if (process.platform === 'win32') {
-    const native = windowsRecord(record)
-    if (request.operation === 'stop') {
-      const archived = await readOpenCodeV2RunStop(record, deadline)
-      if (archived) return archived
-    }
-    executionAssert(deadline > Date.now(), 'run_deadline_expired')
-    const state = await windowsCompositionFor(native, deadline)
-    await validateEndpoint(record, deadline, state)
-    const client = parseWindowsIdentity(await state.broker.request('runStateProcessIdentity', { pid: process.pid }, deadline))
-    executionAssert(client.appContainer === false, 'run_process_appcontainer')
-    executionAssert(deadline > Date.now(), 'run_deadline_expired')
-    const payload = { protocol: 1, binding: native.binding, endpoint: executionHash(record),
-      client, nonce: randomBytes(32).toString('hex'), deadline, request }
-    // The fresh caller identity is measured here and independently compared by
-    // native pipe peer proofs. It never borrows the published server PID.
-    const received = await state.broker.request('runStateRequest', {
-      stateId: state.stateId, directory: native.directory, endpointHash: payload.endpoint,
-      payload, timeoutMs: Math.max(1, deadline - Date.now()),
-    }, deadline) as { response: unknown }
-    const response = executionRecord(received.response)
-    executionAssert(response.nonce === payload.nonce && response.endpoint === payload.endpoint, 'run_control_foreign')
-    if (response.error !== undefined) throw new Error(string(response.error))
-    const value = executionRecord(response.result)
-    executionAssert(value.kind === request.operation || (value.kind === 'send_refused' &&
-      (request.operation === 'send' || request.operation === 'observe' && request.intent !== undefined)), 'run_control_invalid')
-    if (value.kind === 'stop') {
-      const stop = value as Extract<RunControlResult, { kind: 'stop' }>
-      const archived = await readOpenCodeV2RunStop(record, deadline)
-      executionAssert(archived !== null && sameStopReceipt(stop, archived), 'run_control_invalid')
-      return archived
-    }
-    await validateEndpoint(record, deadline, state)
-    return value as RunControlResult
+  executionAssert(Number.isSafeInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= (cleanup ? MAX_STOP_OPERATION_MS : MAX_OPERATION_MS), 'run_control_invalid')
+  const deadline = Math.min(Date.now() + timeoutMs, record.deadline + (cleanup ? MAX_STOP_OPERATION_MS : 0))
+  try {
+    return await exchangeOpenCodeV2Run(record, request, deadline)
+  } catch (failure) {
+    // A stop whose reply was lost is confirmed once from the durable archive of
+    // the same run; only a proven stopped archive replaces the failure and every
+    // custody/validity refusal keeps its exact closed code.
+    if (request.operation === 'stop' && isTransientOpenCodeV2ControlRead(failure))
+      return confirmOpenCodeV2RunStop(record, failure, Date.now() + STOP_RECONCILE_MS)
+    throw failure
   }
+}
+async function exchangeOpenCodeV2Run(record: RunControlRecord, request: RunControlRequest, deadline: number): Promise<RunControlResult> {
   const unix = unixRecord(record)
   if (request.operation === 'stop') {
     const archived = await readOpenCodeV2RunStop(unix, deadline)
@@ -884,7 +666,7 @@ export async function requestOpenCodeV2Run(record: RunControlRecord, request: Ru
   executionAssert(secret.length === 32, 'run_control_invalid')
   const payload = { protocol: 1, binding: unix.binding, endpoint: executionHash(unix),
     client: await readUnixProcessIdentity(), nonce: randomBytes(32).toString('hex'), deadline, request }
-  const socketDirectory = await openSocketDirectory(unix.directory, unix.uid)
+  const socketDirectory = await openSocketDirectory(unix.directory, unix.uid, WINDOWS ? endpointPort(unix.socketPath) : undefined)
   let socket: Socket | undefined
   try {
     await validateEndpoint(unix)
@@ -924,134 +706,40 @@ export async function requestOpenCodeV2Run(record: RunControlRecord, request: Ru
     } finally { await socketDirectory.fd.close() }
   }
 }
-async function serveWindowsRunControl(directory: string, binding: RunBinding, deadline: number, sourceSha256: string,
-  execute: (request: RunControlRequest, deadline: number) => Promise<RunControlResult>,
-  profiles: readonly SelectedExecutionProfile[] = []): Promise<{ record: RunControlRecord; close(): Promise<void> }> {
-  executionAssert(profiles.length > 0, 'run_control_selection_missing')
-  const admittedProfiles = Object.freeze(profiles.map(windowsProfileAdmission))
-  const state = await windowsComposition(directory, {
-    mode: 'serve', dataRoot: windowsDataRoot(directory), binding, profiles: admittedProfiles,
-  })
-  // Capture the first terminal pump failure even when it precedes the listen ACK.
-  // This is diagnostic only: no retry, request result, or authority changes.
-  let pumpFailureRecorded = false
-  const onPumpFailure = (event: unknown) => {
-    if (pumpFailureRecorded) return
-    if (!event || typeof event !== 'object' || Array.isArray(event)) return
-    const value = event as Record<string, unknown>
-    const codes: readonly unknown[] = ['cleanup_unknown', 'run_control_accept_timeout', 'run_control_accept_unknown', 'run_control_connect_unknown', 'run_control_connection_limit', 'run_control_disconnected', 'run_control_endpoint_changed', 'run_control_foreign', 'run_control_frame_invalid', 'run_control_frame_oversize', 'run_control_held_identity', 'run_control_held_inputs', 'run_control_hmac_unknown', 'run_control_image_changed', 'run_control_image_hash', 'run_control_listen_unknown', 'run_control_owner_identity', 'run_control_package_peer_identity', 'run_control_parent_birth', 'run_control_parent_join', 'run_control_path_alias', 'run_control_peer_identity', 'run_control_pipe_name', 'run_control_pipe_security', 'run_control_process_identity', 'run_control_pump_unknown', 'run_control_read_unknown', 'run_control_timeout', 'run_control_write_partial', 'run_control_write_unknown', 'run_process_changed', 'run_state_acl_unknown', 'run_state_challenge_changed', 'run_state_challenge_unknown', 'run_state_endpoint_changed', 'run_state_endpoint_missing', 'run_state_held_inputs', 'run_state_identity_changed', 'run_state_record_absent', 'run_state_record_changed', 'run_state_record_collision', 'run_state_record_encoding', 'run_state_record_name', 'run_state_record_read', 'run_state_record_rename', 'run_state_record_size', 'run_state_record_temporary', 'run_state_record_unknown', 'run_state_record_write', 'run_state_start_changed', 'run_state_unknown']
-    const phases = ['accept_wait', 'accept_authenticate', 'accept_replenish', 'read_frame',
-      'verify_frame', 'validate_payload', 'publish_request']
-    if (typeof value.phase !== 'string' || !phases.includes(value.phase) ||
-      !codes.includes(value.code) || !Number.isSafeInteger(value.nativeCode) ||
-      Number(value.nativeCode) < 0 || Number(value.nativeCode) > 0xffffffff) return
-    pumpFailureRecorded = true
-    void writeRunControlFile(directory, 'operation-failure.json', {
-      schemaVersion: 1, event: 'opencode_v2_run_control_failure', binding,
-      category: 'run_control_pump_failed',
-      controlPhase: value.phase, controlCode: value.code, nativeCode: value.nativeCode,
-      timestamp: new Date().toISOString(),
-    }).catch(() => {})
-  }
-  state.broker.events.on('runControlFailure', onPumpFailure)
-  const record = await (async () => {
-    try {
-      const listened = await state.broker.request('runStateListen', {
-        stateId: state.stateId, directory, binding, deadline, sourceSha256,
-      }, Date.now() + MAX_OPERATION_MS) as { record: unknown }
-      const record = parseRecord(listened.record), native = windowsRecord(record)
-      executionAssert(executionHash(native.binding) === executionHash(binding) && native.directory === directory, 'run_control_foreign')
-      return record
-    } catch (error) {
-      state.broker.events.off('runControlFailure', onPumpFailure)
-      throw error
+// Custody and validity refusals met while confirming keep their exact closed code;
+// native run-state refusals may carry a closed ':stage:code' suffix.
+const STOP_CONFIRM_REFUSALS = new Set(['run_control_foreign', 'run_control_changed', 'run_control_invalid',
+  'run_control_endpoint_changed', 'run_control_selection_missing'])
+async function confirmOpenCodeV2RunStop(record: RunControlRecord, failure: unknown,
+  deadline: number): Promise<Extract<RunControlResult, { kind: 'stop' }>> {
+  // The attempt bound keeps the window finite even when the wall clock stalls.
+  for (let attempt = 0; attempt <= STOP_RECONCILE_MS / 100; attempt += 1) {
+    let archived: Extract<RunControlResult, { kind: 'stop' }> | null
+    try { archived = await readOpenCodeV2RunStop(record, deadline) }
+    catch (error) {
+      const code = error instanceof Error ? error.message.split(':')[0]! : ''
+      if (STOP_CONFIRM_REFUSALS.has(code) || code.startsWith('run_state_')) throw error
+      break
     }
-  })()
-  const native = windowsRecord(record), usedNonces = new OpenCodeV2RunNonces()
-  // Native serving ACK plus parseRecord validation publishes the only retained
-  // record/profile comparison state used by later member preflight.
-  state.serving = Object.freeze({
-    record: native,
-    profiles: admittedProfiles,
-  })
-  const active = new Set<Promise<void>>()
-  const onRequest = (event: unknown) => {
-    const task = (async () => {
-      const envelope = executionRecord(event)
-      keys(envelope, ['connection', 'payload'])
-      const connection = string(envelope.connection), payload = executionRecord(envelope.payload)
-      keys(payload, ['protocol', 'binding', 'endpoint', 'client', 'nonce', 'deadline', 'request'])
-      const request = parseRunControlRequest(payload.request)
-      const requestDeadline = integer(payload.deadline)
-      // Native measurement, endpoint/root validation and HMAC verification
-      // completed before this event. Replay/deadline policy remains authoritative.
-      executionAssert(payload.protocol === 1 && executionHash(payload.binding) === executionHash(binding) &&
-        payload.endpoint === executionHash(native) && parseWindowsIdentity(payload.client).appContainer === false &&
-        requestDeadline > Date.now() && requestDeadline <= deadline + (request.operation === 'stop' || request.operation === 'status' ? MAX_OPERATION_MS : 0), 'run_deadline_expired')
-      usedNonces.claim(string(payload.nonce), requestDeadline, request.operation, Date.now())
-      let result: RunControlResult | undefined, error: string | undefined
-      try { result = await execute(request, requestDeadline) }
-      catch (failure) {
-        error = 'run_operation_unknown'
-        try {
-          const codes = ['mutable_readback', 'run_mutable_cut', 'run_operation_timeout', 'run_not_active', 'session_selection_changed', 'terminal_cut_not_owned',
-            'terminal_cut_unknown', 'terminal_assistant_selection_changed', 'terminal_authority_conflict',
-            'terminal_payload_conflict', 'payload_conflict', 'probe_terminal_cut_changed',
-            'probe_observed_model_variant_changed', 'probe_expected_output_not_observed',
-            'probe_selected_auth_changed', 'probe_selected_authority_changed', 'probe_profile_authority_changed',
-            'probe_config_readback_unavailable', 'execution_selected_auth_changed', 'execution_profile_changed'] as const
-          const category = failure instanceof Error ? codes.find(code => code === failure.message) ?? 'unclassified' : 'unclassified'
-          await writeRunControlFile(directory, 'operation-failure.json', {
-            schemaVersion: 1, event: 'opencode_v2_run_operation_failure', binding,
-            operation: request.operation, category, timestamp: new Date().toISOString(),
-          })
-        } catch { /* Diagnostic failure cannot change the existing operation result. */ }
-      }
-      const response = { nonce: payload.nonce, endpoint: payload.endpoint, ...(error ? { error } : { result }) }
-      await state.broker.request('runStateRespond', {
-        stateId: state.stateId, directory, connection, response,
-        timeoutMs: Math.max(1, Math.min(requestDeadline, Date.now() + MAX_OPERATION_MS) - Date.now()),
-      }, Math.min(requestDeadline, Date.now() + MAX_OPERATION_MS))
-    })().catch(async () => {
-      const envelope = executionRecord(event)
-      await state.broker.request('runStatePoisonConnection', {
-        stateId: state.stateId, directory, connection: string(envelope.connection),
-      }, Date.now() + 5000).catch(() => {})
-    }).finally(() => { active.delete(task) })
-    active.add(task)
+    if (archived?.state === 'stopped') return archived
+    // A retired owner with a non-stopped receipt is terminal; an absent archive
+    // or an unretired owner can still confirm within the window.
+    if (archived?.ownerRetired === true || Date.now() >= deadline) break
+    await new Promise<void>(resolve => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
   }
-  state.broker.events.on('runControlRequest', onRequest)
-  let closing: Promise<void> | undefined
-  const close = () => closing ??= (async () => {
-    state.broker.events.off('runControlRequest', onRequest)
-    state.broker.events.off('runControlFailure', onPumpFailure)
-    try { await Promise.allSettled(active) }
-    finally {
-      let refusal: unknown
-      try {
-        const closed = await state.broker.request('runStateClose', {
-          stateId: state.stateId, directory,
-        }, Date.now() + MAX_OPERATION_MS) as { shutdown?: unknown; complete?: unknown; cleanupUnknown?: unknown; success?: unknown }
-        executionAssert(closed.shutdown === true && closed.complete === true &&
-          closed.cleanupUnknown === false && closed.success === true, 'run_control_cleanup_unknown')
-      } catch (error) { refusal = error }
-      try { await state.broker.close() } finally { windowsRuns.delete(directory) }
-      if (refusal) throw refusal
-    }
-  })()
-  return { record, close }
+  throw failure
 }
 export async function serveOpenCodeV2RunControl(directory: string, binding: RunBinding, deadline: number, sourceSha256: string,
   execute: (request: RunControlRequest, deadline: number) => Promise<RunControlResult>,
   profiles: readonly SelectedExecutionProfile[] = []): Promise<{ record: RunControlRecord; close(): Promise<void> }> {
-  if (process.platform === 'win32') return serveWindowsRunControl(directory, binding, deadline, sourceSha256, execute, profiles)
-  const uid = process.getuid?.(); executionAssert(uid !== undefined, 'run_source_linux_required')
+  void profiles
+  const uid = currentUid()
   await privatePath(directory, 'directory', uid)
   const start = executionRecord(JSON.parse((await readPrivate(path.join(directory, 'start.json'), uid)).toString('utf8')))
   executionAssert(executionHash(start.binding) === executionHash(binding) && start.sourceSha256 === sourceSha256, 'run_control_foreign')
   const secret = await readPrivate(path.join(directory, 'challenge'), uid); executionAssert(secret.length === 32, 'run_control_invalid')
   const socketPath = path.join(directory, 'control.sock')
-  const existingSocket = await lstat(socketPath).catch((error: unknown) => {
+  const existingSocket = WINDOWS ? null : await lstat(socketPath).catch((error: unknown) => {
     if (executionRecord(error).code === 'ENOENT') return null; throw error
   })
   executionAssert(existingSocket === null, 'run_control_foreign')
@@ -1061,7 +749,9 @@ export async function serveOpenCodeV2RunControl(directory: string, binding: RunB
   const server = createServer(socket => {
     sockets.add(socket); socket.once('close', () => sockets.delete(socket))
     void (async () => {
-      const frame = executionRecord(await readFrame(socket, Math.min(MAX_OPERATION_MS, Math.max(1, deadline + MAX_OPERATION_MS - Date.now()))))
+      // Frames stay readable through the extended cleanup window; the signed
+      // deadline check below still refuses every other post-deadline operation.
+      const frame = executionRecord(await readFrame(socket, Math.min(MAX_OPERATION_MS, Math.max(1, deadline + MAX_STOP_OPERATION_MS - Date.now()))))
       keys(frame, ['payload', 'mac']); executionAssert(authentic(secret, frame.payload, frame.mac), 'run_control_foreign')
       const payload = executionRecord(frame.payload)
       keys(payload, ['protocol', 'binding', 'endpoint', 'client', 'nonce', 'deadline', 'request'])
@@ -1069,10 +759,10 @@ export async function serveOpenCodeV2RunControl(directory: string, binding: RunB
       const nonce = string(payload.nonce), requestDeadline = integer(payload.deadline)
       const request = parseRunControlRequest(payload.request)
       const cleanup = request.operation === 'stop' || request.operation === 'status'
-      executionAssert(requestDeadline > Date.now() && requestDeadline <= deadline + (cleanup ? MAX_OPERATION_MS : 0) && requestDeadline - Date.now() <= MAX_OPERATION_MS, 'run_control_timeout')
+      executionAssert(requestDeadline > Date.now() && requestDeadline <= deadline + (cleanup ? MAX_STOP_OPERATION_MS : 0) && requestDeadline - Date.now() <= (cleanup ? MAX_STOP_OPERATION_MS : MAX_OPERATION_MS), 'run_control_timeout')
       const client = parseIdentity(payload.client)
       executionAssert(client.executablePath === record.process.executablePath && client.executableSha256 === record.process.executableSha256 &&
-        executionHash(await readUnixProcessIdentity(client.pid)) === executionHash(client), 'run_control_foreign')
+        sameRunProcess(await readUnixProcessIdentity(client.pid), client), 'run_control_foreign')
       // Recheck the signed deadline after peer measurement. Expired frames
       // cannot regain authority merely because replay history was pruned.
       usedNonces.claim(nonce, requestDeadline, request.operation, Date.now())
@@ -1104,7 +794,7 @@ export async function serveOpenCodeV2RunControl(directory: string, binding: RunB
   const closeOnce = async () => {
     let refusal: unknown
     try {
-      try {
+      if (!WINDOWS) try {
         await socketDirectory.assertCurrent()
         const before = await lstat(socketPath).catch((error: unknown) => {
           if (executionRecord(error).code === 'ENOENT') return null; throw error
@@ -1120,7 +810,7 @@ export async function serveOpenCodeV2RunControl(directory: string, binding: RunB
         if (server.listening) await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
       } catch (error) { refusal ??= error }
       await Promise.all(drained)
-      if (!refusal) {
+      if (!refusal && !WINDOWS) {
         try {
           await socketDirectory.assertCurrent()
           const current = await lstat(socketPath).catch((error: unknown) => {
@@ -1139,6 +829,14 @@ export async function serveOpenCodeV2RunControl(directory: string, binding: RunB
   const close = () => closing ??= closeOnce()
   try {
     await new Promise<void>((resolve, reject) => { server.once('error', reject); socketDirectory.listen(server, () => { server.off('error', reject); resolve() }) })
+    if (WINDOWS) {
+      const address = server.address()
+      executionAssert(address !== null && typeof address === 'object' && address.address === '127.0.0.1', 'run_control_foreign')
+      record = { schema: 1, protocol: 1, binding, process: await readUnixProcessIdentity(), directory, socketPath: tcpEndpoint(address.port),
+        socketDevice: 0, socketInode: 0, deadline, uid, sourceSha256 }
+      await writeRunControlFile(directory, 'control.json', record)
+      return { record, close }
+    }
     // Capture ownership immediately after bind, before publication or slow birth hashing.
     const bound = await lstat(socketPath)
     executionAssert(bound.isSocket() && bound.uid === uid, 'run_control_foreign')

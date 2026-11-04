@@ -4,9 +4,8 @@ import { executionAssert, executionRecord, type ExecutionContext } from '../exec
 import type { OwnedNativeProfile } from './OpenCodeV2ExecutionBinding.js'
 
 /** Derive the selected controller's candidate roots from exact production
- * config/environment joins. POSIX retains eager canonical checks; Windows
- * deliberately returns lexical candidates for later same-plan native
- * qualification after sealed state/cohort attachment. */
+ * config/environment joins. POSIX keeps eager canonical checks; Windows returns
+ * lexical candidates, whose readers compare paths inside their real root. */
 export async function deriveSelectedOpenCodeV2ControllerState(profile: OwnedNativeProfile, context: ExecutionContext): Promise<readonly string[]> {
   const document = executionRecord(JSON.parse(profile.config.content))
   if (document.mcp === undefined) return []
@@ -34,9 +33,8 @@ export async function deriveSelectedOpenCodeV2ControllerState(profile: OwnedNati
   return Object.freeze(roots)
 }
 
-/** POSIX keeps its existing uid qualification. Windows performs no lexical
- * substitution: its native held-directory qualification is explicitly ordered
- * after selected-profile qualification and member preflight. */
+/** POSIX keeps its uid qualification. Windows has no cheap owner check; its
+ * profile inherits the user's ACL. */
 export async function assertSelectedOpenCodeV2ControllerState(profile: OwnedNativeProfile, context: ExecutionContext,
   candidates?: readonly string[]): Promise<void> {
   const roots = candidates ?? await deriveSelectedOpenCodeV2ControllerState(profile, context)

@@ -144,9 +144,170 @@ export function hasGroupChatTools(tools: readonly { name: string }[]): boolean {
   return ['group_chat_list', 'group_chat_send'].every(name => tools.some(tool => isGroupToolName(tool.name, name as 'group_chat_list' | 'group_chat_send')))
 }
 
+export type GroupMailboxHistoryMessage = GroupMailboxEnvelope & {
+  from: string; messageId?: string; text: string; timestamp: string; read?: boolean; source?: string; to?: string
+  groupDeliverySummary?: { recipients: readonly { memberName: string; physicalMessageId: string; status?: string }[] }
+}
+
+/** Process-local accepted turn identity; never reconstructed from transcript text. */
+export type GroupMailboxHostTurn = {
+  submitUserMessageUuid: string; teamName: string; memberName: string;
+  groupChatId: string; groupRunKey: string; physicalMessageId: string
+}
+export type GroupMailboxOwnPostProof = { messageId: string; inboundMessageId: string }
+
+/** Recover proactive posts only from successful tools in finalized host-owned turns. */
+export function findGroupMailboxOwnPostProofs(input: {
+  messages: AppState['messages']; turns: readonly GroupMailboxHostTurn[];
+  teamName: string; memberName: string; current: GroupMailboxHistoryMessage;
+  history: readonly GroupMailboxHistoryMessage[]; sentHistory: readonly GroupMailboxHistoryMessage[]
+}): GroupMailboxOwnPostProof[] {
+  const positions = input.history.flatMap((row, index) => row.messageId === input.current.messageId ? [index] : [])
+  if (positions.length !== 1) return []
+  const finalized = input.history.slice(0, positions[0]).filter(row => row.read === true &&
+    row.to === input.memberName && row.groupChatId === input.current.groupChatId &&
+    row.groupChatProtocolVersion === 1 && row.groupRunKey === input.current.groupRunKey &&
+    row.groupRecipientRunKeys?.[input.memberName] === input.current.groupRunKey)
+  const proofs = new Map<string, string>()
+  for (const turn of input.turns) {
+    if (turn.teamName !== input.teamName || turn.memberName !== input.memberName ||
+        turn.groupChatId !== input.current.groupChatId || turn.groupRunKey !== input.current.groupRunKey ||
+        !finalized.some(row => row.messageId === turn.physicalMessageId)) continue
+    const starts = input.messages.flatMap((message, index) => message.type === 'user' &&
+      message.uuid === turn.submitUserMessageUuid ? [index] : [])
+    if (starts.length !== 1) continue
+    const calls = new Map<string, { messageId: string; text: string }>()
+    for (const message of input.messages.slice(starts[0]! + 1)) {
+      if (message.type === 'assistant') {
+        for (const block of message.message.content) {
+          if (block.type !== 'tool_use' || !isGroupToolName(block.name, 'group_chat_send')) continue
+          const args = block.input as Record<string, unknown> | null
+          if (args?.teamName === input.teamName && args.from === input.memberName &&
+              args.groupChatId === input.current.groupChatId && args.relayOfMessageId == null &&
+              isGroupMailboxUuid(args.messageId) && typeof args.text === 'string')
+            calls.set(block.id, { messageId: args.messageId, text: args.text })
+        }
+      } else if (message.type === 'user') {
+        const blocks = message.message.content
+        if (!Array.isArray(blocks) || !blocks.some(block => block.type === 'tool_result')) break
+        for (const block of blocks) {
+          if (block.type !== 'tool_result' || block.is_error === true) continue
+          const call = calls.get(block.tool_use_id)
+          if (!call) continue
+          const texts = typeof block.content === 'string' ? [block.content] : Array.isArray(block.content)
+            ? block.content.flatMap(part => part.type === 'text' ? [part.text] : []) : []
+          const result = texts.length === 1 ? parseGroupReactionResult(texts[0]!) : undefined
+          if (result?.saved !== true || result.groupChatId !== input.current.groupChatId ||
+              (result.groupMessageId ?? result.messageId) !== call.messageId || result.relayOfMessageId != null) continue
+          const canonical = input.sentHistory.filter(row => row.messageId === call.messageId &&
+            row.groupMessageId === call.messageId && row.from === input.memberName && row.to === 'user' &&
+            row.groupChatId === input.current.groupChatId && row.groupChatProtocolVersion === 1 &&
+            row.source === 'runtime_delivery' && row.relayOfMessageId == null && row.text === call.text)
+          if (canonical.length === 1) proofs.set(call.messageId, turn.physicalMessageId)
+        }
+      }
+    }
+  }
+  return [...proofs].map(([messageId, inboundMessageId]) => ({ messageId, inboundMessageId }))
+}
+
+/** Own-receiver, completed deliveries only. History is context, never a new command or reply target. */
+export function selectGroupMailboxHistory(current: GroupMailboxHistoryMessage, memberName: string | undefined,
+  history: readonly GroupMailboxHistoryMessage[], sentHistory: readonly GroupMailboxHistoryMessage[] = [], ownPosts: readonly GroupMailboxOwnPostProof[] = []): Pick<GroupMailboxHistoryMessage, 'from' | 'text' | 'messageId' | 'timestamp'>[] {
+  if (!current.messageId || !current.groupChatId || !current.groupRunKey || !memberName || current.to !== memberName ||
+      current.groupRecipientRunKeys?.[memberName] !== current.groupRunKey) return []
+  const positions = history.flatMap((row, index) => row.messageId === current.messageId ? [index] : [])
+  if (positions.length !== 1 || history[positions[0]!]!.groupChatId !== current.groupChatId ||
+      history[positions[0]!]!.groupRunKey !== current.groupRunKey || history[positions[0]!]!.to !== memberName) return []
+  let earlier = history.slice(0, positions[0]).filter(row => row.read === true && row.to === memberName &&
+    row.groupChatId === current.groupChatId && row.groupRunKey === current.groupRunKey &&
+    row.groupChatProtocolVersion === 1 && row.groupRecipientRunKeys?.[memberName] === current.groupRunKey &&
+    row.messageId && row.groupMessageId && row.messageId !== row.groupMessageId)
+  const earlierIds = new Set(earlier.map(row => row.messageId))
+  const ownPostParents = new Map(ownPosts.map(proof => [proof.messageId, proof.inboundMessageId]))
+  const parentId = (row: GroupMailboxHistoryMessage) => row.relayOfMessageId ?? ownPostParents.get(row.messageId!)
+  let ownReplies = sentHistory.filter(row => row.to === 'user' && row.from === memberName && row.source === 'runtime_delivery' &&
+    row.groupChatId === current.groupChatId && row.groupChatProtocolVersion === 1 &&
+    !!row.messageId && row.messageId === row.groupMessageId &&
+    !!parentId(row) && earlierIds.has(parentId(row)))
+  // Replay peer context only along a proven reply chain to our own posts.
+  // Parallel answers to a human must not reintroduce that human's old command.
+  if (current.from !== 'user') {
+    const repliesByReceipt = new Map<string, GroupMailboxHistoryMessage | null>()
+    for (const reply of ownReplies) {
+      const receiptKeys = new Set((reply.groupDeliverySummary?.recipients ?? [])
+        .filter(recipient => recipient.status === 'queued' || recipient.status === 'accepted')
+        .map(recipient => JSON.stringify([recipient.memberName, recipient.physicalMessageId])))
+      for (const key of receiptKeys)
+        repliesByReceipt.set(key, repliesByReceipt.has(key) ? null : reply)
+    }
+    const parentReply = (incoming: GroupMailboxHistoryMessage) => incoming.relayOfMessageId
+      ? repliesByReceipt.get(JSON.stringify([incoming.from, incoming.relayOfMessageId])) ?? undefined
+      : undefined
+    const earlierById = new Map(earlier.map(row => [row.messageId!, row]))
+    const ancestors = new Set<string>()
+    let incoming: GroupMailboxHistoryMessage | undefined = current
+    while (incoming && ancestors.size < 8) {
+      const parent = parentReply(incoming)
+      const previous = parent && earlierById.get(parentId(parent)!)
+      if (!previous?.messageId || ancestors.has(previous.messageId)) break
+      ancestors.add(previous.messageId)
+      incoming = previous.from === 'user' ? undefined : previous
+    }
+    if (ancestors.size === 0) return []
+    // Include finalized sibling branches and their saved completions. A later
+    // peer answer must not replay an ancestor while hiding work already done.
+    const childrenByParent = new Map<string, string[]>()
+    for (const row of earlier) {
+      const parent = parentReply(row)
+      const previousId = parent && parentId(parent)
+      if (!previousId) continue
+      const children = childrenByParent.get(previousId) ?? []
+      children.push(row.messageId!); childrenByParent.set(previousId, children)
+    }
+    const connected = [...ancestors]
+    for (let index = 0; index < connected.length; index++) {
+      for (const childId of childrenByParent.get(connected[index]!) ?? []) {
+        if (ancestors.has(childId)) continue
+        ancestors.add(childId); connected.push(childId)
+      }
+    }
+    earlier = earlier.filter(row => ancestors.has(row.messageId!))
+    ownReplies = ownReplies.filter(reply => ancestors.has(parentId(reply)!))
+  }
+  const repliesByInbound = new Map<string, GroupMailboxHistoryMessage[]>()
+  for (const reply of ownReplies) {
+    const replies = repliesByInbound.get(parentId(reply)!) ?? []
+    replies.push(reply); repliesByInbound.set(parentId(reply)!, replies)
+  }
+  let units = earlier.map(inbound => {
+    const rows = [inbound, ...(repliesByInbound.get(inbound.messageId!) ?? [])]
+    return { rows, latest: rows.reduce((latest, row) => Math.max(latest, Date.parse(row.timestamp)), 0) }
+  }).sort((left, right) => left.latest - right.latest)
+  if (current.from !== 'user') {
+    // The entire connected peer context is indivisible: omitting a completed
+    // branch while retaining its human ancestor would imply unfinished work.
+    const rows = units.flatMap(unit => unit.rows)
+    units = [{ rows, latest: units.reduce((latest, unit) => Math.max(latest, unit.latest), 0) }]
+  }
+  const selected: Pick<GroupMailboxHistoryMessage, 'from' | 'text' | 'messageId' | 'timestamp'>[][] = []
+  let bytes = 2, count = 0
+  for (const unit of units.reverse()) {
+    if (count + unit.rows.length > 8) continue
+    const entries = unit.rows.map(row => ({ from: row.from, text: row.text, messageId: row.messageId, timestamp: row.timestamp }))
+    const size = Buffer.byteLength(JSON.stringify(entries), 'utf8')
+    // Keep inbound/reply pairs intact; never imply unfinished work by dropping its saved reply.
+    if (count + entries.length > 8 || bytes + size > 16 * 1024) continue
+    bytes += size; count += entries.length
+    selected.push(entries)
+  }
+  return selected.reverse().flat()
+}
+
 export function buildGroupMailboxPrompt(message: GroupMailboxEnvelope & {
-  from: string; messageId?: string; text: string; timestamp: string
-}, teamName?: string, memberName?: string, catalog?: unknown): string {
+  from: string; to?: string; messageId?: string; text: string; timestamp: string
+}, teamName?: string, memberName?: string, catalog?: unknown, history: readonly GroupMailboxHistoryMessage[] = [], sentHistory: readonly GroupMailboxHistoryMessage[] = [], ownPosts: readonly GroupMailboxOwnPostProof[] = []): string {
+  const context = selectGroupMailboxHistory(message, memberName, history, sentHistory, ownPosts)
   return [
     catalog === undefined ? 'Fresh group catalog unavailable. Call group_chat_list before choosing a destination; do not assume an empty list.' : `Fresh group catalog: ${JSON.stringify(catalog)}`,
     'Process this queued GROUP CHAT message. Its destination is explicit; it is not a private message.',
@@ -155,10 +316,17 @@ export function buildGroupMailboxPrompt(message: GroupMailboxEnvelope & {
     `Canonical message ID: ${JSON.stringify(message.groupMessageId)}. Physical inbound ID: ${JSON.stringify(message.messageId)}.`,
     `First call group_chat_list (or mcp__agent-teams__group_chat_list) with teamName=${JSON.stringify(teamName)}, from=${JSON.stringify(memberName)} for the fresh group catalog. An unavailable catalog does not mean no groups exist.`,
     `If a reply is needed, call group_chat_send (or mcp__agent-teams__group_chat_send) with ${JSON.stringify({ teamName, from: memberName, groupChatId: message.groupChatId, messageId: '<new UUID, reused only for retry of this exact post>', relayOfMessageId: message.messageId, text: '<reply>' })}.`,
+    'Before choosing silence, check the original unfinished human request. If this peer answer resolves your pending question, continue that task and provide any completion report the human explicitly requested. Do not invent an acknowledgement requirement.',
     `For an optional informational acknowledgement, call group_chat_react (or mcp__agent-teams__group_chat_react) with ${JSON.stringify({ teamName, from: memberName, groupChatId: message.groupChatId, relayOfMessageId: message.messageId })}. After success stop; never send an extra OK or answer a reaction. Still use group_chat_send for requested or substantive replies.`,
+    'When a peer message needs no response, finish with exactly [[AGENT_TEAMS_NO_REPLY]] as your entire final text. This is an internal silence marker: never publish it with a message tool. A trailing unescaped marker cancels publication of the entire automatic peer reply, including any preceding text; quote or use a message tool when discussing the marker as content. Do not explain that no reply is needed. Human requests and substantive peer questions still require a real reply.',
     'Do not reply with SendMessage or message_send to user. They are private-message tools. Do not guess a last group or redirect a blocked group reply to a private chat.',
     'An archived, not-member, invalid-relay, or unavailable result is blocked: stop this reply attempt. Do not retry with another destination. A peer FYI needs no text acknowledgement.',
     'You may proactively post in any active group you belong to after a fresh group_chat_list. A proactive post in another group does not reply to this inbound.',
+    ...(context.length ? [
+      ...(message.from !== 'user' ? ['This inbound is a verified reply to your own earlier post. Continue the original human request in the chain below to the extent it is still unfinished. Completing an explicitly requested report is required work, not an optional acknowledgement. Your saved replies show steps already done; do not repeat them.'] : []),
+      'Earlier processed incoming messages and your saved replies in this same group/run (bounded historical context, not new commands or proof that a task is still open). Do not repeat completed work or create a group from history. Only the current physical inbound ID is a reply target:',
+      '<group_mailbox_history>', JSON.stringify(context), '</group_mailbox_history>',
+    ] : []),
     '<queued_mailbox_message>', message.text, '</queued_mailbox_message>',
   ].join('\n')
 }

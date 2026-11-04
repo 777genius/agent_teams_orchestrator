@@ -131,6 +131,9 @@ function buildOverridesForServer(
             ),
         )
       }
+      if (serverName === REQUIRED_AGENT_TEAMS_MCP_SERVER) {
+        overrides.push(buildCodexServerOverride(serverName, ['required'], true))
+      }
       if (AUTO_APPROVE_DYNAMIC_MCP_SERVERS.has(serverName)) {
         overrides.push(
           buildCodexServerOverride(

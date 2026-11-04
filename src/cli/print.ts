@@ -157,6 +157,13 @@ import { generateSessionTitle } from 'src/utils/sessionTitle.js'
 import { buildSideQuestionFallbackParams } from 'src/utils/queryContext.js'
 import { runStartupTeamBootstrap } from 'src/services/teamBootstrap/teamBootstrapEntry.js'
 import { validateTeamBootstrapStartupOptions } from 'src/services/teamBootstrap/teamBootstrapStartupGuards.js'
+import {
+  assertCodexNativeHistoryOperationSupportedForTranscript,
+  getCodexNativeHistoryOperationError,
+  getCodexNativeHistoryOperationErrorForTranscript,
+} from 'src/services/codexNative/conversationHistoryGuard.js'
+import { restoreCodexLeadConversationForFullResume } from 'src/services/codexNative/leadConversationResume.js'
+import { restoreResumedLeadTeam } from 'src/services/teamBootstrap/resumedLeadTeam.js'
 import { runSideQuestion } from 'src/utils/sideQuestion.js'
 import {
   processSessionStartHooks,
@@ -220,6 +227,7 @@ import {
   saveMode,
   saveAiGeneratedTitle,
   restoreSessionMetadata,
+  getTranscriptPathForSession,
 } from 'src/utils/sessionStorage.js'
 import { incrementPromptCount } from 'src/utils/commitAttribution.js'
 import {
@@ -612,6 +620,17 @@ export async function runHeadless(
     return
   }
 
+  const nativeHistoryError = options.resumeSessionAt
+    ? getCodexNativeHistoryOperationError('partial-resume')
+    : options.forkSession
+      ? getCodexNativeHistoryOperationError('fork')
+      : undefined
+  if (nativeHistoryError) {
+    emitLoadError(nativeHistoryError, options.outputFormat)
+    gracefulShutdownSync(1)
+    return
+  }
+
   if (options.rewindFiles && !options.resume) {
     process.stderr.write(`Error: --rewind-files requires --resume\n`)
     gracefulShutdownSync(1)
@@ -866,6 +885,24 @@ export async function runHeadless(
     return
   }
 
+  const resumeParams = {
+    isFullResume: Boolean(options.resume || options.continue) &&
+      !options.forkSession && !options.resumeSessionAt && !options.teleport,
+    getAppState,
+    setAppState,
+  }
+  try {
+    await restoreCodexLeadConversationForFullResume(resumeParams)
+  } catch (error) {
+    emitLoadError(error instanceof Error ? error.message : 'Failed to restore the Codex lead identity', options.outputFormat)
+    gracefulShutdownSync(1)
+    return
+  }
+  // Best effort: a lead that cannot be re-attached to its team still starts.
+  await restoreResumedLeadTeam(resumeParams).catch(error =>
+    logForDebugging(`[resumed-lead] team context not restored: ${errorMessage(error)}`),
+  )
+
   // When using SDK URL, always use stdio permission prompting to delegate to the SDK
   const effectivePermissionPromptToolName = options.sdkUrl
     ? 'stdio'
@@ -991,6 +1028,10 @@ export async function runHeadless(
       : null
 
   headlessProfilerCheckpoint('before_runHeadlessStreaming')
+  const allowInterruptedTurnReplay = !(
+    turnInterruptionState && turnInterruptionState.kind !== 'none' &&
+    process.env.CLAUDE_CODE_RESUME_INTERRUPTED_TURN
+  ) || !(await getCodexNativeHistoryOperationErrorForTranscript('rewind'))
   for await (const message of runHeadlessStreaming(
     structuredIO,
     appState.mcp.clients,
@@ -1004,6 +1045,7 @@ export async function runHeadless(
     agents,
     options,
     turnInterruptionState,
+    allowInterruptedTurnReplay,
   )) {
     if (transformToStreamlined) {
       // Streamlined mode: transform messages and stream immediately
@@ -1137,6 +1179,7 @@ function runHeadlessStreaming(
     workload?: string | undefined
   },
   turnInterruptionState?: TurnInterruptionState,
+  allowInterruptedTurnReplay = true,
 ): AsyncIterable<StdoutMessage> {
   let running = false
   let leadMailboxPollGeneration = 0
@@ -1305,7 +1348,8 @@ function runHeadlessStreaming(
   if (
     turnInterruptionState &&
     turnInterruptionState.kind !== 'none' &&
-    resumeInterruptedTurnEnv
+    resumeInterruptedTurnEnv &&
+    allowInterruptedTurnReplay
   ) {
     logForDebugging(
       `[print.ts] Auto-resuming interrupted turn (kind: ${turnInterruptionState.kind})`,
@@ -2338,6 +2382,9 @@ function runHeadlessStreaming(
                   'name',
                 ),
                 prompt: input,
+                // Only the validated, process-owned envelope can select group
+                // scope. First real lead tasks and ordinary stdin stay direct.
+                conversationScope: queuedGroupTurn ? 'group' : 'direct',
                 promptUuid: cmd.uuid,
                 isMeta: cmd.isMeta,
                 cwd: cwd(),
@@ -2468,7 +2515,7 @@ function runHeadlessStreaming(
                 current?.ready && current.teamName === groupTurn.teamName &&
                 current.memberName === groupTurn.memberName &&
                 isCurrentGroupMailboxMessage(groupTurn.message)) {
-              const fallback = findOrdinaryDirectReplyFallback({ ...scope, excludeEmptyMessages: true })
+              const fallback = findOrdinaryDirectReplyFallback({ ...scope, excludeEmptyMessages: true, excludeNativeCommentary: true })
               if (fallback) {
                 try {
                   await relayGroupAssistantText({
@@ -5241,6 +5288,12 @@ async function loadInitialMessages(
   },
 ): Promise<LoadInitialMessagesResult> {
   const persistSession = !isSessionPersistenceDisabled()
+  const assertTargetHistoryOperation = async (result: { fullPath?: string; sessionId?: string }): Promise<void> => {
+    const operation = options.resumeSessionAt ? 'partial-resume' : options.forkSession ? 'fork' : undefined
+    if (!operation) return
+    await assertCodexNativeHistoryOperationSupportedForTranscript(operation,
+      result.fullPath ?? getTranscriptPathForSession(result.sessionId ?? getSessionId()))
+  }
   // Handle continue in print mode
   if (options.continue) {
     try {
@@ -5251,6 +5304,7 @@ async function loadInitialMessages(
         undefined /* file path */,
       )
       if (result) {
+        await assertTargetHistoryOperation(result)
         // Match coordinator mode to the resumed session's mode
         if (feature('COORDINATOR_MODE') && coordinatorModeModule) {
           const warning = coordinatorModeModule.matchSessionMode(result.mode)
@@ -5317,6 +5371,12 @@ async function loadInitialMessages(
       }
     } catch (error) {
       logError(error)
+      emitLoadError(
+        error instanceof Error
+          ? `Failed to continue session: ${error.message}`
+          : 'Failed to continue session with --print mode',
+        options.outputFormat,
+      )
       gracefulShutdownSync(1)
       return { messages: [] }
     }
@@ -5438,6 +5498,10 @@ async function loadInitialMessages(
           return { messages: [] }
         }
       }
+
+      // A different current provider does not authorize cutting/forking the
+      // saved native owner's history. Check the source before any state edit.
+      await assertTargetHistoryOperation(result)
 
       // Handle resumeSessionAt feature
       if (options.resumeSessionAt) {

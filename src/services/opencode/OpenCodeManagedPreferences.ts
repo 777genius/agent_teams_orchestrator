@@ -3,6 +3,7 @@ import path from 'node:path'
 
 import { writeJsonFileAtomic } from '../../utils/atomicWrite.js'
 import { lock } from '../../utils/lockfile.js'
+import { raceOpenCodeAbortSignal, throwOpenCodeAbortReason } from './OpenCodeRuntimeDeadline.js'
 
 const OPEN_CODE_MANAGED_PREFERENCES_FILE = 'agent-teams-runtime-preferences.json'
 const OPEN_CODE_GLOBAL_MANAGED_PREFERENCES_FILE = 'global-runtime-preferences.json'
@@ -147,22 +148,34 @@ async function writePreferencesFile(
 
 export async function readOpenCodeManagedRuntimePreferences(
   profileRootPath: string,
+  signal?: AbortSignal,
 ): Promise<OpenCodeManagedRuntimePreferences> {
+  if (signal?.aborted) throwOpenCodeAbortReason(signal)
   try {
-    const raw = await readFile(getOpenCodeManagedPreferencesPath(profileRootPath), 'utf8')
+    // A pending OS read may outlive readFile's signal. Only the read is raced;
+    // this path cannot migrate preferences or publish any changes afterwards.
+    const raw = await raceOpenCodeAbortSignal(readFile(getOpenCodeManagedPreferencesPath(profileRootPath), {
+      encoding: 'utf8', signal,
+    }), signal)
     return normalizePreferences(JSON.parse(raw))
   } catch {
+    if (signal?.aborted) throwOpenCodeAbortReason(signal)
     return emptyPreferences()
   }
 }
 
 export async function readOpenCodeGlobalManagedRuntimePreferences(
   dataRootPath: string,
+  signal?: AbortSignal,
 ): Promise<OpenCodeManagedRuntimePreferences> {
+  if (signal?.aborted) throwOpenCodeAbortReason(signal)
   try {
-    const raw = await readFile(getOpenCodeGlobalManagedPreferencesPath(dataRootPath), 'utf8')
+    const raw = await raceOpenCodeAbortSignal(readFile(getOpenCodeGlobalManagedPreferencesPath(dataRootPath), {
+      encoding: 'utf8', signal,
+    }), signal)
     return normalizePreferences(JSON.parse(raw))
   } catch {
+    if (signal?.aborted) throwOpenCodeAbortReason(signal)
     return emptyPreferences()
   }
 }

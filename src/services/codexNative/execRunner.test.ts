@@ -1,11 +1,188 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
+import { spawn } from 'node:child_process'
 import { PassThrough } from 'node:stream'
+import { existsSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 
 import {
   buildCodexNativeExecArgs,
   runCodexNativeExec,
 } from './execRunner.js'
+import { CodexNativeRunnerError } from './runnerLifecycle.js'
+
+const CONTINUITY_THREAD = '591b2560-ff9b-4620-b30e-8ca38ad2abf3'
+
+async function drainExec(iterator: ReturnType<typeof runCodexNativeExec>) {
+  while (true) {
+    const next = await iterator.next()
+    if (next.done) return next.value
+  }
+}
+
+describe('exec owned conversation continuity', () => {
+  test('actual ENOENT spawn reports safe pre-submission failure and releases its temporary home', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'TEST-codex-exec-spawn-failure-'))
+    const source = path.join(root, 'profile')
+    const sessions = path.join(root, 'sessions')
+    const missing = path.join(root, 'missing-codex-executable')
+    await mkdir(source)
+    await mkdir(sessions)
+    await writeFile(path.join(sessions, 'sentinel'), 'owned history')
+    let overlayHome = ''
+    let launched: ReturnType<typeof spawn> | undefined
+    try {
+      const error = await drainExec(runCodexNativeExec({
+        prompt: 'TEST input that no process can receive', cwd: root,
+        ephemeral: false, sessionsDirectory: sessions, extraEnv: { CODEX_HOME: source },
+      }, {
+        which: () => missing, resolveVersion: () => 'TEST-no-child',
+        spawnProcess: (_binary, args, options) => {
+          overlayHome = options.env.CODEX_HOME!
+          launched = spawn(missing, args, {
+            cwd: options.cwd, env: options.env, signal: options.signal,
+            detached: options.detached, stdio: ['pipe', 'pipe', 'pipe'],
+          })
+          return launched
+        },
+      })).then(() => null, error => error)
+      expect(launched).toBeDefined()
+      expect(launched!.pid).toBeUndefined()
+      expect(error).toBeInstanceOf(CodexNativeRunnerError)
+      expect(error.cause?.code).toBe('ENOENT')
+      expect(error.lifecycle).toEqual({ submissionMayHaveStarted: false, turnTerminal: false, childStopped: true })
+      expect(overlayHome).not.toBe('')
+      expect(existsSync(overlayHome)).toBe(false)
+      expect(await readFile(path.join(sessions, 'sentinel'), 'utf8')).toBe('owned history')
+    } finally {
+      if (launched?.pid) launched.kill('SIGKILL')
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('keeps shared flags before exact resume UUID and new images after resume', () => {
+    const args = buildCodexNativeExecArgs({
+      prompt: 'new input', cwd: tmpdir(), ephemeral: false, resumeThreadId: CONTINUITY_THREAD,
+      sessionsDirectory: tmpdir(), model: 'TEST-new-model', reasoningEffort: 'high',
+      approvalPolicy: 'never', sandboxMode: 'workspace-write', imagePaths: [path.join(tmpdir(), 'TEST.png')],
+      ignoreUserConfig: true, configOverrides: ['mcp_servers.TEST.enabled=false'],
+    })
+    const resume = args.indexOf('resume')
+    expect(args.slice(resume)).toEqual(['resume', CONTINUITY_THREAD, '--image', path.join(tmpdir(), 'TEST.png'), '-'])
+    expect(args.indexOf('--sandbox')).toBeLessThan(resume)
+    expect(args.indexOf('TEST-new-model')).toBeLessThan(resume)
+    expect(args.indexOf('mcp_servers.TEST.enabled=false')).toBeLessThan(resume)
+    expect(args).not.toContain('--ephemeral')
+    expect(args).not.toContain('--last')
+  })
+
+  test('rejects invalid resume identity before spawning with safe failure evidence', async () => {
+    let spawned = false
+    const error = await drainExec(runCodexNativeExec({
+      prompt: 'must not submit', cwd: tmpdir(), ephemeral: false,
+      sessionsDirectory: tmpdir(), resumeThreadId: 'friendly-title',
+    }, { spawnProcess: () => { spawned = true; throw new Error('unexpected spawn') } }))
+      .then(() => null, error => error)
+    expect(spawned).toBe(false)
+    expect(error).toBeInstanceOf(CodexNativeRunnerError)
+    expect(error.lifecycle).toEqual({ submissionMayHaveStarted: false, turnTerminal: false, childStopped: true })
+  })
+
+  test('uses fresh isolated profiles over the same sessions, preserving explicit user config and secret env', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'TEST-codex-exec-continuity-'))
+    const source = path.join(root, 'source')
+    const sessions = path.join(root, 'sessions')
+    await mkdir(source)
+    await mkdir(sessions)
+    await writeFile(path.join(source, 'config.toml'), 'model = "TEST-user"\n')
+    const homes: string[] = []
+    try {
+      for (let turn = 0; turn < 2; turn++) {
+        const child = new FakeCodexProcess()
+        const stdin: string[] = []
+        child.stdin.on('data', chunk => stdin.push(String(chunk)))
+        const iterator = runCodexNativeExec({
+          prompt: `only new prompt ${turn}`, cwd: root, model: 'TEST-current', ephemeral: false,
+          sessionsDirectory: sessions, ...(turn ? { resumeThreadId: CONTINUITY_THREAD } : {}),
+          ignoreUserConfig: false, extraEnv: { CODEX_HOME: source, CODEX_SQLITE_HOME: source, TEST_LOOPBACK_TOKEN: 'test-secret' },
+          loopbackOverlayToml: '[model_providers.TEST]\nexperimental_bearer_token="test-secret"\n',
+          configOverrides: ['model_providers.TEST.env_key="TEST_LOOPBACK_TOKEN"', `sqlite_home=${JSON.stringify(source)}`],
+        }, { which: () => '/TEST/codex', resolveVersion: () => 'TEST',
+          spawnProcess: (_binary, args, options) => {
+            homes.push(options.env.CODEX_HOME!)
+            expect(options.env.CODEX_SQLITE_HOME).toBe(options.env.CODEX_HOME)
+            expect(options.env.TEST_LOOPBACK_TOKEN).toBe('test-secret')
+            expect(args.join(' ')).not.toContain('test-secret')
+            expect(args.filter(arg => arg.startsWith('sqlite_home=')).at(-1))
+              .toBe(`sqlite_home=${JSON.stringify(options.env.CODEX_HOME)}`)
+            expect(args.includes('resume')).toBe(Boolean(turn))
+            return child as never
+          },
+        })
+        await iterator.next()
+        expect(stdin.join('')).toBe(`only new prompt ${turn}`)
+        expect(await readFile(path.join(homes[turn]!, 'config.toml'), 'utf8')).toBe('model = "TEST-user"\n')
+        await writeFile(path.join(homes[turn]!, 'sessions', 'sentinel'), 'owned')
+        const remaining = drainExec(iterator)
+        child.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: CONTINUITY_THREAD }) + '\n')
+        child.stdout.write('{"type":"turn.completed","usage":{}}\n')
+        child.stdout.end()
+        child.stderr.end()
+        child.emit('close', 0, null)
+        expect((await remaining).threadId).toBe(CONTINUITY_THREAD)
+        expect(existsSync(homes[turn]!)).toBe(false)
+        expect(await readFile(path.join(sessions, 'sentinel'), 'utf8')).toBe('owned')
+      }
+      expect(homes[0]).not.toBe(homes[1])
+      expect(await readFile(path.join(source, 'config.toml'), 'utf8')).toBe('model = "TEST-user"\n')
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
+
+  for (const terminal of [true, false]) {
+    test(`reports terminal=${terminal} separately from confirmed process shutdown`, async () => {
+      const child = new FakeCodexProcess()
+      const iterator = runCodexNativeExec({ prompt: 'TEST lifecycle', cwd: tmpdir() }, {
+        which: () => '/TEST/codex', resolveVersion: () => 'TEST', spawnProcess: () => child as never,
+      })
+      await iterator.next()
+      const remaining = drainExec(iterator).then(() => null, error => error)
+      child.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: CONTINUITY_THREAD }) + '\n')
+      if (terminal) child.stdout.write('{"type":"turn.failed","error":{"message":"TEST provider failed"}}\n')
+      child.stdout.end()
+      child.stderr.end()
+      child.emit('close', 1, null)
+      const error = await remaining
+      expect(error).toBeInstanceOf(CodexNativeRunnerError)
+      expect(error.lifecycle).toEqual({ submissionMayHaveStarted: true, turnTerminal: terminal, childStopped: true })
+    })
+  }
+
+  test('escalates despite child.killed and retains uncertainty plus overlay until close is observed', async () => {
+    const sessions = await mkdtemp(path.join(tmpdir(), 'TEST-codex-unstopped-'))
+    const child = new FakeCodexProcess()
+    const signals: Array<NodeJS.Signals | number | undefined> = []
+    child.kill = signal => { child.killed = true; signals.push(signal); return true }
+    let home = ''
+    try {
+      const error = await drainExec(runCodexNativeExec({
+        prompt: 'TEST hung process', cwd: sessions, ephemeral: false, sessionsDirectory: sessions,
+        ignoreUserConfig: true, extraEnv: { CODEX_HOME: path.join(sessions, 'absent-profile') }, idleTimeoutMs: 1,
+      }, { which: () => '/TEST/codex', resolveVersion: () => 'TEST',
+        spawnProcess: (_binary, _args, options) => { home = options.env.CODEX_HOME!; return child as never } }))
+        .then(() => null, error => error)
+      expect(error.lifecycle).toEqual({ submissionMayHaveStarted: true, turnTerminal: false, childStopped: false })
+      expect(signals).toContain('SIGTERM')
+      expect(signals).toContain('SIGKILL')
+      expect(existsSync(home)).toBe(true)
+      child.emit('close', null, 'SIGKILL')
+      await new Promise(resolve => setTimeout(resolve, 20))
+      expect(existsSync(home)).toBe(false)
+      expect(existsSync(sessions)).toBe(true)
+    } finally { await rm(sessions, { recursive: true, force: true }) }
+  })
+})
 
 class FakeCodexProcess extends EventEmitter {
   pid?: number
@@ -18,6 +195,11 @@ class FakeCodexProcess extends EventEmitter {
   kill(signal?: NodeJS.Signals | number): boolean {
     this.killed = true
     this.killSignal = signal
+    queueMicrotask(() => {
+      this.stdout.end()
+      this.stderr.end()
+      this.emit('close', null, signal ?? 'SIGTERM')
+    })
     return true
   }
 }
@@ -464,10 +646,13 @@ describe('runCodexNativeExec', () => {
       return
     }
 
-    const processKill = spyOn(process, 'kill')
-      .mockImplementation((() => true) as typeof process.kill)
     const nativeProcess = new FakeCodexProcess()
     nativeProcess.pid = 4343
+    const processKill = spyOn(process, 'kill')
+      .mockImplementation((() => {
+        queueMicrotask(() => nativeProcess.emit('close', null, 'SIGTERM'))
+        return true
+      }) as typeof process.kill)
 
     const iterator = runCodexNativeExec(
       {

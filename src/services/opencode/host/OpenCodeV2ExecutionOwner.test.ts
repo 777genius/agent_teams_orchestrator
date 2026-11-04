@@ -8,10 +8,7 @@ import { fileURLToPath } from 'node:url'
 import { acquireExecutionProfileOwner, readExecutionProfileOwner } from './OpenCodeV2ExecutionOwner.js'
 import { readExecutionBirth, type SelectedExecutionProfile } from './OpenCodeV2ExecutionBinding.js'
 import { canonicalExecutionJSON, executionHash, executionRecord } from '../execution/OpenCodeV2ExecutionContracts.js'
-import { launchLinuxExecution } from './OpenCodeV2ExecutionLauncher.js'
-import * as windowsExecution from './windows/OpenCodeV2WindowsExecution.js'
 import * as executionPlatform from './OpenCodeV2ExecutionPlatform.js'
-import { createWindowsOwnerFilesystem, type WindowsOwnerNativeRequest } from './windows/OpenCodeV2WindowsOwnerFilesystem.js'
 
 const identity = () => ({ hostInstanceId: randomUUID(), leaseOwnerId: randomUUID(), graphSha256: 'a'.repeat(64) })
 async function fixture() {
@@ -52,90 +49,6 @@ function peer(root: string) {
 describe('canonical durable execution owner', () => {
   // Persistence seam only: the synthetic native port and mapping brand below
   // cannot qualify a native launch, ownership or physical retirement receipt.
-  test('Windows owner binds a many-anchor mapping through bounded complete-mapping audit commitment', async () => {
-    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
-    const root = 'C:\\TEST\\profile', databasePath = root + '\\data\\opencode.db'
-    const born = Object.freeze({ format: 'windows-filetime' as const, value: '42', bootId: null })
-    const ids = identity(), records = new Map<string, Buffer>(), handles = new Map<string, string>()
-    const observedIdentity = { volumeSerial: '2', fileId: 'a'.repeat(32), ownerSid: 'S-1-5-21-2' }
-    const native = async (request: WindowsOwnerNativeRequest): Promise<unknown> => {
-      if (request.op === 'ownerValidateSelectedProfile') return { schema: 1, ok: true, root,
-        databasePath, privateAcl: true, reparse: false, filesystem: 'NTFS',
-        rootIdentity: observedIdentity, parentIdentity: observedIdentity, databaseIdentity: null }
-      if (request.op === 'ownerOpenDirectory') {
-        const handleId = String(handles.size + 1); handles.set(handleId, request.path)
-        return { schema: 1, ok: true, path: request.path, directory: true,
-          reparse: false, privateAcl: true, identity: observedIdentity, handleId }
-      }
-      if (request.op === 'ownerAssertDirectory') return { schema: 1, ok: true, path: request.path,
-        directory: true, reparse: false, privateAcl: true, identity: observedIdentity }
-      if (request.op === 'ownerWriteExclusive') {
-        const bytes = Buffer.from(request.bytesBase64, 'base64')
-        expect(bytes.length).toBeLessThanOrEqual(16 * 1024)
-        const key = handles.get(request.handleId) + '\\' + request.name
-        expect(records.has(key)).toBe(false); records.set(key, bytes)
-        return { schema: 1, ok: true, writtenBytes: bytes.length, flushed: true,
-          links: 1, reparse: false, privateAcl: true }
-      }
-      if (request.op === 'ownerReadRecord') return { schema: 1, ok: true,
-        bytesBase64: records.get(handles.get(request.handleId) + '\\' + request.name)!.toString('base64'),
-        links: 1, reparse: false, privateAcl: true }
-      throw new Error('TEST-unexpected-native-request')
-    }
-    const filesystem = createWindowsOwnerFilesystem(native)
-    const mapping = Object.freeze({
-      bun: { hostPID: 73, nativePID: 73, birth: born, executablePath: 'C:\\TEST\\bun.exe', executableSha256: 'b'.repeat(64) },
-      supervisor: { hostPID: 74, nativePID: 74, birth: born, executablePath: 'C:\\TEST\\helper.exe', executableSha256: 'c'.repeat(64) },
-      namespace: { name: 'windows-job:' + ids.hostInstanceId }, leaseOwnerId: ids.leaseOwnerId,
-      containerSid: 'S-1-15-2-1', realpathDll: { receiptId: 'windows-dll:74:73:42' },
-      realpathAnchors: { receiptId: 'windows-anchors:74:73:42', nonce: ids.hostInstanceId,
-        anchors: Array.from({ length: 128 }, (_, index) => {
-          const directory = `D:\\a\\TEST-native-source\\frontend\\node_modules\\.pnpm\\TEST-package-${index}\\node_modules\\TEST-package-${index}`
-          return { kind: 'readOnly', admittedPath: directory, dosPath: directory,
-            ntPath: '\\Device\\HarddiskVolume2' + directory.slice(2), volumeSerial: '2', fileId: index.toString(16).padStart(32, '0') }
-        }) },
-    })
-    const fullBytes = Buffer.byteLength(canonicalExecutionJSON(mapping) + '\n')
-    expect(fullBytes).toBeGreaterThan(16 * 1024)
-    expect(fullBytes).toBeLessThan(16 * 1024 * 1024 - 1024)
-    const directory = path.join, parent = path.dirname
-    const join = spyOn(path, 'join').mockImplementation(path.win32.join)
-    const dirname = spyOn(path, 'dirname').mockImplementation(path.win32.dirname)
-    const basename = spyOn(path, 'basename').mockImplementation(path.win32.basename)
-    const ownerFilesystem = spyOn(windowsExecution, 'ownerFilesystemForWindowsPlan').mockReturnValue({
-      ...filesystem, selectedAuthMetadata() { throw new Error('TEST-unexpected-selected-auth') },
-    })
-    const readBirth = spyOn(windowsExecution, 'windowsBirth').mockResolvedValue(born)
-    const branded = spyOn(executionPlatform, 'isExecutionPlatformMapping').mockImplementation(
-      (value: unknown): value is executionPlatform.ExecutionPlatformMapping => value === mapping)
-    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
-    try {
-      const windowsPlan: windowsExecution.WindowsLaunchPlan = {
-        helper: { path: 'C:\\TEST\\helper.exe', sha256: 'c'.repeat(64), arch: 'x64' },
-        realpathDll: { path: 'C:\\TEST\\realpath.dll', sha256: 'd'.repeat(64), arch: 'x64' },
-        executable: 'C:\\TEST\\bun.exe', entry: 'C:\\TEST\\source\\entry.ts', cwd: root,
-        writableRoots: [root], readOnlyRoots: ['C:\\TEST\\source'], protectedRoots: [], metadataRoots: [],
-        profileDirectories: [root], env: {},
-      }
-      const owner = await acquireExecutionProfileOwner({ root, databasePath, epoch: 'TEST-epoch' } as SelectedExecutionProfile,
-        ids, { windowsPlan })
-      await owner.beforeSpawn()
-      await owner.bindChild(73, born, mapping)
-      const published = [...records.entries()].filter(([name]) => name.endsWith('\\containment.json'))
-      expect(published).toHaveLength(2)
-      for (const [, bytes] of published) expect(JSON.parse(bytes.toString())).toEqual({
-        schema: 1, platform: 'win32', mappingSha256: executionHash(mapping),
-        child: { pid: 73, birth: born }, namespace: mapping.namespace.name, leaseOwnerId: ids.leaseOwnerId,
-      })
-      expect(executionHash({ ...mapping, containerSid: 'S-1-15-2-2' })).not.toBe(executionHash(mapping))
-      await expect(owner.release(JSON.parse(published[0]![1].toString()))).rejects.toThrow('execution_owner_unknown')
-      expect([...records.keys()].some(name => name.endsWith('\\release.json'))).toBe(false)
-    } finally {
-      branded.mockRestore(); readBirth.mockRestore(); ownerFilesystem.mockRestore(); join.mockRestore(); dirname.mockRestore(); basename.mockRestore()
-      Object.defineProperty(process, 'platform', platform)
-      expect(path.join).toBe(directory); expect(path.dirname).toBe(parent)
-    }
-  })
 
   // The old host created independent nonces/fences for one profile. Two actual
   // processes now race at one barrier; only the winner crosses the mutation port.
@@ -165,23 +78,26 @@ describe('canonical durable execution owner', () => {
   // A spawn that dies before binding its child still owns both fences. Only the
   // launch-owned empty-scope retirement may free them; without that branded
   // claim the fence stays and blocks every later acquisition indefinitely.
-  test('unbound spawn frees its fences only through a branded empty-scope retirement', async () => {
+  test('unbound spawn frees its fences only through a branded retirement of its process', async () => {
     const { profile, remove } = await fixture()
-    const proof = Object.freeze({ scopeEmpty: true as const, heldProcessExited: true as const, scopeClosed: false })
+    const proof = Object.freeze({ pid: 4242, scopeClosed: true })
+    const open = Object.freeze({ pid: 4242, scopeClosed: false })
     const brand = spyOn(executionPlatform, 'isExecutionUnboundRetirement').mockImplementation(
-      (value: unknown): value is executionPlatform.ExecutionUnboundRetirement => value === proof)
+      (value: unknown): value is executionPlatform.ExecutionUnboundRetirement => value === proof || value === open)
     try {
       const owner = await acquireExecutionProfileOwner(profile, identity())
       await owner.beforeSpawn()
       await expect(owner.abandonBeforeSpawn()).rejects.toThrow('execution_owner_unknown')
       // Caller-supplied claims without the launch-owned brand never release.
-      await expect(owner.abandonAfterUnboundSpawn({ scopeEmpty: true, heldProcessExited: true, scopeClosed: false })).rejects.toThrow('execution_owner_unknown')
+      await expect(owner.abandonAfterUnboundSpawn({ pid: 4242, scopeClosed: true })).rejects.toThrow('execution_owner_unknown')
+      // A branded retirement that could not close the scope keeps the fence.
+      await expect(owner.abandonAfterUnboundSpawn(open)).rejects.toThrow('execution_owner_unknown')
       await owner.abandonAfterUnboundSpawn(proof)
       await expect(owner.abandonAfterUnboundSpawn(proof)).rejects.toThrow('execution_owner_released')
       const archive = path.join(profile.root, `.opencode-v2-execution-owner.released.${owner.record.leaseOwnerId}`, 'release.json')
       expect(JSON.parse(await readFile(archive, 'utf8'))).toEqual({ state: 'spawn_unbound',
         hostInstanceId: owner.record.hostInstanceId, leaseOwnerId: owner.record.leaseOwnerId,
-        retirement: { scopeEmpty: true, heldProcessExited: true, scopeClosed: false } })
+        retirement: { pid: 4242, processExited: true, scopeClosed: true } })
       // The freed fence admits the retry's fresh acquisition.
       const successor = await acquireExecutionProfileOwner(profile, identity())
       expect((await readExecutionProfileOwner(profile.root)).hostInstanceId).toBe(successor.record.hostInstanceId)
@@ -333,13 +249,11 @@ describe('canonical durable execution owner', () => {
     } finally { await remove() }
   })
 
-  test('physical database hardlink aliases and unqualified launches are refused', async () => {
+  test('physical database hardlink aliases are refused', async () => {
     const { profile, remove } = await fixture()
     try {
       await link(profile.databasePath, path.join(profile.root, 'data', 'alias.sqlite'))
       await expect(acquireExecutionProfileOwner(profile, identity())).rejects.toThrow('execution_database_alias')
-      expect(() => launchLinuxExecution({ launcher: '/TEST-foreign', launcherSha256: 'a'.repeat(64), args: [], cwd: '/', serialization: 'json' },
-        'TEST-nonce', 'TEST-lease', { path: '/TEST-bun', sha256: 'b'.repeat(64) })).toThrow('execution_containment_unqualified')
       expect(await readFile(profile.databasePath, 'utf8')).toBe('TEST-original-database')
     } finally { await remove() }
   })

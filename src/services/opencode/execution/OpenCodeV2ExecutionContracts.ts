@@ -1,17 +1,27 @@
+import { OPEN_CODE_LOADING_TIMEOUT_MS } from '../OpenCodeLoadingBudget.js'
 import { createHash } from 'node:crypto'
+import { isOpenCodeV2Identity, isOpenCodeV2Pin, type OpenCodeV2Dialect, type OpenCodeV2Pin } from '../compatibility/OpenCodeV2Registry.js'
 
 /** One absolute owner startup ceiling; callers may clip it to an earlier deadline. */
 export function openCodeV2RunInitializationMs(platform: NodeJS.Platform): number {
-  return platform === 'win32' ? 300_000 : platform === 'darwin' ? 300_000 : 90_000
+  return platform === 'win32' || platform === 'darwin' ? 300_000 : OPEN_CODE_LOADING_TIMEOUT_MS
 }
-// Windows physical close shares the existing 29s owner Stop envelope. The
+/** The activation deadline a child accepts: the caller's deadline, clipped to the
+ * platform ceiling counted from before the child was spawned. The entry refuses any
+ * deadline past its own start plus that ceiling, so a longer caller deadline (the
+ * 240s catalog lease) must not reach it unclipped. */
+export function openCodeV2ActivationDeadline(callerDeadline: number, acquisitionStartedAt: number, platform: NodeJS.Platform): number {
+  return Math.min(callerDeadline, acquisitionStartedAt + openCodeV2RunInitializationMs(platform))
+}
+// Windows physical close shares the 40s owner Stop envelope. The
 // owner clips this ceiling to leave 2s for the final durable run receipt.
-export const OPEN_CODE_V2_WINDOWS_CLOSE_MS = 27_000
+export const OPEN_CODE_V2_WINDOWS_CLOSE_MS = 38_000
 
-export type ExecutionPin = '2.0.0' | '2.0.32'
+export type ExecutionPin = OpenCodeV2Pin
 export type ExecutionBirth = Readonly<{ format: 'linux-start-ticks' | 'darwin-pidversion' | 'windows-filetime' | 'utc-ms'; value: string; bootId: string | null }>
 export type ExecutionAuthority = Readonly<{
-  generation: 'v2'; pin: ExecutionPin; dialect: 'v2-2.0.0' | 'v2-2.0.32'
+  /** pin/dialect identify the exact owned engine; selectedCli.version identifies the installed CLI. */
+  generation: 'v2'; pin: ExecutionPin; dialect: OpenCodeV2Dialect
   graphSha256: string
   selectedCli: Readonly<{ path: string; sha256: string; version: ExecutionPin }>
   child: Readonly<{ pid: number; birth: ExecutionBirth; executablePath: string; sha256: string }>
@@ -69,8 +79,7 @@ export function assertExecutionAuthority(host: ExecutionAuthority): void {
     host.child.birth.format === 'windows-filetime' ? /^[1-9]\d{0,19}$/.test(host.child.birth.value) &&
       BigInt(host.child.birth.value) <= 0xffffffffffffffffn && host.child.birth.bootId === null :
     host.child.birth.format === 'utc-ms' && host.child.birth.bootId === null)
-  executionAssert(host.generation === 'v2' && (host.pin === '2.0.0' || host.pin === '2.0.32'))
-  executionAssert(host.dialect === `v2-${host.pin}` && host.selectedCli.version === host.pin)
+  executionAssert(host.generation === 'v2' && isOpenCodeV2Identity(host.pin, host.dialect) && isOpenCodeV2Pin(host.selectedCli.version))
   executionAssert([host.graphSha256, host.selectedCli.sha256, host.child.sha256].every(x => /^[a-f0-9]{64}$/.test(x)))
   executionAssert(Number.isSafeInteger(host.child.pid) && host.child.pid > 0 && typeof host.child.birth.value === 'string' && host.child.birth.value.length > 0)
   executionAssert([host.profileEpoch, host.hostInstanceId, host.leaseOwnerId].every(x => typeof x === 'string' && x.length > 0))
@@ -91,8 +100,12 @@ export function assertExecutionSelectedModel(model: ExecutionSelectedModel): voi
   if (Object.hasOwn(model, 'variant')) executionAssert(typeof model.variant === 'string' &&
     model.variant.length > 0 && Buffer.byteLength(model.variant) <= 4096 && !model.variant.includes('\0'), 'invalid_model')
 }
+/** App message IDs can be long: a still-stuck work-sync nudge carries two SHA-256 agendas and a
+ * timestamp (224 chars). The native input ID is a hash, so this bound only limits record size. */
+export const INTENT_IDENTITY_MAX_LENGTH = 512
 export function assertIntentIdentity(identity: IntentIdentity): void {
   executionAssert(Object.keys(identity).sort().join(',') === 'deliveryAttemptId,localMessageId,nativeInputID,requestId')
-  executionAssert([identity.requestId, identity.deliveryAttemptId, identity.localMessageId].every(x => typeof x === 'string' && x.length > 0 && x.length <= 200))
+  executionAssert([identity.requestId, identity.deliveryAttemptId, identity.localMessageId].every(x => typeof x === 'string' && x.length > 0 &&
+    x.length <= INTENT_IDENTITY_MAX_LENGTH), 'intent_identity_invalid')
   executionAssert(/^msg_[a-zA-Z0-9]+$/.test(identity.nativeInputID))
 }

@@ -4,6 +4,10 @@ import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:f
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { isOpenCodeV2Pin, openCodeV2GraphPackages } from '../../src/services/opencode/compatibility/OpenCodeV2Registry.js'
+import runtimeManifest from '../../package.json' with { type: 'json' }
+import { collectOpenCodeV2GraphFiles } from '../../src/services/opencode/host/OpenCodeV2GraphFiles.js'
+import { loadPackagedOpenCodeV2Support } from './packaged-support.js'
 
 type Exit = { exitCode: number; signal?: string | number }
 type Terminal = {
@@ -16,7 +20,7 @@ type Terminal = {
 export function assertNoPtyHooks(environment: NodeJS.ProcessEnv, arguments_: readonly string[]): void {
   const forbidden = new Set(['BUN_PTY_LIB', 'BUN_OPTIONS', 'BUN_PRELOAD', 'BUN_INSPECT', 'NODE_OPTIONS', 'LD_PRELOAD', 'DYLD_INSERT_LIBRARIES'])
   assert(!Object.keys(environment).some(key => forbidden.has(key.toUpperCase())), 'PTY loader override or hook is present')
-  assert(arguments_.every(argument => argument === '--no-env-file'), 'Unexpected Bun startup arguments')
+  assert(arguments_.every(argument => argument === '--no-env-file' || argument === '--no-install'), 'Unexpected Bun startup arguments')
 }
 
 /** A cleanup-generated exit is never accepted as natural process completion. */
@@ -97,7 +101,7 @@ async function waitGone(pid: number): Promise<boolean> {
   return false
 }
 
-export async function main(deliveryArgument: string, receipt: string, expectedPlatform: string): Promise<void> {
+export async function main(baseArgument: string, supportArgument: string, receipt: string, expectedPlatform: string): Promise<void> {
   const evidence: Record<string, unknown> = { schemaVersion: 1, ok: false,
     sourceHead: process.env.PR_HEAD_SHA ?? process.env.GITHUB_SHA ?? null,
     checkoutSha: process.env.GITHUB_SHA ?? null, platform: process.platform, arch: process.arch,
@@ -108,13 +112,8 @@ export async function main(deliveryArgument: string, receipt: string, expectedPl
     assert.equal(process.platform, 'win32'); assert(['x64', 'arm64'].includes(process.arch))
     assert.equal(`${process.platform}-${process.arch}`, expectedPlatform)
     assert.equal(Bun.version, '1.4.3')
-    const delivery = await realpath(deliveryArgument)
-    const bundle = await realpath(path.join(delivery, 'local-cli'))
-    assert.equal(path.relative(delivery, bundle), 'local-cli', 'Physical local-cli must stay inside delivery')
-    const bun = await physical(path.join(delivery, 'bun/bun.exe'), delivery)
-    assert.equal(await realpath(process.execPath), bun, 'Smoke must execute the shipped physical Bun')
-    const entry = await physical(path.join(bundle, 'cli.js'), bundle)
-    const identity = JSON.parse(await readFile(await physical(path.join(delivery, 'opencode-delivery.json'), delivery), 'utf8'))
+    const { base: delivery, delivery: support, descriptor, bun, entry, identity } = await loadPackagedOpenCodeV2Support(baseArgument, supportArgument)
+    const bundle = support.root
     assert.equal(identity.schema, 1); assert.equal(identity.platform, process.platform)
     assert.equal(identity.arch, process.arch); assert.equal(identity.bunVersion, Bun.version)
     assert.equal(sha(await readFile(bun)), identity.bunSha256)
@@ -129,15 +128,24 @@ export async function main(deliveryArgument: string, receipt: string, expectedPl
     const environment = { SystemRoot: systemRoot, ComSpec: command, PATH: path.dirname(command),
       HOME: home, USERPROFILE: home, APPDATA: path.join(home, 'appdata'),
       LOCALAPPDATA: path.join(home, 'localappdata'), TEMP: temp, TMP: temp }
-    for (const pin of ['2.0.0', '2.0.32'] as const) {
-      const server = await physical(Bun.resolveSync(pin === '2.0.0' ? '@opencode/server-v2-floor/process' : '@opencode/server/process', bundle), bundle)
+    // Exercise every graph the bundle staged, as recorded by its own staging manifest.
+    const staged = JSON.parse(await readFile(path.join(bundle, 'opencode-v2-graphs.json'), 'utf8')) as {
+      schema: number; graphs: { version: string; server: string }[]; pty: string }
+    assert(staged.schema === 2 && Array.isArray(staged.graphs) && typeof staged.pty === 'string', 'Staged graph manifest invalid')
+    // The artifact must ship exactly the graphs and PTY pin this source manifest stages.
+    assert.deepEqual(staged.graphs.map(graph => graph.version), descriptor.engineVersions, 'Staged graph set changed')
+    assert.equal(staged.pty, runtimeManifest.overrides['bun-pty'], 'Staged PTY pin changed')
+    for (const { version: pin, server: alias } of staged.graphs) {
+      assert(isOpenCodeV2Pin(pin) && alias === openCodeV2GraphPackages(pin).server, 'Staged graph manifest invalid')
+      await collectOpenCodeV2GraphFiles(pin, bundle, support.binding)
+      const server = await physical(Bun.resolveSync(`${alias}/process`, bundle), bundle)
       await packageInfo(server, '@opencode/server', pin, bundle)
       const core = await physical(Bun.resolveSync('@opencode/core/bus', path.dirname(server)), bundle)
       const coreRoot = await packageInfo(core, '@opencode/core', pin, bundle)
       const adapter = await physical(Bun.resolveSync('#pty', path.dirname(core)), bundle)
       assert.equal(await packageInfo(adapter, '@opencode/core', pin, bundle), coreRoot)
       const pty = await physical(Bun.resolveSync('bun-pty', path.dirname(adapter)), bundle)
-      const ptyRoot = await packageInfo(pty, 'bun-pty', '0.4.11', bundle)
+      const ptyRoot = await packageInfo(pty, 'bun-pty', staged.pty, bundle)
       const dll = await physical(path.join(ptyRoot, 'rust-pty/target/release', process.arch === 'arm64' ? 'rust_pty_arm64.dll' : 'rust_pty.dll'), bundle)
       const bytes = await readFile(dll), pe = bytes.readUInt32LE(0x3c)
       assert.equal(bytes.readUInt16LE(0), 0x5a4d); assert(pe <= bytes.length - 6)
@@ -169,7 +177,7 @@ export async function main(deliveryArgument: string, receipt: string, expectedPl
 }
 
 if (import.meta.main) {
-  const [delivery, receipt, platform] = process.argv.slice(2)
-  assert(delivery && receipt && platform, 'Expected delivery, receipt and platform arguments')
-  await main(delivery, receipt, platform)
+  const [base, support, receipt, platform] = process.argv.slice(2)
+  assert(base && support && receipt && platform, 'Expected base, support, receipt and platform arguments')
+  await main(base, support, receipt, platform)
 }

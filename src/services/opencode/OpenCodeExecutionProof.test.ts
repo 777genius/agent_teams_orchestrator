@@ -71,6 +71,29 @@ const identityDeps = {
 }
 
 describe('OpenCodeExecutionProof', () => {
+  test('only team qualification survives 126s preparation and still enforces signed expiry and identity', async () => {
+    const current = snapshot(); current.host!.profile = current.profile!
+    const deps = { ...identityDeps, readCredential: async () => null }
+    const input = { selectedModel: 'ollama/gemma4:12b', snapshot: current, capabilitySnapshotId: 'capability-1' }
+    const ordinary = await buildOpenCodeExecutionProof(input, deps)
+    const team = await buildOpenCodeExecutionProof({ ...input, unattendedTeam: true }, deps)
+    expect(Date.parse(ordinary.expiresAt) - Date.parse(ordinary.verifiedAt)).toBe(120_000)
+    expect(Date.parse(team.expiresAt) - Date.parse(team.verifiedAt)).toBe(330_000)
+    const validate = (proof = team, snapshotValue = current, now = 127_000) => validateOpenCodeExecutionProof({
+      ...input, proof, projectPath: current.projectPath, snapshot: snapshotValue,
+    }, { ...deps, nowMs: () => now })
+    await expect(validate(ordinary)).resolves.toEqual({ valid: false, reason: 'execution proof expired' })
+    await expect(validate()).resolves.toEqual({ valid: true, reason: null })
+    await expect(validate(team, current, 330_999)).resolves.toEqual({ valid: true, reason: null })
+    await expect(validate(team, current, 331_000)).resolves.toEqual({ valid: false, reason: 'execution proof expired' })
+    await expect(validate({ ...team, expiresAt: new Date(332_000).toISOString() }))
+      .resolves.toEqual({ valid: false, reason: 'execution proof integrity mismatch' })
+    for (const field of ['managedAuthFingerprint', 'managedConfigFingerprint', 'projectBehaviorFingerprint'] as const) {
+      const changed = structuredClone(current); changed.profile![field] = 'TEST-changed'
+      await expect(validate(team, changed)).resolves.toEqual({ valid: false, reason: 'execution proof profile or authentication changed' })
+    }
+  })
+
   test('reuses a fresh exact proof for authless local models', async () => {
     const current = snapshot()
     current.host!.profile = current.profile!

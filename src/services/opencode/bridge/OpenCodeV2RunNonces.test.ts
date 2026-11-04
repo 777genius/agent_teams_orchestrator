@@ -28,5 +28,13 @@ test('expired signed frames cannot replay after their history is pruned', () => 
   expect(() => history.claim(nonce(1), now + 1000, 'send', now + 1000)).toThrow('run_control_timeout')
   history.claim(nonce(2), now + 31_000, 'status', now + 1000)
   expect(() => history.claim(nonce(1), now + 1000, 'send', now + 1001)).toThrow('run_control_timeout')
-  expect(() => history.claim(nonce(3), now + 31_002, 'status', now + 1001)).toThrow('run_control_timeout')
+  expect(() => history.claim(nonce(3), now + 31_002, 'observe', now + 1001)).toThrow('run_control_timeout')
+})
+
+test('cleanup stop and status keep the extended 45s signed window while other operations stay at 30s', () => {
+  const history = new OpenCodeV2RunNonces(), now = 100_000
+  history.claim(nonce(1), now + 45_000, 'stop', now)
+  history.claim(nonce(2), now + 45_000, 'status', now)
+  expect(() => history.claim(nonce(3), now + 45_001, 'stop', now)).toThrow('run_control_timeout')
+  expect(() => history.claim(nonce(4), now + 30_001, 'send', now)).toThrow('run_control_timeout')
 })

@@ -1,4 +1,5 @@
-import { mkdir, writeFile } from 'node:fs/promises'
+import { OPEN_CODE_LOADING_TIMEOUT_MS } from './OpenCodeLoadingBudget.js'
+import { mkdir, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import stripAnsi from 'strip-ansi'
 
@@ -16,6 +17,8 @@ import { readOpenCodeAuthProviderSummaries } from './OpenCodeAuthStore.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { inspectOpenCodeReadSelection } from './compatibility/OpenCodeNativeIdentity.js'
 import { probeOpenCodeV2Inventory } from './catalog/OpenCodeV2InventoryService.js'
+import { emptyOpenCodeV2ReadStatus } from './catalog/OpenCodeV2ReadStatus.js'
+import { openCodeV2KeyIntegrations, readOpenCodeV2ConnectedProviders } from './catalog/OpenCodeV2KeyIntegrations.js'
 import {
   getOpenCodeManagedSubscriptionPluginPackages,
   isOpenCodeCuratedSubscriptionProviderId,
@@ -28,6 +31,7 @@ import {
 } from './OpenCodeProfileManager.js'
 import {
   raceOpenCodeAbortSignal,
+  OpenCodeRuntimeDeadline,
   throwOpenCodeAbortReason,
   waitForOpenCodeAbortableDelay,
 } from './OpenCodeRuntimeDeadline.js'
@@ -85,12 +89,16 @@ export const OPEN_CODE_PROBE_TIMEOUT_MS = 10_000
 // Summary still prepares the profile and runs sequential version/auth probes.
 // Allow profile I/O plus both per-command budgets without starting a model host.
 export const OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 3
-export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = OPEN_CODE_PROBE_TIMEOUT_MS * 6
-export const OPEN_CODE_MODEL_LIST_TIMEOUT_MS = 30_000
+// Cold full inventory includes profile/auth preparation and the first managed-plugin
+// load before sequential probes. Keep their shared budget below the desktop connect ceiling.
+export const OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS = OPEN_CODE_LOADING_TIMEOUT_MS
+export const OPEN_CODE_MODEL_LIST_TIMEOUT_MS = OPEN_CODE_LOADING_TIMEOUT_MS
+// Seeding runs before a catalog host starts, inside the catalog read's own deadline.
+export const OPEN_CODE_MODELS_CACHE_SEED_TIMEOUT_MS = 15_000
 const OPEN_CODE_MODEL_REFRESH_OUTPUT_PROVIDER = 'opencode'
 const OPEN_CODE_CACHE_TTL_MS = 10_000
 const OPEN_CODE_INVENTORY_TIMEOUT_MESSAGE_PREFIX = 'OpenCode inventory probe timed out'
-const OPEN_CODE_MANAGED_PLUGIN_FIRST_LOAD_TIMEOUT_MS = 45_000
+const OPEN_CODE_MANAGED_PLUGIN_FIRST_LOAD_TIMEOUT_MS = OPEN_CODE_LOADING_TIMEOUT_MS
 const OPEN_CODE_MANAGED_PLUGIN_INSTALL_LOCK_OPTIONS = {
   stale: 30_000,
   update: 5_000,
@@ -179,7 +187,7 @@ export type OpenCodeInventoryProbeProgressTracker = {
 }
 
 export function createOpenCodeInventoryProbeProgressTracker(
-  now: () => number = () => Date.now(),
+  now: () => number = () => performance.now(),
 ): OpenCodeInventoryProbeProgressTracker {
   const startedAtMs = now()
   const completedSteps: OpenCodeInventoryProbeProgressSnapshot['completedSteps'] = []
@@ -187,6 +195,12 @@ export function createOpenCodeInventoryProbeProgressTracker(
 
   return {
     enterStep(label: string): () => void {
+      if (currentStep) {
+        completedSteps.push({
+          label: currentStep.label,
+          durationMs: Math.max(0, now() - currentStep.startedAtMs),
+        })
+      }
       const step = { label, startedAtMs: now() }
       currentStep = step
       let active = true
@@ -294,6 +308,18 @@ export function getOpenCodeInventoryCommandTimeoutMs(args: readonly string[]): n
     : OPEN_CODE_PROBE_TIMEOUT_MS
 }
 
+/** Each sequential CLI stage consumes the original full-inventory budget. */
+export function getOpenCodeRemainingInventoryCommandTimeoutMs(
+  args: readonly string[],
+  remainingMs: (() => number) | undefined,
+): number {
+  const remaining = remainingMs?.() ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS
+  if (!Number.isFinite(remaining) || remaining <= 0) {
+    throw new Error('OpenCode inventory probe timed out')
+  }
+  return Math.max(1, Math.min(getOpenCodeInventoryCommandTimeoutMs(args), Math.floor(remaining)))
+}
+
 function getOpenCodeCatalogRefreshProfile(
   profile: OpenCodePreparedProfile,
 ): OpenCodePreparedProfile {
@@ -312,6 +338,74 @@ function getOpenCodeCatalogRefreshProfile(
   }
 }
 
+export type OpenCodeModelsCacheSeed = 'present' | 'seeded' | 'not-applicable' | 'unavailable'
+
+// OpenCode controls its own Models.dev source with these: a fetch disabled on
+// purpose, or another file than the cache named below.
+function openCodeChoosesModelsSource(env: NodeJS.ProcessEnv | undefined): boolean {
+  const disabled = env?.OPENCODE_DISABLE_MODELS_FETCH?.toLowerCase()
+  return disabled === 'true' || disabled === '1' || Boolean(env?.OPENCODE_MODELS_URL) || Boolean(env?.OPENCODE_MODELS_PATH)
+}
+// A failed seed (offline, blocked network) is not retried by every catalog read.
+export const OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS = 15 * 60_000
+const OPEN_CODE_MODELS_CACHE_SEED_FAILURE_MARKER = '.models-cache-seed-failed'
+
+const modelsCacheSeeds = new Map<string, Promise<OpenCodeModelsCacheSeed>>()
+
+function isNonEmptyFile(filePath: string): Promise<boolean> {
+  return stat(filePath).then(info => info.isFile() && info.size > 0, () => false)
+}
+
+/**
+ * Until OpenCode's shared Models.dev cache exists, OpenCode answers from the
+ * model snapshot built into its release, which can still list models that
+ * Models.dev has deprecated since. Seed a missing cache once, before a catalog
+ * host starts; an existing cache is refreshed by OpenCode itself. Best effort:
+ * if the refresh fails (for example offline), OpenCode keeps its snapshot as
+ * before, and the next attempt waits OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS.
+ */
+export function seedOpenCodeModelsCache(input: {
+  binaryPath: string | null
+  profile: OpenCodePreparedProfile | null
+  exec: (binaryPath: string, args: string[], profile: OpenCodePreparedProfile) => Promise<OpenCodeCommandResult>
+  /** The caller's deadline; a cancelled seed is not a failed one. Joined callers share the first one's. */
+  abortSignal?: AbortSignal
+  now?: () => number
+}): Promise<OpenCodeModelsCacheSeed> {
+  const { binaryPath, profile } = input
+  if (!binaryPath || !profile?.xdgCacheHome) return Promise.resolve('unavailable')
+  if (openCodeChoosesModelsSource(profile.env)) return Promise.resolve('not-applicable')
+  const cacheDirectory = path.join(profile.xdgCacheHome, 'opencode')
+  const cacheFile = path.join(cacheDirectory, 'models.json')
+  const failureMarker = path.join(cacheDirectory, OPEN_CODE_MODELS_CACHE_SEED_FAILURE_MARKER)
+  const now = input.now ?? Date.now
+  const pending = modelsCacheSeeds.get(cacheFile)
+  if (pending) return pending
+  const seed = (async (): Promise<OpenCodeModelsCacheSeed> => {
+    if (await isNonEmptyFile(cacheFile)) return 'present'
+    const failedAt = await stat(failureMarker).then(info => info.mtimeMs, () => null)
+    // A marker dated in the future (clock moved back) does not block seeding.
+    if (failedAt !== null && failedAt <= now() && now() - failedAt < OPEN_CODE_MODELS_CACHE_SEED_RETRY_MS)
+      return 'unavailable'
+    // The catalog refresh profile (no managed plugins or MCP), run in the catalog
+    // workspace rather than the user's project; the cache lives in XDG_CACHE_HOME.
+    await input.exec(binaryPath, getOpenCodeRefreshModelsArgs(), {
+      ...getOpenCodeCatalogRefreshProfile(profile),
+      projectPath: profile.workingDirectoryPath,
+    }).catch(() => undefined)
+    if (await isNonEmptyFile(cacheFile)) return 'seeded'
+    if (input.abortSignal?.aborted) return 'unavailable'
+    await mkdir(cacheDirectory, { recursive: true })
+      // Non-empty, changing content: every failure must move the marker's mtime,
+      // which rewriting an already empty file does not guarantee on every platform.
+      .then(() => writeFile(failureMarker, `${new Date().toISOString()}\n`))
+      .catch(() => undefined)
+    return 'unavailable'
+  })().finally(() => modelsCacheSeeds.delete(cacheFile))
+  modelsCacheSeeds.set(cacheFile, seed)
+  return seed
+}
+
 const EMPTY_OPEN_CODE_COMMAND_RESULT: OpenCodeCommandResult = {
   stdout: '',
   stderr: '',
@@ -328,6 +422,7 @@ export function execOpenCodePortableCommand(input: {
   profile: OpenCodePreparedProfile
   abortSignal?: AbortSignal
   timeoutMs?: number
+  progress?: OpenCodeInventoryProbeProgressTracker
 }): Promise<OpenCodeCommandResult> {
   return new Promise(resolve => {
     const stdout: Buffer[] = []
@@ -369,7 +464,9 @@ export function execOpenCodePortableCommand(input: {
         return
       }
 
+      const leaveCleanup = input.progress?.enterStep('clean up OpenCode inventory command')
       void killProcessTreeAndWait(pid, 'SIGKILL').finally(() => {
+        leaveCleanup?.()
         finish({
           ...snapshotOutput(),
           code: 1,
@@ -478,7 +575,9 @@ async function withManagedPluginInstallLock<T>(
   profile: OpenCodePreparedProfile,
   callback: () => Promise<T>,
   abortSignal?: AbortSignal,
+  progress?: OpenCodeInventoryProbeProgressTracker,
 ): Promise<T> {
+  const leaveLock = progress?.enterStep('wait for managed OpenCode plugin install lock')
   const lockPath = path.join(
     profile.xdgCacheHome,
     'opencode',
@@ -493,7 +592,7 @@ async function withManagedPluginInstallLock<T>(
       lockPath,
       OPEN_CODE_MANAGED_PLUGIN_INSTALL_LOCK_OPTIONS,
       abortSignal,
-    )
+    ).finally(() => leaveLock?.())
     if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
     await repairEmptyOpenCodeManagedPluginCaches(profile.xdgCacheHome)
     return await callback()
@@ -508,7 +607,9 @@ async function withOpenCodeInventoryCommandLock<T>(
   profile: OpenCodePreparedProfile,
   callback: () => Promise<T>,
   abortSignal?: AbortSignal,
+  progress?: OpenCodeInventoryProbeProgressTracker,
 ): Promise<T> {
+  const leaveLock = progress?.enterStep('wait for OpenCode inventory command lock')
   const lockPath = path.join(profile.profileRootPath, 'inventory-command.lock')
   await mkdir(path.dirname(lockPath), { recursive: true })
   await writeFile(lockPath, '', { flag: 'a' })
@@ -517,7 +618,7 @@ async function withOpenCodeInventoryCommandLock<T>(
     lockPath,
     OPEN_CODE_INVENTORY_COMMAND_LOCK_OPTIONS,
     abortSignal,
-  )
+  ).finally(() => leaveLock?.())
   try {
     if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
     return await callback()
@@ -555,11 +656,12 @@ export async function prewarmOpenCodeManagedSubscriptionPlugins(input: {
         profile: input.profile,
         abortSignal: input.abortSignal,
         timeoutMs: OPEN_CODE_MANAGED_PLUGIN_FIRST_LOAD_TIMEOUT_MS,
+        progress: input.progress,
       })
     } finally {
       leaveStep?.()
     }
-  }, input.abortSignal)
+  }, input.abortSignal, input.progress)
 }
 
 export function isOpenCodeInventoryTimeoutMessage(message: string | null | undefined): boolean {
@@ -615,7 +717,7 @@ export function buildOpenCodeInventoryTimeoutSnapshot(input: {
     modelMetadata: [],
     agents: [],
     authStorePath: null,
-    probeError: message,
+    probeError: diagnostics.slice(0, input.progress ? 3 : 1).join(' '),
     diagnostics,
   }
 }
@@ -946,9 +1048,27 @@ export function parseOpenCodeAgentListOutput(output: string): OpenCodeAgentSumma
 
 export class OpenCodeInventoryService {
   private readonly cache = new Map<string, CacheEntry>()
+  private readonly v2CatalogReads = new Map<string, symbol>()
 
   clearCache(): void {
     this.cache.clear()
+    this.v2CatalogReads.clear()
+  }
+
+  /** See seedOpenCodeModelsCache; call it before a catalog host starts. */
+  seedModelsCache(
+    inventory: Pick<OpenCodeInventorySnapshot, 'binaryPath' | 'profile'>,
+    options: { abortSignal?: AbortSignal; progress?: OpenCodeInventoryProbeProgressTracker } = {},
+  ): Promise<OpenCodeModelsCacheSeed> {
+    return seedOpenCodeModelsCache({
+      binaryPath: inventory.binaryPath,
+      profile: inventory.profile,
+      abortSignal: options.abortSignal,
+      exec: (binaryPath, args, profile) => this.execOpenCode(binaryPath, args, profile, {
+        ...options,
+        timeoutMs: OPEN_CODE_MODELS_CACHE_SEED_TIMEOUT_MS,
+      }),
+    })
   }
 
   private getCommandFailureMessage(
@@ -980,6 +1100,7 @@ export class OpenCodeInventoryService {
         profile,
         abortSignal: options.abortSignal,
         timeoutMs: options.timeoutMs ?? getOpenCodeInventoryCommandTimeoutMs(args),
+        progress: options.progress,
       })
     } finally {
       leaveStep?.()
@@ -987,6 +1108,36 @@ export class OpenCodeInventoryService {
   }
 
   async probe(
+    projectPath?: string | null,
+    options: OpenCodeInventoryProbeOptions = {},
+  ): Promise<OpenCodeInventorySnapshot> {
+    if ((options.mode ?? 'full') !== 'full') {
+      return this.probeWithinDeadline(projectPath, options)
+    }
+    const remaining = Math.min(
+      OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
+      options.remainingMs?.() ?? OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS,
+    )
+    if (!Number.isFinite(remaining) || remaining <= 0) {
+      throw new Error('OpenCode inventory probe timed out')
+    }
+    const deadline = new OpenCodeRuntimeDeadline(remaining)
+    const signal = options.abortSignal
+      ? AbortSignal.any([options.abortSignal, deadline.signal])
+      : deadline.signal
+    try {
+      signal.throwIfAborted()
+      return await this.probeWithinDeadline(projectPath, {
+        ...options,
+        abortSignal: signal,
+        remainingMs: () => Math.min(deadline.remainingMs(), options.remainingMs?.() ?? Infinity),
+      })
+    } finally {
+      deadline.dispose()
+    }
+  }
+
+  private async probeWithinDeadline(
     projectPath?: string | null,
     options: OpenCodeInventoryProbeOptions = {},
   ): Promise<OpenCodeInventorySnapshot> {
@@ -999,6 +1150,7 @@ export class OpenCodeInventoryService {
     }
     const resolvedProjectPath = await canonicalizeOpenCodeProjectPath(projectPath)
     // Select generation before V1 profile preparation, plugin prewarming, locks or cache lookup.
+    const leaveSelection = options.progress?.enterStep('select OpenCode binary generation')
     let selection: Awaited<ReturnType<typeof inspectOpenCodeReadSelection>>
     try { selection = await inspectOpenCodeReadSelection(options.abortSignal, options.onReadAcquisitionStarted) }
     catch (failure) {
@@ -1011,17 +1163,53 @@ export class OpenCodeInventoryService {
         diagnostics: ['capabilities_pending'], readGeneration: 'unsupported',
       }
     }
-    finally { options.onReadAcquisitionSettled?.() }
+    finally { leaveSelection?.(); options.onReadAcquisitionSettled?.() }
     if (selection.native && mode === 'full') {
       options.onV2ReadStarted?.()
-      return probeOpenCodeV2Inventory(selection.native, resolvedProjectPath, { signal: options.abortSignal, remainingMs: options.remainingMs })
+      const identity = emptyOpenCodeV2ReadStatus(selection.native, resolvedProjectPath)
+      const cacheKey = `v2-catalog\0${identity.selectionKey}\0${identity.locationKey}`
+      const cached = this.cache.get(cacheKey)
+      if (!options.bypassCache && !options.refreshModels && cached && cached.expiresAt > Date.now()) {
+        // Connection receipts can change independently of the public catalog.
+        let connectedProviders: OpenCodeConnectedProvider[] = []
+        try { connectedProviders = await readOpenCodeV2ConnectedProviders(resolvedProjectPath, selection.native.version) } catch { /* unknown is not connected */ }
+        options.abortSignal?.throwIfAborted()
+        return { ...cached.snapshot, connectedProviders }
+      }
+      const readToken = Symbol()
+      this.v2CatalogReads.set(cacheKey, readToken)
+      try {
+        const snapshot = await probeOpenCodeV2Inventory(selection.native, resolvedProjectPath, { signal: options.abortSignal, remainingMs: options.remainingMs })
+        // A late read must not undo a newer refresh or explicit invalidation.
+        if (this.v2CatalogReads.get(cacheKey) === readToken) {
+          if (!options.abortSignal?.aborted && !snapshot.probeError && snapshot.readStatus?.catalog === 'ready') {
+            this.cache.set(cacheKey, { snapshot, expiresAt: Date.now() + OPEN_CODE_CACHE_TTL_MS })
+          } else this.cache.delete(cacheKey)
+        }
+        return snapshot
+      } catch (error) {
+        if (this.v2CatalogReads.get(cacheKey) === readToken) this.cache.delete(cacheKey)
+        throw error
+      } finally {
+        if (this.v2CatalogReads.get(cacheKey) === readToken) this.v2CatalogReads.delete(cacheKey)
+      }
     }
-    if (selection.path && selection.policy.generation !== 'v1') {
+    if (selection.policy.generation !== 'v1') {
+      // No selected executable is also an unsupported generation: do not enter
+      // V1 profile preparation, plugin prewarming or host discovery on absence.
+      // Passive V2 reads still list the native key integrations and their completed connections.
+      const v2 = selection.policy.generation === 'v2' ? selection.policy.version : null
+      let connectedProviders: OpenCodeInventorySnapshot['connectedProviders'] = []
+      if (v2) { try { connectedProviders = await readOpenCodeV2ConnectedProviders(resolvedProjectPath, v2) } catch { /* unknown is not connected */ } }
       return {
-        detected: true, binaryPath: selection.path, version: selection.policy.version, projectPath: resolvedProjectPath,
-        profile: null, connectedProviders: [], availableProviders: [], models: [], agents: [], authStorePath: null,
-        probeError: 'This selected generation requires an explicit qualified V2 full catalog read.',
-        diagnostics: ['capabilities_pending'], readGeneration: selection.policy.generation,
+        detected: selection.path !== null, binaryPath: selection.path, version: selection.policy.version, projectPath: resolvedProjectPath,
+        profile: null, connectedProviders, availableProviders: v2 ? openCodeV2KeyIntegrations(v2).map(entry => entry.providerId) : [],
+        models: [], agents: [], authStorePath: null,
+        probeError: selection.path
+          ? 'This selected generation requires an explicit qualified V2 full catalog read.'
+          : null,
+        diagnostics: [selection.path ? 'capabilities_pending' : 'OpenCode CLI not detected on PATH'],
+        readGeneration: selection.policy.generation,
       }
     }
     // Preserve the selected V2 full read above; only V1 settings avoids CLI sweeps.
@@ -1082,7 +1270,7 @@ export class OpenCodeInventoryService {
         binaryPath,
         profile,
         verifiedVersion: options.v1SettingsOnly ? selection.policy.version ?? undefined : undefined,
-      }), options.abortSignal,
+      }), options.abortSignal, options.progress,
     )
   }
 
@@ -1134,9 +1322,7 @@ export class OpenCodeInventoryService {
             {
               abortSignal: options.abortSignal,
               progress: options.progress,
-              ...(options.refreshModels && args[0] === 'models'
-                ? { timeoutMs: OPEN_CODE_MODEL_LIST_TIMEOUT_MS }
-                : {}),
+              timeoutMs: getOpenCodeRemainingInventoryCommandTimeoutMs(args, options.remainingMs),
             },
           ),
       })
@@ -1204,12 +1390,15 @@ export class OpenCodeInventoryService {
     let modelMetadata = verboseModels.modelMetadata
     let finalModelsResult = modelsResult
     if (mode === 'full' && models.length === 0) {
-      const fallbackModelsResult = await this.execOpenCode(binaryPath, [
+      options.abortSignal?.throwIfAborted()
+      const fallbackModelsArgs = [
         'models',
         ...(options.refreshModels ? ['--refresh'] : []),
-      ], profile, {
+      ]
+      const fallbackModelsResult = await this.execOpenCode(binaryPath, fallbackModelsArgs, profile, {
         abortSignal: options.abortSignal,
         progress: options.progress,
+        timeoutMs: getOpenCodeRemainingInventoryCommandTimeoutMs(fallbackModelsArgs, options.remainingMs),
       })
       finalModelsResult = fallbackModelsResult
       models =

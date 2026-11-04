@@ -11,7 +11,8 @@ import { once } from 'node:events';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { assertBackfillCasePath, assertBackfillEnvelope, assertImportedLedger, buildWindowsTeardownCommand, createBackfillFixture, finishSmokeCleanup, fixtureScriptPaths, runSmokeGroups, sandboxEnvironment, stageRuntimeDelivery, teardownOwnedProcesses, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
+import { assertBackfillCasePath, assertBackfillEnvelope, assertImportedLedger, buildWindowsTeardownCommand, createBackfillFixture, finishSmokeCleanup, fixtureScriptPaths, runSmokeGroups, sandboxEnvironment, stageRuntimeDelivery, teardownOwnedProcesses,
+  WINDOWS_BACKFILL_TEARDOWN_TIMEOUT_MS, trustedSearchPath, windowsNodeScriptPattern } from './windows-runtime-opencode-backfill.mjs';
 
 import { actualProviderResult, actualProviderTransport, catalogGuard, assertReadinessHost, runProviderSmoke, runRecordedCheck } from './windows-runtime-opencode-provider-json.mjs';
 import { environmentSummary, traceSpawn } from './windows-process-identity-probe.mjs';
@@ -375,7 +376,8 @@ test('teardown retains the last phase on timeout or failure and keeps stdout sep
     assert.equal(executable, 'powershell.exe');
     assert.deepEqual(argv.slice(0, -1), ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command']);
     assert.equal(options.env, env);
-    assert.equal(options.timeout, 30000);
+    assert.equal(options.timeout, WINDOWS_BACKFILL_TEARDOWN_TIMEOUT_MS);
+    assert.equal(WINDOWS_BACKFILL_TEARDOWN_TIMEOUT_MS, 3 * 60_000);
     assert.deepEqual(options.stdio, ['ignore', 'pipe', 'pipe']);
     // Check emitted diagnostic boundaries; native execution remains Windows-only.
     const command = argv.at(-1);
@@ -430,7 +432,7 @@ test('teardown retains the last phase on timeout or failure and keeps stdout sep
       assert.equal(report.teardown.stdout, result.stdout);
       assert.equal(report.teardown.errorCode, result.error?.code);
       assert.equal(report.teardown.signal, result.signal);
-      assert.equal(report.teardown.timeoutMs, 30000);
+      assert.equal(report.teardown.timeoutMs, WINDOWS_BACKFILL_TEARDOWN_TIMEOUT_MS);
       assert.ok(Number.isFinite(report.teardown.elapsedMs));
     }
   } finally {

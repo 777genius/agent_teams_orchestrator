@@ -5,17 +5,42 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { aggregate, classify, diffArgs, parsePaths } from './policy.ts'
 
+test('legacy provider fixture native-selection mock is isolated from real identity tests in CI', () => {
+  const workflow = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8')
+  const target = 'src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderManagementAdapter.test.ts'
+  // Reject folded run scripts that silently combine the native-identity mock
+  // with other tests, even when the fixture path appears on a continuation line.
+  const references = workflow.split('\n').map(line => line.trim()).filter(line => line.includes(target))
+  assert.deepEqual(references, [`run: bun test ${target} --timeout 30000`])
+  assert.match(workflow, /- name: Test provider identity, inventory, labels and HTTP deadlines\n\s+run: bun test src\/services\/opencode\/OpenCodeProviderIdentity\.test\.ts/)
+})
+
 test('routine source and documentation keep Linux coverage without native jobs', () => {
   for (const path of ['src/components/Button.tsx', 'src/utils/processUserInput/processTextPrompt.ts', 'src/services/opencode/OpenCodeLogProjector.ts', 'src/services/opencode/OpenCodeModelRef.ts', 'docs/guide.md', 'src/features/runtimeProviderManagement/ui/ProviderManagementDialog.tsx']) {
     const decision = classify([path])
     assert.equal(decision.native, 'false', path)
     assert.deepEqual(JSON.parse(decision.authority_os), ['ubuntu-latest'])
     assert.match(decision.reason, /native jobs skipped/)
+    assert.equal(decision.v2_linux, 'false', path)
   }
 })
 
+test('V2 execution, catalog and provider code selects the real Linux V2 lane', () => {
+  // host/ is not a native boundary: the Linux deadline regression changed host code only.
+  for (const path of ['src/services/opencode/host/OpenCodeV2ExecutionHost.ts', 'src/services/opencode/host/OpenCodeV2PlainExecution.ts',
+    'src/services/opencode/execution/OpenCodeV2ExecutionContracts.ts', 'src/services/opencode/catalog/OpenCodeV2RuntimeStatus.ts',
+    'src/services/opencode/compatibility/opencode-v2-qualifications.json', 'src/services/opencode/bridge/OpenCodeV2TeamBridge.ts',
+    'src/services/opencode/transport/OpenCodeV2ProviderWire.ts', 'src/services/opencode/profile/OpenCodeV2ExecutionReceipt.ts',
+    'src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.ts', 'src/entrypoints/opencodeV2ExecutionServer.ts',
+    'scripts/opencode-v2/stage.ts', 'scripts/opencode-v2-anonymous-native-e2e.ts', 'scripts/opencode-v2-team-native-e2e.ts', 'scripts/ci/opencode-v2-linux-execution.sh', 'patches/@opencode%2Fcore@2.0.32.patch', 'package.json']) {
+    assert.equal(classify([path]).v2_linux, 'true', path)
+  }
+  assert.equal(classify(['src/services/opencode/host/OpenCodeV2ExecutionHost.ts']).native, 'false')
+  assert.equal(classify([], true).v2_linux, 'true')
+})
+
 test('custody, process identity, startup cleanup, lifecycle, ABI and policy retain native gates', () => {
-  for (const path of ['src/services/opencode/OpenCodeBinaryResolver.ts', 'src/services/opencode/compatibility/OpenCodeVersionProbe.ts', 'src/services/opencode/compatibility/OpenCodeVersionProbe.helperBudget.test.ts', 'src/services/opencode/OpenCodeProvisioningProbe.ts', 'src/services/opencode/OpenCodeExecutionProof.ts', 'src/services/opencode/OpenCodeSelectedSessionAuthority.ts', 'src/services/opencode/OpenCodeCursorAgentAtomicReap.test.ts', 'src/services/opencode/OpenCodeStartupCleanup.ts', 'src/services/opencode/OpenCodeProcessAttributionStore.ts', 'src/services/opencode/recovery-contract/independent-boundaries.test.ts', 'src/utils/processKill.ts', 'src/utils/windowsNativeProcess.ts', 'src/utils/swarm/processBackend.ts', 'src/services/runtimeBackends/registry.ts', 'src/services/teamBootstrap/teamBootstrapRunner.ts', 'src/features/runtimeProviderManagement/application/connectProvider.ts', 'src/native-ts/yoga-layout/index.ts', 'src/entrypoints/cli.tsx', 'scripts/build.ts', 'scripts/package-runtime.ts', 'scripts/runtime-bun-pins.json', 'scripts/opencode-v2/stage.ts', 'src/cli/packagedOpenCodeDelivery.ts', 'src/cli/packagedOpenCodeDelivery.test.ts', 'package.json', 'bun.lock', 'tsconfig.json', '.github/workflows/ci.yml', 'scripts/ci/policy.test.ts', 'scripts/smoke/windows-runtime-opencode-provider-json.mjs']) {
+  for (const path of ['src/services/opencode/OpenCodeBinaryResolver.ts', 'src/services/opencode/compatibility/OpenCodeVersionProbe.ts', 'src/services/opencode/compatibility/OpenCodeVersionProbe.helperBudget.test.ts', 'src/services/opencode/OpenCodeProvisioningProbe.ts', 'src/services/opencode/OpenCodeExecutionProof.ts', 'src/services/opencode/OpenCodeSelectedSessionAuthority.ts', 'src/services/opencode/OpenCodeCursorAgentAtomicReap.test.ts', 'src/services/opencode/OpenCodeStartupCleanup.ts', 'src/services/opencode/OpenCodeProcessAttributionStore.ts', 'src/services/opencode/recovery-contract/independent-boundaries.test.ts', 'src/utils/processKill.ts', 'src/utils/windowsNativeProcess.ts', 'src/services/opencode/host/OpenCodeV2PlainExecution.ts', 'src/utils/swarm/processBackend.ts', 'src/services/runtimeBackends/registry.ts', 'src/services/teamBootstrap/teamBootstrapRunner.ts', 'src/features/runtimeProviderManagement/application/connectProvider.ts', 'src/native-ts/yoga-layout/index.ts', 'src/entrypoints/cli.tsx', 'scripts/build.ts', 'scripts/package-runtime.ts', 'scripts/runtime-bun-pins.json', 'scripts/opencode-v2/stage.ts', 'src/cli/packagedOpenCodeDelivery.ts', 'src/cli/packagedOpenCodeDelivery.test.ts', 'package.json', 'bun.lock', 'tsconfig.json', '.github/workflows/ci.yml', 'scripts/ci/policy.test.ts', 'scripts/smoke/windows-runtime-opencode-provider-json.mjs']) {
     assert.equal(classify([path]).native, 'true', path)
     assert.deepEqual(JSON.parse(classify([path]).authority_os), ['ubuntu-latest', 'windows-latest'])
   }
@@ -30,6 +55,18 @@ test('event ranges distinguish PR merge base, push before/head and new branches'
   for (const event of ['pull_request_target', '', 'workflow_dispatch']) assert.throws(() => diffArgs(event, base, head))
   assert.throws(() => diffArgs('push', '--bad-ref', head))
   assert.throws(() => diffArgs('pull_request', '0'.repeat(40), head))
+})
+
+test('native Codex conversation and transport changes retain Windows process/storage checks', () => {
+  for (const path of [
+    'src/services/codexNative/execRunner.ts',
+    'src/services/codexNative/appServerRunner.ts',
+    'src/services/codexNative/conversationBinding.ts',
+    'src/services/codexNative/nativeHomeOverlay.test.ts',
+  ]) {
+    assert.equal(classify([path]).native, 'true', path)
+    assert.deepEqual(JSON.parse(classify([path]).authority_os), ['ubuntu-latest', 'windows-latest'])
+  }
 })
 
 test('effective model ownership and fixture changes retain both native authority lanes', () => {
@@ -83,15 +120,17 @@ test('real no-index Git diff retains renamed-away and deleted authority paths', 
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
-function needs(native = 'false') {
+function needs(native = 'false', v2Linux = native === 'true' ? 'true' : 'false') {
   return {
-    scope: { result: 'success', outputs: { native, reason: 'TEST decision' } },
+    scope: { result: 'success', outputs: { native, reason: 'TEST decision', v2_linux: v2Linux } },
     'cursor-managed-plugin': { result: 'success' },
     'task-change-ledger': { result: 'success' },
     'opencode-authority': { result: 'success' },
     'packaged-delivery': { result: native === 'true' ? 'success' : 'skipped' },
     'windows-packaged-backfill': { result: native === 'true' ? 'success' : 'skipped' },
     'opencode-conformance': { result: native === 'true' ? 'success' : 'skipped' },
+    'opencode-v2-linux': { result: v2Linux === 'true' ? 'success' : 'skipped' },
+    'opencode-v2-desktop-lifecycle': { result: v2Linux === 'true' ? 'success' : 'skipped' },
   }
 }
 
@@ -102,12 +141,25 @@ test('aggregate independently rejects required failures/cancellation/skips and c
       for (const result of ['failure', 'cancelled', 'skipped', 'unknown']) {
         const sample = needs(native)
         sample[job as keyof typeof sample].result = result
-        if (native === 'false' && result === 'skipped' && ['windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery'].includes(job)) {
+        if (native === 'false' && result === 'skipped' && ['windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery', 'opencode-v2-linux', 'opencode-v2-desktop-lifecycle'].includes(job)) {
           assert.equal(aggregate(sample), 'TEST decision')
         } else assert.throws(() => aggregate(sample), `${job}/${native}/${result}`)
       }
     }
   }
+  // The V2 Linux lane may be skipped only when it was not selected; native always selects it.
+  const selected = needs('false', 'true')
+  assert.equal(aggregate(selected), 'TEST decision')
+  for (const job of ['opencode-v2-linux', 'opencode-v2-desktop-lifecycle'] as const) {
+    for (const result of ['failure', 'cancelled', 'skipped']) {
+      const sample = needs('false', 'true'); sample[job].result = result
+      assert.throws(() => aggregate(sample), `${job}/${result}`)
+    }
+    const { [job]: omitted, ...missing } = needs('false', 'true')
+    assert.throws(() => aggregate(missing), `${job}/missing`)
+  }
+  assert.throws(() => aggregate(needs('true', 'false')))
+  for (const v2Linux of ['', 'invalid']) assert.throws(() => aggregate(needs('false', v2Linux)))
   for (const native of ['', 'invalid']) assert.throws(() => aggregate(needs(native)))
   const missingReason = needs(); missingReason.scope.outputs.reason = ''
   assert.throws(() => aggregate(missingReason))
@@ -123,7 +175,7 @@ test('actual Node CLI emits outputs and fails closed without Git access or valid
     const output = join(root, 'outputs')
     const full = invoke('classify', { CI_EVENT: 'workflow_dispatch', CI_FULL: 'true', GITHUB_OUTPUT: output })
     assert.equal(full.status, 0, full.stderr)
-    assert.match(readFileSync(output, 'utf8'), /native=true\nauthority_os=\["ubuntu-latest","windows-latest"\]\nreason=Explicit full validation request\n/)
+    assert.match(readFileSync(output, 'utf8'), /native=true\nauthority_os=\["ubuntu-latest","windows-latest"\]\nreason=Explicit full validation request\nv2_linux=true\n/)
     assert.notEqual(invoke('classify', { CI_EVENT: 'workflow_dispatch', CI_FULL: 'false', GITHUB_OUTPUT: output }).status, 0)
     assert.notEqual(invoke('classify', { CI_EVENT: 'push', CI_BASE: 'a'.repeat(40), CI_HEAD: 'b'.repeat(40), GITHUB_OUTPUT: output }).status, 0)
     assert.equal(invoke('aggregate', { CI_NEEDS: JSON.stringify(needs()) }).status, 0)

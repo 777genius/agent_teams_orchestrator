@@ -1,4 +1,5 @@
 import { expect, spyOn, test } from 'bun:test'
+import { launchExplicitOpenCodeV2Run } from './OpenCodeV2RunOwner.js'
 import { OpenCodeV2TeamBridge, type OpenCodeV2RunControlPorts } from './OpenCodeV2TeamBridge.js'
 import type { RunControlRecord, RunControlResult, RunLaunchPlan, RunMemberStatus } from './OpenCodeV2RunTypes.js'
 
@@ -173,7 +174,8 @@ async function missingReadinessFixture(urls: { target: string; factory: string; 
     if (stage === 'source_availability') throw failure()
     return { project: '/TEST-project', model: { providerID: 'openrouter', id: 'TEST-model' } }
   } }))
-  mock.module(urls.probe, () => ({ resolveOpenCodeV2ExecutionProbe: async (_envelope: unknown, _selection: unknown, run: boolean) => {
+  const probeModule = await import(urls.probe)
+  mock.module(urls.probe, () => ({ ...probeModule, resolveOpenCodeV2ExecutionProbe: async (_envelope: unknown, _selection: unknown, run: boolean) => {
     assert.equal(run, false); probes++; throw failure()
   } }))
   const { executeSelectedOpenCodeBridgeCommandEnvelope: execute, OpenCodeV2TeamBridge }:
@@ -208,3 +210,104 @@ test('model-free public readiness refuses missing inputs with closed preparation
   const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
   expect({ code, stderr }).toEqual({ code: 0, stderr: '' })
 }, 15_000)
+
+
+async function totalReadinessFixture(urls: { target: string; factory: string; planner: string; probe: string }) {
+  const assert: typeof import('node:assert/strict') = (await import('node:assert/strict')).default
+  const { mock } = await import('bun:test')
+  let clock = 1000, scenario = 'success', selections = 0, plans = 0, probes = 0, cleaned = false
+  Date.now = () => clock
+  const deadline = 6000
+  const factory = await import(urls.factory)
+  mock.module(urls.factory, () => ({ ...factory, inspectOpenCodeRuntimeAdapterSelection: async (signal?: AbortSignal, _started?: unknown, at?: number) => {
+    selections++
+    if (scenario === 'v1') {
+      assert.equal(signal, undefined); assert.equal(at, undefined)
+      return { policy: { generation: 'v1', version: '1.19.4' } }
+    }
+    assert.ok(signal instanceof AbortSignal); assert.equal(at, deadline)
+    clock += 2000
+    if (scenario === 'selection-timeout' || scenario === 'selection-cleanup') {
+      clock = deadline + 1
+      // Selection retains responsibility for cleanup; public routing awaits it.
+      await Bun.sleep(5); cleaned = true
+      throw Error(scenario === 'selection-cleanup' ? 'opencode_version_probe_cleanup_unknown' : 'selection_unavailable')
+    }
+    return { policy: { generation: 'v2', version: '2.0.32' } }
+  } }))
+  const planner = await import(urls.planner)
+  mock.module(urls.planner, () => ({ ...planner, inspectOpenCodeV2SourceAvailability: async (_envelope: unknown, budget: { signal: AbortSignal; deadlineMs: number }) => {
+    plans++; assert.equal(budget.deadlineMs, deadline); assert.ok(budget.signal instanceof AbortSignal)
+    if (scenario === 'source-timeout') { clock = deadline + 1; throw Error('execution_timeout') }
+    clock += 1000
+    return { model: { providerID: 'TEST', id: 'TEST' }, native: { version: '2.0.32', executablePath: '/TEST' } }
+  } }))
+  const probeModule = await import(urls.probe)
+  mock.module(urls.probe, () => ({ ...probeModule, resolveOpenCodeV2ExecutionProbe: async (_envelope: unknown, _selection: unknown, run: boolean,
+    options: { deadline: number; signal: AbortSignal; onPhase: (phase: string) => void }) => {
+    probes++; assert.equal(run, true); assert.equal(options.deadline, deadline)
+    assert.ok(options.signal instanceof AbortSignal); assert.equal(clock, 4000)
+    options.onPhase('model_observe'); clock = deadline + 1
+    if (scenario === 'probe-cleanup') throw Error('probe_physical_cleanup_unknown')
+    throw Error('execution_timeout')
+  } }))
+  const { OpenCodeV2TeamBridge, executeSelectedOpenCodeBridgeCommandEnvelope: execute } = await import(urls.target)
+  OpenCodeV2TeamBridge.prototype.discover = async () => { if (scenario === 'discovery-timeout') clock = deadline + 1; return null }
+  const input = { schemaVersion: 1, requestId: 'TEST-total', command: 'opencode.readiness', cwd: '/TEST',
+    startedAt: new Date().toISOString(), timeoutMs: 30000, body: { selectedModel: 'TEST/TEST', requireExecutionProbe: true } }
+  const noV1 = async () => { throw Error('TEST V1 forbidden') }
+  for (const [name, expected] of [
+    ['discovery-timeout', 'execution_timeout:owner_discovery'], ['selection-timeout', 'execution_timeout:runtime_selection'],
+    ['selection-cleanup', 'opencode_version_probe_cleanup_unknown'], ['source-timeout', 'execution_timeout:source_availability'],
+    ['probe-timeout', 'execution_timeout:model_observe'], ['probe-cleanup', 'probe_physical_cleanup_unknown'],
+  ]) {
+    scenario = name!; clock = 1000; selections = plans = probes = 0; cleaned = false
+    const result = await execute({ ...input, body: { ...input.body, ...(name === 'discovery-timeout' ? { teamId: 'TEST', runId: 'TEST' } : {}) } }, noV1)
+    assert.equal(result.ok, false); assert.equal(result.error.message, expected)
+    if (name === 'discovery-timeout') assert.equal(selections + plans + probes, 0)
+    if (name.startsWith('selection-')) { assert.equal(cleaned, true); assert.equal(plans + probes, 0) }
+    if (name === 'source-timeout') assert.equal(probes, 0)
+  }
+  scenario = 'v1'; clock = 1000
+  const original = { ...input, command: 'opencode.reconcileTeam' }
+  const marker = { TEST: 'legacy-response' }
+  assert.equal(await execute(original, async (received: unknown) => { assert.equal(received, original); return marker }), marker)
+}
+test('public readiness shares one deadline across discovery, selection, preparation and probe while preserving cleanup refusals', async () => {
+  const urls = { target: import.meta.resolve('./OpenCodeV2TeamBridge.ts'), factory: import.meta.resolve('./OpenCodeRuntimeAdapterFactory.ts'),
+    planner: import.meta.resolve('./OpenCodeV2LaunchPlan.ts'), probe: import.meta.resolve('./OpenCodeV2ExecutionProbe.ts') }
+  const child = Bun.spawn([process.execPath, '-e', `(${totalReadinessFixture.toString()})(${JSON.stringify(urls)})`],
+    { cwd: import.meta.dir, stdout: 'ignore', stderr: 'pipe' })
+  const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+  expect({ code, stderr }).toEqual({ code: 0, stderr: '' })
+}, 15000)
+
+
+test('team launch invokes producer cleanup only before handoff or with a matching no-spawn receipt', async () => {
+  const f = fixture()
+  let cleanups = 0
+  const cleanup = async () => { cleanups++ }
+  await f.bridge.launchExplicit(f.plan, cleanup)
+  expect(cleanups).toBe(0) // A successful launch hands ownership to its original owner.
+  const unusedPlan = { ...f.plan, members: f.plan.members.map(member => ({ ...member,
+    profile: { ...member.profile, root: member.profile.root + '-unused' } })) }
+  await expect(f.bridge.launchExplicit(unusedPlan, cleanup)).rejects.toThrow('run_already_owned')
+  expect(cleanups).toBe(1)
+  const cleanupFailure = Error('TEST-profile-cleanup-failed')
+  await expect(f.bridge.launchExplicit(unusedPlan, async () => { throw cleanupFailure })).rejects.toMatchObject({
+    message: 'run_profile_cleanup_unknown',
+    errors: [expect.objectContaining({ message: 'run_already_owned' }), cleanupFailure],
+  })
+  for (const branded of [false, true]) {
+    cleanups = 0
+    const bridge = new OpenCodeV2TeamBridge(f.plan.dataRoot, f.plan.binding, {
+      discover: async () => null, request: async () => f.active,
+      launch: async plan => {
+        if (branded) return launchExplicitOpenCodeV2Run({ ...plan, deadline: Date.now() - 1 })
+        throw Error('execution_timeout:owner_start')
+      },
+    })
+    await expect(bridge.launchExplicit(f.plan, cleanup)).rejects.toThrow('execution_timeout:owner_start')
+    expect(cleanups).toBe(branded ? 1 : 0)
+  }
+})

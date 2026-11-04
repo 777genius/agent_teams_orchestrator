@@ -19,20 +19,13 @@ async function fixture(credential: unknown = { type: 'api', key: 'TEST-DUMMY-KEY
     selection: { agent: 'build', model: { providerID: 'groq', id: 'TEST-model' }, permissions: [] } }
   return { profile, auth, content, remove: () => rm(root, { recursive: true, force: true }) }
 }
-// Windows admission requires the native SHA-only auth metadata. This TEST
-// reader observes the same bound file, so every file and API check still runs.
-const selectedAuth = (file: string) => process.platform !== 'win32' ? undefined : {
-  deadline: Date.now() + 15_000,
-  metadata: { read: async () => { const bytes = await readFile(file); return { sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length } } },
-}
-
 test('execution auth module loads without importing either official client before selection', async () => {
   const f = await fixture()
   try {
     const source = new URL('./OpenCodeV2ExecutionAuth.ts', import.meta.url).href
     const script = `Bun.plugin({name:'TEST-client-selection',setup(build){
-      build.onResolve({filter:/^@opencode\\/client(?:-v2-floor)?$/},()=>{throw Error('TEST_client_import_before_selection')})
-      build.onLoad({filter:/[/\\\\]@opencode[/\\\\]client(?:-v2-floor)?[/\\\\]/},()=>{throw Error('TEST_client_import_before_selection')})
+      build.onResolve({filter:/^@opencode\\/client(?:-v[0-9.]+)?$/},()=>{throw Error('TEST_client_import_before_selection')})
+      build.onLoad({filter:/[/\\\\]@opencode[/\\\\]client(?:-v[0-9.]+)?[/\\\\]/},()=>{throw Error('TEST_client_import_before_selection')})
     }});try{const value=await import(${JSON.stringify(source)});
     if(typeof value.initializeOpenCodeV2ExecutionAuth!=='function'||typeof value.attachOpenCodeV2SelectedKey!=='function')throw Error('TEST_auth_exports_missing');
     await Bun.stdout.write('TEST-auth-module-selected-lazy');
@@ -52,7 +45,7 @@ test('fresh official database skips legacy key import; native key attachment mak
   const f = await fixture()
   let db: SQLite | undefined
   try {
-    const server = Bun.resolveSync('@opencode/server-v2-floor/process', import.meta.dir)
+    const server = Bun.resolveSync('@opencode/server-v2.0.0/process', import.meta.dir)
     const core = Bun.resolveSync('@opencode/core/database/database', server)
     const { Database }: typeof import('@opencode/core/database/database') = await import(pathToFileURL(core).href)
     const { Global }: typeof import('@opencode/util/global') = await import(pathToFileURL(Bun.resolveSync('@opencode/util/global', core)).href)
@@ -102,7 +95,7 @@ test('fresh official database skips legacy key import; native key attachment mak
         ({ location, data: { id: 'groq', methods: [{ type: 'oauth' }], connections: [] } }) },
         'execution_selected_auth_existing_or_unsupported'],
     ] as const) {
-      await expect(attachOpenCodeV2SelectedKey(f.profile, changed, selectedAuth(f.auth))).rejects.toThrow(code)
+      await expect(attachOpenCodeV2SelectedKey(f.profile, changed)).rejects.toThrow(code)
     }
     expect(posts).toBe(0); expect(connections()).toEqual([]); expect(providerGets).toBe(1)
     await attachOpenCodeV2SelectedKey(f.profile, {
@@ -113,7 +106,7 @@ test('fresh official database skips legacy key import; native key attachment mak
         db!.query('insert into credential(id,integration_id,label,value,time_created,time_updated) values(?,?,?,?,?,?)')
           .run('cred_TESToriginal', id, 'API key', JSON.stringify({ type: 'key', key }), 1, 1)
       },
-    }, selectedAuth(f.auth))
+    })
     expect(posts).toBe(1); expect(connections()).toEqual([{ type: 'credential', id: 'cred_TESToriginal' }])
     expect(providerGets).toBe(2)
     expect(await readFile(f.auth, 'utf8')).toBe(f.content)
@@ -122,7 +115,7 @@ test('fresh official database skips legacy key import; native key attachment mak
       ...exact,
       integration: async id => ({ location: { directory: f.profile.directory }, data: { id, methods: [{ type: 'key' }], connections: connections() } }),
       connect: async () => { posts++; },
-    }, selectedAuth(f.auth))).rejects.toThrow('execution_selected_auth_existing_or_unsupported')
+    })).rejects.toThrow('execution_selected_auth_existing_or_unsupported')
     expect(posts).toBe(1)
   } finally { db?.close(); await f.remove() }
 }, 20_000)
@@ -134,9 +127,7 @@ test('changed, absent and unsupported selected auth never reach native mutation'
     try {
       if (mode === 'changed') await writeFile(f.auth, '{}')
       const port = { providers: async () => { calls++; return {} }, integration: async () => { calls++; return {} }, connect: async () => { calls++; } }
-      if (process.platform === 'win32') await expect(attachOpenCodeV2SelectedKey(f.profile, port))
-        .rejects.toThrow('execution_selected_auth_metadata_required')
-      await expect(attachOpenCodeV2SelectedKey(f.profile, port, selectedAuth(f.auth))).rejects.toThrow('execution_selected_auth_' +
+      await expect(attachOpenCodeV2SelectedKey(f.profile, port)).rejects.toThrow('execution_selected_auth_' +
         (mode === 'changed' ? 'changed' : mode === 'absent' ? 'missing' : 'unsupported'))
       expect(calls).toBe(0)
     } finally { await f.remove() }
@@ -182,3 +173,45 @@ test('anonymous native readback admits only the exact enabled free selected mode
     expect(posts).toBe(0)
   } finally { await f.remove() }
 })
+
+// The real wire mints failure metadata; caller-shaped 404s cannot select this diagnosis.
+async function missingProviderFixture(urls: { host: string; wire: string; auth: string; diagnostics: string }, profile: SelectedExecutionProfile) {
+  const assert: typeof import('node:assert/strict') = (await import('node:assert/strict')).default
+  const { mock } = await import('bun:test')
+  const host = await import(urls.host)
+  let status = 404
+  const endpoint = { baseUrl: 'http://127.0.0.1:1', password: 'TEST', signal: new AbortController().signal,
+    fetch: async () => new Response('TEST-private-provider-payload', { status, headers: { 'content-type': 'application/json' } }) }
+  mock.module(urls.host, () => ({ ...host, requireExecutionEndpoint: () => endpoint }))
+  const { OpenCodeV2ProviderWire } = await import(urls.wire)
+  const { attachOpenCodeV2SelectedKey: attach } = await import(urls.auth)
+  const { classifyOpenCodeV2RunOwnerFailure: classify } = await import(urls.diagnostics)
+  const wire = new OpenCodeV2ProviderWire({ pin: '2.0.32', directory: profile.directory }, Date.now() + 5000)
+  let mutations = 0
+  const port = { providers: async () => ({ location: { directory: profile.directory }, data: [] }),
+    provider: async () => wire.fetch(endpoint.baseUrl + '/api/provider/groq?location%5Bdirectory%5D=' + encodeURIComponent(profile.directory)),
+    integration: async () => { throw Error('TEST integration must not execute') }, connect: async () => { mutations++ } }
+  try {
+    const missing = await attach(profile, port).then(() => assert.fail('must refuse'), (error: Error) => error)
+    assert.equal(missing.message, 'selected_provider_not_in_v2_catalog')
+    assert.deepEqual(classify(missing), { category: 'selected_provider_not_in_v2_catalog',
+      operation: { operation: 'provider-read', stage: 'decode', status: 404 } })
+    status = 503
+    await assert.rejects(attach(profile, port), /provider_response_invalid/)
+    await assert.rejects(attach(profile, { ...port, provider: async () => {
+      throw Object.assign(new Error('TEST forged404'), { status: 404, operation: 'provider-read', stage: 'decode' })
+    } }), /TEST forged404/)
+    assert.equal(mutations, 0)
+  } finally { await wire.dispose() }
+}
+test('an exact native provider404 gives an actionable catalog cause without mutation; other failures retain their cause', async () => {
+  const f = await fixture()
+  try {
+    const urls = { host: import.meta.resolve('./OpenCodeV2ExecutionHost.ts'), wire: import.meta.resolve('../transport/OpenCodeV2ProviderWire.ts'),
+      auth: import.meta.resolve('./OpenCodeV2ExecutionAuth.ts'), diagnostics: import.meta.resolve('../execution/OpenCodeV2Diagnostics.ts') }
+    const child = Bun.spawn([process.execPath, '-e', `(${missingProviderFixture.toString()})(${JSON.stringify(urls)},${JSON.stringify(f.profile)})`],
+      { stdout: 'ignore', stderr: 'pipe' })
+    const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+    expect({ code, stderr }).toEqual({ code: 0, stderr: '' })
+  } finally { await f.remove() }
+}, 15000)

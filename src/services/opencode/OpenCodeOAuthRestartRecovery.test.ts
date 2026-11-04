@@ -30,6 +30,7 @@ function startOwnedChild(script: string, args: string[], env: NodeJS.ProcessEnv,
     env, stdio: ipc ? ['pipe', 'pipe', 'pipe', 'ipc'] : ['pipe', 'pipe', 'pipe'], windowsHide: true,
   })
   const state = { phase, stdout: '', stderr: '', stdoutEnded: false,
+    checkpointPath: null as string | null,
     exited: false, code: null as number | null, signal: null as NodeJS.Signals | null,
     error: null as Error | null, cleaning: false,
     control: null as null | { ready: boolean; stopSent: boolean; stopAcknowledged: boolean; stopAckSent: boolean } }
@@ -181,8 +182,14 @@ async function reapOwnedChild(entry: ReturnType<typeof startOwnedChild>): Promis
   } finally { clearTimeout(timer) }
   // A closed entry may have been retained for its pending parent ACK callback.
   ownedChildren.delete(entry)
+  const checkpoint = entry.state.checkpointPath
+    ? await readFile(entry.state.checkpointPath, 'utf8').catch(() => 'unavailable')
+    : null
+  const lastCheckpoint = checkpoint === null ? null
+    : ['import-started', 'resolve-started', 'receipt-produced', 'unavailable'].includes(checkpoint)
+      ? checkpoint : 'invalid-checkpoint'
   console.error(`Owned recovery fixture reaped after test interruption: ${JSON.stringify({ ...diagnostic,
-    closeCode: entry.state.code, closeSignal: entry.state.signal })}`)
+    lastCheckpoint, closeCode: entry.state.code, closeSignal: entry.state.signal })}`)
 }
 
 afterEach(async () => {
@@ -487,6 +494,9 @@ type Fixture = Awaited<ReturnType<typeof fixture>>
 // production recovery must use the exited writer's canonical SQLite history.
 async function fresh(f: Fixture, env = f.env, purpose = f.purpose, project = f.project, fault?: { path: string, after: boolean }, role: 'fault' | 'recovery' | 'idempotent' = fault ? 'fault' : 'recovery') {
   const modulePath = path.resolve(import.meta.dir, './OpenCodeProfileManager.ts')
+  // A finite sidecar checkpoint distinguishes cold import from resolution and
+  // post-result handle drain without adding IPC handles or exposing payloads.
+  const checkpointPath = path.join(f.root, `fresh-phase-${randomBytes(8).toString('hex')}`)
   const inject = fault ? `const { mock } = await import('bun:test');
     const atomicPath = ${JSON.stringify(path.resolve(import.meta.dir, '../../utils/atomicWrite.ts'))};
     const atomic = await import(atomicPath); const originalWrite = atomic.writeJsonFileAtomic;
@@ -496,21 +506,28 @@ async function fresh(f: Fixture, env = f.env, purpose = f.purpose, project = f.p
       if (p === ${JSON.stringify(fault.path)}) throw new Error('AUDIT crash boundary');
     } }));` : ''
   const script = `${inject}globalThis.fetch = async () => { throw new Error('AUDIT forbids network') };
+    const { writeFile } = await import('node:fs/promises');
+    const checkpoint = phase => writeFile(${JSON.stringify(checkpointPath)}, phase);
     if (process.platform === 'win32') {
       const { deepStrictEqual } = await import('node:assert/strict');
       deepStrictEqual([process.env.HOMEDRIVE, process.env.HOMEPATH], ${JSON.stringify([env.HOMEDRIVE, env.HOMEPATH])});
     }
+    await checkpoint('import-started');
     const { resolveOpenCodeProfileScope } = await import(${JSON.stringify(modulePath)});
+    await checkpoint('resolve-started');
     try { const scope = await resolveOpenCodeProfileScope({ projectPath: process.argv[1], selectedModel: 'xai/grok-4.3', purpose: process.argv[2] });
       process.stdout.write(JSON.stringify({ ok: true, scope }));
-    } catch (e) { process.stdout.write(JSON.stringify({ ok: false, error: e.message })); }`
+    } catch (e) { process.stdout.write(JSON.stringify({ ok: false, error: e.message })); }
+    await checkpoint('receipt-produced');`
   const entry = startOwnedChild(script, [project, purpose], env, `fresh ${role} natural exit`)
+  entry.state.checkpointPath = checkpointPath
   entry.child.stdin!.end()
   await entry.closed
   if (entry.state.cleaning) await stopInterruptedContinuation()
   // Fresh recovery must exit naturally, including closing its imported handles.
   expect(entry.state.error).toBeNull()
   expect(entry.state.stderr).toBe(''); expect(entry.state.code).toBe(0)
+  expect(await readFile(checkpointPath, 'utf8')).toBe('receipt-produced')
   return JSON.parse(entry.state.stdout)
 }
 const current = (f: Fixture, env = f.env) => isOpenCodeOAuthPublicationScopeCurrent(f.receipt.owner, c0, env)
