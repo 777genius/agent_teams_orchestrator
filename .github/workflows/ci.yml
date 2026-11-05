@@ -25,9 +25,10 @@ permissions:
   checks: read
   pull-requests: read
 
+# Preserve each main SHA's release/native E2E evidence; only supersede PR and dev checks.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ (github.event_name == 'pull_request' || github.event_name == 'push') && (github.event.pull_request.number || github.ref) || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.event_name == 'push' && github.ref == 'refs/heads/dev' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' && github.ref == 'refs/heads/dev' }}
 
 jobs:
   scope:
