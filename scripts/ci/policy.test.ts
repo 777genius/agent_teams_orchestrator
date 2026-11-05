@@ -255,3 +255,18 @@ test('actual Node CLI emits outputs and fails closed without Git access or valid
     assert.notEqual(invoke('aggregate', { CI_NEEDS: 'broken JSON' }).status, 0)
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
+
+test('workflow independently forces full native E2E if PR-editable CI authority scripts differ', () => {
+  const workflow = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8')
+  const scope = workflow.split('\n  scope:\n')[1]?.split('\n  windows-packaged-backfill:\n')[0]
+  assert.ok(scope)
+  assert.match(scope, /git diff --quiet "\$compare_base" "\$compare_head" -- scripts\/ci\/policy\.ts scripts\/ci\/post-merge-reuse\.ts/)
+  assert.match(scope, /echo 'unchanged=false' >> "\$GITHUB_OUTPUT"/)
+  assert.equal([...scope.matchAll(/if: steps\.provenance\.outputs\.unchanged == 'true'/g)].length, 2)
+  assert.match(scope, /id: guarded[\s\S]*PROVENANCE_UNCHANGED:[\s\S]*native=true[\s\S]*authority_os=\["ubuntu-latest","windows-latest"\]/)
+  for (const key of ['native', 'authority_os', 'reason', 'v2_linux']) {
+    assert.ok(scope.includes(`${key}: ` + '${{ steps.guarded.outputs.' + key + ' }}'), key)
+  }
+  assert.match(scope, /if \[\[ "\$PROVENANCE_UNCHANGED" != 'true' \]\]/)
+  assert.match(scope, /reason=CI policy\/proof source changed or unverifiable; full native validation/)
+})
