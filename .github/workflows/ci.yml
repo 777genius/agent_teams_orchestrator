@@ -36,10 +36,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      native: ${{ steps.scope.outputs.native }}
-      authority_os: ${{ steps.scope.outputs.authority_os }}
-      reason: ${{ steps.scope.outputs.reason }}
-      v2_linux: ${{ steps.scope.outputs.v2_linux }}
+      native: ${{ steps.guarded.outputs.native }}
+      authority_os: ${{ steps.guarded.outputs.authority_os }}
+      reason: ${{ steps.guarded.outputs.reason }}
+      v2_linux: ${{ steps.guarded.outputs.v2_linux }}
       reuse: ${{ steps.reuse.outputs.reuse }}
     steps:
       - uses: actions/checkout@v6
@@ -56,12 +56,38 @@ jobs:
           TMPDIR="$RUNNER_TEMP/TEST-ci-policy" node --test scripts/ci/policy.test.ts scripts/ci/post-merge-reuse.test.ts
       - name: Test source release publication contracts
         run: python3 -m unittest discover -s scripts/release -p 'test_*.py'
+      # Workflow-owned provenance check, independent of PR-editable gate scripts.
+      - name: Qualify CI policy and proof source provenance
+        id: provenance
+        shell: bash
+        env:
+          GIT_NO_REPLACE_OBJECTS: '1'
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == 'pull_request' ]]; then
+            compare_base='${{ github.event.pull_request.base.sha }}'
+            compare_head='${{ github.event.pull_request.head.sha }}'
+          elif [[ "$GITHUB_EVENT_NAME" == 'push' && "$GITHUB_REF" == 'refs/heads/main' ]]; then
+            compare_base="$(git rev-parse "$GITHUB_SHA^" 2>/dev/null || true)"
+            compare_head="$GITHUB_SHA"
+          else
+            echo 'unchanged=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$compare_base" =~ ^[0-9a-f]{40}$ && "$compare_head" =~ ^[0-9a-f]{40}$ ]] &&
+              git diff --quiet "$compare_base" "$compare_head" -- scripts/ci/policy.ts scripts/ci/post-merge-reuse.ts; then
+            echo 'unchanged=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'unchanged=false' >> "$GITHUB_OUTPUT"
+          fi
       - name: Verify completed same-tree PR CI for post-merge reuse
+        if: steps.provenance.outputs.unchanged == 'true'
         id: reuse
         env:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/ci/post-merge-reuse.ts
       - name: Classify event changes
+        if: steps.provenance.outputs.unchanged == 'true'
         id: scope
         env:
           CI_EVENT: ${{ github.event_name }}
@@ -70,9 +96,28 @@ jobs:
           CI_FULL: ${{ inputs.full }}
           CI_REUSE: ${{ steps.reuse.outputs.reuse }}
         run: node scripts/ci/policy.ts classify
+      # Do not let edited policy code decide whether it may skip native checks.
+      - name: Enforce full native checks for modified or unverifiable CI logic
+        id: guarded
+        shell: bash
+        env:
+          PROVENANCE_UNCHANGED: ${{ steps.provenance.outputs.unchanged }}
+          NATIVE: ${{ steps.scope.outputs.native }}
+          AUTHORITY_OS: ${{ steps.scope.outputs.authority_os }}
+          V2_LINUX: ${{ steps.scope.outputs.v2_linux }}
+          REASON: ${{ steps.scope.outputs.reason }}
+        run: |
+          set -euo pipefail
+          if [[ "$PROVENANCE_UNCHANGED" != 'true' ]]; then
+            printf '%s\n' 'native=true' 'authority_os=["ubuntu-latest","windows-latest"]' \
+              'v2_linux=true' 'reason=CI policy/proof source changed or unverifiable; full native validation' >> "$GITHUB_OUTPUT"
+          else
+            printf 'native=%s\nauthority_os=%s\nv2_linux=%s\nreason=%s\n' \
+              "$NATIVE" "$AUTHORITY_OS" "$V2_LINUX" "$REASON" >> "$GITHUB_OUTPUT"
+          fi
       - name: Explain selected checks
         env:
-          REASON: ${{ steps.scope.outputs.reason }}
+          REASON: ${{ steps.guarded.outputs.reason }}
         run: printf '%s\n' "$REASON" >> "$GITHUB_STEP_SUMMARY"
 
   windows-packaged-backfill:
