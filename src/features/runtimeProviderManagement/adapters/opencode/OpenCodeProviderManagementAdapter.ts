@@ -2984,6 +2984,8 @@ export function isOpenCodeZenCatalogModelFree(input: {
     if (model.cost === undefined) continue
     const cost = asRecord(model.cost)
     if (!cost || cost.input !== 0 || cost.output !== 0) return false
+    const cache = asRecord(cost.cache)
+    if (!cache || cache.read !== 0 || cache.write !== 0) return false
     const allZero = (value: unknown): boolean => typeof value === 'number' ? value === 0
       : Array.isArray(value) ? value.length > 0 && value.every(allZero)
         : value !== null && typeof value === 'object'

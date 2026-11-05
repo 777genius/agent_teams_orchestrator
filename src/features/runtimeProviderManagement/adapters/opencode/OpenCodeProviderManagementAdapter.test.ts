@@ -6705,6 +6705,9 @@ describe('OpenCodeProviderManagementAdapter', () => {
     const input = { providerId: 'opencode', modelId: 'opencode/big-pickle', inventory: inventory({ modelMetadata: [] }),
       configProviders: price({ input: 0, output: 0, cache: { read: 0, write: 0 } }), providers: null }
     expect(isOpenCodeZenCatalogModelFree(input)).toBe(true)
+    expect(isOpenCodeZenCatalogModelFree({ ...input, configProviders: price({ input: 0, output: 0 }) })).toBe(false)
+    expect(isOpenCodeZenCatalogModelFree({ ...input, configProviders: price({ input: 0, output: 0, cache: { read: 0 } }) })).toBe(false)
+    expect(isOpenCodeZenCatalogModelFree({ ...input, configProviders: price({ input: 0, output: 0, cache: { write: 0 } }) })).toBe(false)
     expect(isOpenCodeZenCatalogModelFree({ ...input, configProviders: price({ input: 0, output: 0, cache: { read: 1, write: 0 } }) })).toBe(false)
     expect(isOpenCodeZenCatalogModelFree({ ...input, providers: { all: [{ id: 'opencode', models: { 'big-pickle': null } }] } })).toBe(false)
     expect(isOpenCodeZenCatalogModelFree({ ...input, providers: { all: [{ id: 'opencode', models: 'invalid' as unknown as Record<string, unknown> }] } })).toBe(false)
