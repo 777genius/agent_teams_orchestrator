@@ -272,3 +272,10 @@ test('workflow independently forces full native E2E if PR-editable CI authority 
   assert.match(scope, /'v2_linux=true' 'reason=CI policy\/proof source changed or unverifiable; full native validation'/)
   assert.match(scope, /reason=CI policy\/proof source changed or unverifiable; full native validation/)
 })
+
+test('main post-merge CI is independent while PR and dev supersession remains scoped', () => {
+  const workflow = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8')
+  // Each main run must have a unique group, even while older runs are queued.
+  assert.ok(workflow.includes("group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.event_name == 'push' && github.ref == 'refs/heads/dev' && github.ref || github.run_id }}"), 'main pushes need independent run IDs')
+  assert.ok(workflow.includes("cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' && github.ref == 'refs/heads/dev' }}"), 'only PR and dev checks may be cancelled')
+})
