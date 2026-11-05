@@ -15,6 +15,26 @@ test('legacy provider fixture native-selection mock is isolated from real identi
   assert.match(workflow, /- name: Test provider identity, inventory, labels and HTTP deadlines\n\s+run: bun test src\/services\/opencode\/OpenCodeProviderIdentity\.test\.ts/)
 })
 
+test('post-merge reuse keeps the required check and cannot leak into unqualified jobs', () => {
+  const workflow = readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8')
+  const job = (name: string) => {
+    const start = workflow.indexOf(`\n  ${name}:\n`)
+    assert.ok(start >= 0, name)
+    const text = workflow.slice(start + 1)
+    return text.split(/\n  [a-z][a-z-]*:\n/, 2)[0]
+  }
+  assert.match(job('scope'), /reuse: \$\{\{ steps\.reuse\.outputs\.reuse \}\}/)
+  assert.match(job('scope'), /CI_REUSE: \$\{\{ steps\.reuse\.outputs\.reuse \}\}/)
+  for (const name of ['cursor-managed-plugin', 'windows-packaged-backfill',
+    'opencode-authority', 'opencode-conformance', 'packaged-delivery', 'opencode-v2-linux',
+    'opencode-v2-desktop-lifecycle', 'opencode-native-custody']) {
+    assert.match(job(name), /needs\.scope\.outputs\.reuse != 'true'/, name)
+  }
+  assert.match(job('task-change-ledger'), /needs\.scope\.outputs\.reuse == 'true'/)
+  assert.match(job('post-merge-smoke'), /needs\.scope\.outputs\.reuse == 'true'/)
+  assert.match(job('required'), /needs: \[scope, post-merge-smoke,/)
+})
+
 test('routine source and documentation keep Linux coverage without native jobs', () => {
   for (const path of ['src/components/Button.tsx', 'src/utils/processUserInput/processTextPrompt.ts', 'src/services/opencode/OpenCodeLogProjector.ts', 'src/services/opencode/OpenCodeModelRef.ts', 'docs/guide.md', 'src/features/runtimeProviderManagement/ui/ProviderManagementDialog.tsx']) {
     const decision = classify([path])
@@ -184,6 +204,31 @@ test('aggregate independently rejects required failures/cancellation/skips and c
   assert.throws(() => aggregate({}))
 })
 
+test('same-tree reuse requires fresh smoke and the push-only Windows ledger', () => {
+  const input = needs('true')
+  const reused: Record<string, { result: string; outputs?: Record<string, string> }> = {}
+  for (const [name] of Object.entries(input)) reused[name] = { result: name === 'scope' || name === 'task-change-ledger' ? 'success' : 'skipped' }
+  reused.scope = { result: 'success', outputs: { native: 'true', v2_linux: 'true', reason: 'TEST decision', reuse: 'true' } }
+  reused['post-merge-smoke'] = { result: 'success' }
+  assert.equal(aggregate(reused), 'TEST decision')
+  for (const name of Object.keys(reused).filter(name => name !== 'scope')) {
+    const previous = reused[name]!
+    for (const result of ['failure', 'cancelled', 'unknown']) {
+      reused[name] = { result }
+      assert.throws(() => aggregate(reused), name)
+    }
+    reused[name] = previous
+  }
+  delete reused['post-merge-smoke']
+  assert.throws(() => aggregate(reused), /post-merge-smoke/)
+  reused['post-merge-smoke'] = { result: 'success' }
+  delete reused['opencode-v2-linux']
+  assert.throws(() => aggregate(reused), /opencode-v2-linux/)
+  // An omitted reuse field cannot convert missing E2E into accepted skips.
+  delete reused.scope!.outputs!.reuse
+  assert.throws(() => aggregate(reused))
+})
+
 test('actual Node CLI emits outputs and fails closed without Git access or valid needs', () => {
   assert.ok(process.env.TMPDIR, 'TEST TMPDIR must be explicitly isolated')
   const root = mkdtempSync(join(process.env.TMPDIR, 'TEST-ci-policy-'))
@@ -195,7 +240,15 @@ test('actual Node CLI emits outputs and fails closed without Git access or valid
     assert.equal(full.status, 0, full.stderr)
     assert.match(readFileSync(output, 'utf8'), /native=true\nauthority_os=\["ubuntu-latest","windows-latest"\]\nreason=Explicit full validation request\nv2_linux=true\n/)
     assert.notEqual(invoke('classify', { CI_EVENT: 'workflow_dispatch', CI_FULL: 'false', GITHUB_OUTPUT: output }).status, 0)
-    assert.notEqual(invoke('classify', { CI_EVENT: 'push', CI_BASE: 'a'.repeat(40), CI_HEAD: 'b'.repeat(40), GITHUB_OUTPUT: output }).status, 0)
+    // Missing/failed evidence and direct pushes to main execute the complete native matrix.
+    const mainFallback = invoke('classify', { CI_EVENT: 'push', GITHUB_REF: 'refs/heads/main', CI_REUSE: 'false', GITHUB_OUTPUT: output })
+    assert.equal(mainFallback.status, 0, mainFallback.stderr)
+    assert.match(readFileSync(output, 'utf8'), /native=true\nauthority_os=\["ubuntu-latest","windows-latest"\]\nreason=Explicit full validation request\nv2_linux=true\n/)
+    assert.equal(invoke('classify', { CI_EVENT: 'push', GITHUB_REF: 'refs/heads/main', CI_REUSE: '', GITHUB_OUTPUT: output }).status, 0)
+    // Verified reuse and dev pushes still evaluate changed paths; neither gets a forced full selection.
+    for (const [ref, reuse] of [['refs/heads/main', 'true'], ['refs/heads/dev', 'false']]) {
+      assert.notEqual(invoke('classify', { CI_EVENT: 'push', GITHUB_REF: ref, CI_REUSE: reuse, CI_BASE: 'a'.repeat(40), CI_HEAD: 'b'.repeat(40), GITHUB_OUTPUT: output }).status, 0)
+    }
     assert.equal(invoke('aggregate', { CI_NEEDS: JSON.stringify(needs()) }).status, 0)
     const failed = needs(); failed['opencode-authority'].result = 'cancelled'
     assert.notEqual(invoke('aggregate', { CI_NEEDS: JSON.stringify(failed) }).status, 0)

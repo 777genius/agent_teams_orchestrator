@@ -1,4 +1,10 @@
 name: CI
+# GitHub evaluates these identifiers from the originating PR event. After merge
+# workflow_run.pull_requests may be empty; do not trust the head SHA alone.
+run-name: >-
+  ${{ github.event_name == 'pull_request'
+      && format('CI PR={0} HEAD={1} BASE={2} TARGET={3}', github.event.pull_request.number, github.event.pull_request.head.sha, github.event.pull_request.base.sha, github.event.pull_request.base.ref)
+      || format('CI {0} HEAD={1}', github.event_name, github.sha) }}
 
 on:
   push:
@@ -15,6 +21,9 @@ on:
 
 permissions:
   contents: read
+  actions: read
+  checks: read
+  pull-requests: read
 
 concurrency:
   group: ci-${{ github.event_name }}-${{ (github.event_name == 'pull_request' || github.event_name == 'push') && (github.event.pull_request.number || github.ref) || github.run_id }}
@@ -31,6 +40,7 @@ jobs:
       authority_os: ${{ steps.scope.outputs.authority_os }}
       reason: ${{ steps.scope.outputs.reason }}
       v2_linux: ${{ steps.scope.outputs.v2_linux }}
+      reuse: ${{ steps.reuse.outputs.reuse }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -43,9 +53,14 @@ jobs:
       - name: Test gating contracts in isolated TEST scratch
         run: |
           mkdir -p "$RUNNER_TEMP/TEST-ci-policy"
-          TMPDIR="$RUNNER_TEMP/TEST-ci-policy" node --test scripts/ci/policy.test.ts
+          TMPDIR="$RUNNER_TEMP/TEST-ci-policy" node --test scripts/ci/policy.test.ts scripts/ci/post-merge-reuse.test.ts
       - name: Test source release publication contracts
         run: python3 -m unittest discover -s scripts/release -p 'test_*.py'
+      - name: Verify completed same-tree PR CI for post-merge reuse
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/ci/post-merge-reuse.ts
       - name: Classify event changes
         id: scope
         env:
@@ -53,6 +68,7 @@ jobs:
           CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
           CI_FULL: ${{ inputs.full }}
+          CI_REUSE: ${{ steps.reuse.outputs.reuse }}
         run: node scripts/ci/policy.ts classify
       - name: Explain selected checks
         env:
@@ -61,7 +77,7 @@ jobs:
 
   windows-packaged-backfill:
     needs: scope
-    if: needs.scope.outputs.native == 'true'
+    if: needs.scope.outputs.native == 'true' && needs.scope.outputs.reuse != 'true'
     name: Windows packaged backfill (candidate)
     runs-on: windows-latest
     timeout-minutes: 25
@@ -132,7 +148,8 @@ jobs:
 
   cursor-managed-plugin:
     name: Cursor managed plugin
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    needs: scope
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.scope.outputs.reuse != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -152,12 +169,13 @@ jobs:
 
   task-change-ledger:
     name: Task change ledger (${{ matrix.os }})
+    needs: scope
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest","windows-latest"]') }}
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || needs.scope.outputs.reuse == 'true' && '["windows-latest"]' || '["ubuntu-latest","windows-latest"]') }}
 
     steps:
       - name: Checkout
@@ -221,8 +239,30 @@ jobs:
       - name: Build dev runtime
         run: bun run build:dev
 
+  post-merge-smoke:
+    name: Post-merge source smoke
+    needs: scope
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.scope.outputs.reuse == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - name: Install immutable dependencies
+        run: bun install --frozen-lockfile --linker hoisted
+      - name: Verify exact main source and qualified V2 safety contracts
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          bun test src/services/opencode/compatibility/OpenCodeV2Registry.test.ts src/services/opencode/transport/OpenCodeV2CatalogDiagnostics.test.ts --timeout 30000
+
   opencode-authority:
     needs: scope
+    if: needs.scope.outputs.reuse != 'true'
     name: OpenCode selected authority (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # Windows recovery fixtures spend ~20 minutes in real process-identity
@@ -349,7 +389,7 @@ jobs:
 
   opencode-conformance:
     needs: scope
-    if: needs.scope.outputs.native == 'true'
+    if: needs.scope.outputs.native == 'true' && needs.scope.outputs.reuse != 'true'
     name: OpenCode ${{ matrix.version }} conformance (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
@@ -436,7 +476,7 @@ jobs:
   packaged-delivery:
     name: Packaged delivery (${{ matrix.platform }})
     needs: scope
-    if: needs.scope.outputs.native == 'true'
+    if: needs.scope.outputs.native == 'true' && needs.scope.outputs.reuse != 'true'
     runs-on: ${{ matrix.os }}
     # Windows also proves a real source owner with its production readiness and stop budgets.
     timeout-minutes: ${{ matrix.platform != 'linux-x64' && 35 || 25 }}
@@ -708,7 +748,7 @@ jobs:
 
   opencode-v2-linux:
     needs: scope
-    if: needs.scope.outputs.v2_linux == 'true'
+    if: needs.scope.outputs.v2_linux == 'true' && needs.scope.outputs.reuse != 'true'
     name: OpenCode V2 Linux execution
     # Real V2 children on ubuntu-24.04. Public catalog reads and anonymous execution
     # against loopback fixtures; no credential or external model request.
@@ -791,7 +831,7 @@ jobs:
 
   opencode-v2-desktop-lifecycle:
     needs: scope
-    if: needs.scope.outputs.v2_linux == 'true'
+    if: needs.scope.outputs.v2_linux == 'true' && needs.scope.outputs.reuse != 'true'
     name: OpenCode V2 desktop lifecycle (Linux)
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -886,7 +926,7 @@ jobs:
   opencode-native-custody:
     name: OpenCode native custody (Linux x64)
     needs: [scope, packaged-delivery]
-    if: ${{ !cancelled() && needs.scope.outputs.native == 'true' }}
+    if: ${{ !cancelled() && needs.scope.outputs.native == 'true' && needs.scope.outputs.reuse != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -952,7 +992,7 @@ jobs:
   required:
     name: CI required
     if: always() && !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    needs: [scope, cursor-managed-plugin, task-change-ledger, opencode-authority, windows-packaged-backfill, opencode-conformance, packaged-delivery, opencode-v2-linux, opencode-v2-desktop-lifecycle, opencode-native-custody]
+    needs: [scope, post-merge-smoke, cursor-managed-plugin, task-change-ledger, opencode-authority, windows-packaged-backfill, opencode-conformance, packaged-delivery, opencode-v2-linux, opencode-v2-desktop-lifecycle, opencode-native-custody]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

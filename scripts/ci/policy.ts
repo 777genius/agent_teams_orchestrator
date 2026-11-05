@@ -45,6 +45,18 @@ export function aggregate(needs: Record<string, Need>): string {
   const v2Linux = scope.outputs?.v2_linux
   if (!['true', 'false'].includes(native ?? '') || !reason?.trim()) throw new Error('Missing classifier decision/reason')
   if (!['true', 'false'].includes(v2Linux ?? '') || (native === 'true' && v2Linux !== 'true')) throw new Error('Missing V2 Linux decision')
+  // A completed PR CI gate and identical merged tree qualify the fast post-merge path.
+  // Even in that case a fresh main smoke must succeed; missing or failed jobs never count as skips.
+  if (scope.outputs?.reuse === 'true') {
+    if (needs['post-merge-smoke']?.result !== 'success') throw new Error('post-merge-smoke: missing or failed')
+    if (needs['task-change-ledger']?.result !== 'success') throw new Error('task-change-ledger: missing or failed')
+    for (const job of ['cursor-managed-plugin', 'opencode-authority',
+      'windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery', 'opencode-native-custody',
+      'opencode-v2-linux', 'opencode-v2-desktop-lifecycle']) {
+      if (needs[job]?.result !== 'skipped') throw new Error(`${job}: ${needs[job]?.result ?? 'missing'}`)
+    }
+    return reason
+  }
   const required = ['cursor-managed-plugin', 'task-change-ledger', 'opencode-authority']
   const optional = ['windows-packaged-backfill', 'opencode-conformance', 'packaged-delivery', 'opencode-native-custody']
   for (const job of [...required, ...optional]) {
@@ -64,7 +76,9 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     console.log(aggregate(JSON.parse(process.env.CI_NEEDS ?? '{}')))
   } else if (process.argv[2] === 'classify') {
     const event = process.env.CI_EVENT ?? ''
-    const full = event === 'workflow_dispatch' && process.env.CI_FULL === 'true'
+    // Main pushes without qualified PR CI must not retain the routine-path skips.
+    const full = (event === 'workflow_dispatch' && process.env.CI_FULL === 'true') ||
+      (event === 'push' && process.env.GITHUB_REF === 'refs/heads/main' && process.env.CI_REUSE !== 'true')
     if (event === 'workflow_dispatch' && !full) throw new Error('Dispatch requires full validation')
     const paths = full ? [] : parsePaths(execFileSync('git', diffArgs(event, process.env.CI_BASE ?? '', process.env.CI_HEAD ?? ''), { encoding: 'utf8' }))
     const decision = classify(paths, full)
