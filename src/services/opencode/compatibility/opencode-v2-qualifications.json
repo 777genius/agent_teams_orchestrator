@@ -7,11 +7,16 @@
       "scope": "team-launch",
       "platforms": [
         "darwin-arm64",
+        "darwin-x64",
         "linux-x64",
         "win32-x64",
         "win32-arm64"
       ],
       "evidence": [
+        {
+          "kind": "owner-risk-acceptance",
+          "ref": "docs/opencode-v2-qualification/intel-macos-2.1.4.md"
+        },
         {
           "kind": "e2e-report",
           "ref": "docs/opencode-v2-qualification/2.1.4.md"

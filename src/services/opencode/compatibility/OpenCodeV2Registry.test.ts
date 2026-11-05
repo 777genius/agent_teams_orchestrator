@@ -57,7 +57,7 @@ test('2.0.0 floor and 2.0.32 current keep their identities but no longer admit a
   }
 })
 
-test('qualification is per platform: a version is admitted only where its evidence ran', () => {
+test('qualification is per platform: a version is admitted only where its record permits', () => {
   const record = openCodeV2Qualification('2.1.4')
   expect(record?.platforms.length).toBeGreaterThan(0)
   for (const platform of ['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64', 'win32-arm64', 'win32-x64']) {
