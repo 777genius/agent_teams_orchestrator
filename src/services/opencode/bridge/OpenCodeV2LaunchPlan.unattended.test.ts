@@ -335,9 +335,9 @@ for (const version of ['2.1.4'] as const) test(`${version} team launch requires 
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
   const arch = Object.getOwnPropertyDescriptor(process, 'arch')!
   try {
-    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' })
-    Object.defineProperty(process, 'arch', { ...arch, value: 'x64' })
-    // V2 2.1.4 is not qualified on Intel macOS; refuse before process work.
+    Object.defineProperty(process, 'platform', { ...platform, value: 'linux' })
+    Object.defineProperty(process, 'arch', { ...arch, value: 'arm64' })
+    // V2 2.1.4 is not qualified on Linux ARM64; refuse before process work.
     await expect(launchExplicitOpenCodeV2Run(plan)).rejects.toThrow('opencode_v2_version_unqualified')
     await expect(startOpenCodeV2RunSupervisor(plan, '/TEST-unqualified', 'TEST')).rejects.toThrow('opencode_v2_version_unqualified')
   } finally { Object.defineProperty(process, 'platform', platform); Object.defineProperty(process, 'arch', arch) }

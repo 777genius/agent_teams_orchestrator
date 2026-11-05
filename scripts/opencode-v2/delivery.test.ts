@@ -79,7 +79,7 @@ test('Windows ARM64 support binds its own architecture, Bun and exact engine ros
 test('macOS support binds Bun 1.4.4 and refuses the previous interpreter pins', async () => {
   const f = await fixture()
   try {
-    for (const arch of ['arm64']) {
+    for (const arch of ['arm64', 'x64']) {
       const engines = ['2.1.4']
       await writeFile(path.join(f.local, 'opencode-v2-graphs.json'), JSON.stringify({
         schema: 2, platform: 'darwin', arch,
@@ -93,7 +93,6 @@ test('macOS support binds Bun 1.4.4 and refuses the previous interpreter pins', 
         expect(() => validateOpenCodeV2DeliveryDescriptor({ ...descriptor, requiredBunVersion })).toThrow()
       }
     }
-    await expect(packageOpenCodeV2Delivery({ ...f.options, platformKey: 'darwin-x64' })).rejects.toThrow('not qualified')
   } finally { await rm(f.root, { recursive: true, force: true }) }
 })
 
