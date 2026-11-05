@@ -24,7 +24,7 @@ mock.module('./OpenCodeV2ProviderManagement.js', () => ({
     fingerprint: 'TEST-SELECTED-V1',
   }),
 }))
-const { OpenCodeProviderManagementAdapter } = await import('./OpenCodeProviderManagementAdapter.js')
+const { OpenCodeProviderManagementAdapter, isOpenCodeZenCatalogModelFree } = await import('./OpenCodeProviderManagementAdapter.js')
 import { planOpenCodeProfilePolicy } from '../../../../services/opencode/OpenCodeProfilePolicy.js'
 import { OpenCodeHostManager } from '../../../../services/opencode/OpenCodeHostManager.js'
 import { readCapturedOpenCodeBinaryPath } from '../../../../services/opencode/OpenCodeBinaryResolver.js'
@@ -6698,6 +6698,40 @@ describe('OpenCodeProviderManagementAdapter', () => {
     if (!viewResult.ok) return
     expect(viewResult.value.providers.find(provider => provider.providerId === 'openrouter'))
       .toMatchObject({ modelCount: 5 })
+  })
+
+  test('uses exact Zen catalog prices when profile inventory omits metadata', () => {
+    const price = (cost: unknown) => ({ providers: [{ id: 'opencode', models: { 'big-pickle': { cost } } }] })
+    const input = { providerId: 'opencode', modelId: 'opencode/big-pickle', inventory: inventory({ modelMetadata: [] }),
+      configProviders: price({ input: 0, output: 0, cache: { read: 0, write: 0 } }), providers: null }
+    expect(isOpenCodeZenCatalogModelFree(input)).toBe(true)
+    expect(isOpenCodeZenCatalogModelFree({ ...input, configProviders: price({ input: 1, output: 0 }) })).toBe(false)
+    expect(isOpenCodeZenCatalogModelFree({ ...input, configProviders: price({ input: 0 }) })).toBe(false)
+    expect(isOpenCodeZenCatalogModelFree({ ...input, configProviders: null })).toBe(false)
+    expect(isOpenCodeZenCatalogModelFree({ ...input, providerId: 'other', modelId: 'other/big-pickle' })).toBe(false)
+    expect(isOpenCodeZenCatalogModelFree({ ...input, providers: { all: [{ id: 'opencode', models: { 'big-pickle': { cost: { input: 1, output: 0 } } } }] } })).toBe(false)
+    expect(isOpenCodeZenCatalogModelFree({ ...input, inventory: inventory({ modelMetadata: [{ id: 'opencode/big-pickle', cost: { input: 1, output: 0 }, context: null, limits: null, free: false, raw: {} }] }) })).toBe(false)
+  })
+
+  test('profile-only Zen model loading retains free pricing', async () => {
+    const models = { 'big-pickle': { cost: { input: 0, output: 0, cache: { read: 0, write: 0 } } },
+      'paid-model': { cost: { input: 1, output: 1 } }, 'unknown-model': {} }
+    const adapter = new OpenCodeProviderManagementAdapter({
+      ...catalogIdentityDependencies(),
+      inventoryService: { probe: async () => inventory({ availableProviders: ['opencode'], models: [], modelMetadata: [] }) },
+      hostManager: { ensureHost: async () => host(), releaseHost: async () => {} },
+      clientFactory: { create: () => ({
+        getConfigProviders: async () => ({ providers: [{ id: 'opencode', models }], default: {} }),
+        getProviders: async () => ({ all: [{ id: 'opencode', models }], connected: ['opencode'], default: {} }),
+        getProviderAuth: async () => ({ opencode: [{ type: 'api' }] }),
+      }) },
+    })
+    const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'opencode' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.models.map(model => [model.modelId, model.free])).toEqual([
+      ['opencode/big-pickle', true], ['opencode/paid-model', false], ['opencode/unknown-model', false],
+    ])
   })
 
   test('marks provider-scoped zero-cost OpenRouter models as free', async () => {

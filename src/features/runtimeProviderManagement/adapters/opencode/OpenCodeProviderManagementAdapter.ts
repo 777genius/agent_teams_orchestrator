@@ -2957,6 +2957,38 @@ function getProviderModelDeclaredInputModalities(input: {
   return declaration
 }
 
+/** Profile-only reads omit verbose inventory prices; use exact Zen HTTP entries. */
+export function isOpenCodeZenCatalogModelFree(input: {
+  providerId: string
+  modelId: string
+  inventory: OpenCodeInventorySnapshot
+  configProviders: OpenCodeConfigProvidersResponse | null
+  providers: OpenCodeProviderResponse | null
+}): boolean {
+  if (input.providerId !== 'opencode') return isOpenCodeModelFree(input.modelId, input.inventory.modelMetadata)
+  const known = input.inventory.modelMetadata?.find(model => model.id === input.modelId)
+  if (known) return isOpenCodeModelFree(input.modelId, input.inventory.modelMetadata)
+  const nestedId = input.modelId.slice(`${input.providerId}/`.length)
+  let found = false
+  for (const entries of [input.configProviders?.providers, input.providers?.all]) {
+    if (entries !== undefined && !Array.isArray(entries)) return false
+    const matching = entries?.filter(provider => normalizeProviderId(provider.id) === input.providerId) ?? []
+    if (matching.length > 1) return false
+    const models = asRecord(matching[0]?.models)
+    const model = asRecord(models?.[nestedId])
+    if (!model || model.cost === undefined) continue
+    const cost = asRecord(model.cost)
+    if (!cost || cost.input !== 0 || cost.output !== 0) return false
+    const allZero = (value: unknown): boolean => typeof value === 'number' ? value === 0
+      : Array.isArray(value) ? value.length > 0 && value.every(allZero)
+        : value !== null && typeof value === 'object'
+          ? Object.keys(value).length > 0 && Object.values(value).every(allZero) : false
+    if (!allZero(cost)) return false
+    found = true
+  }
+  return found
+}
+
 function buildRuntimeProviderModel(input: {
   providerId: string
   modelId: string
@@ -2984,7 +3016,7 @@ function buildRuntimeProviderModel(input: {
     displayName: nestedModelId || input.modelId,
     declaredInputModalities: getProviderModelDeclaredInputModalities(input),
     sourceLabel,
-    free: isOpenCodeModelFree(input.modelId, input.inventory.modelMetadata),
+    free: isOpenCodeZenCatalogModelFree(input),
     default: input.defaultModelId === input.modelId,
     catalogStatus: getProviderModelCatalogStatus({
       providerId: input.providerId,
