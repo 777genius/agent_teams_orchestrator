@@ -60,6 +60,8 @@ jobs:
       - name: Qualify CI policy and proof source provenance
         id: provenance
         shell: bash
+        env:
+          GIT_NO_REPLACE_OBJECTS: '1'
         run: |
           set -euo pipefail
           if [[ "$GITHUB_EVENT_NAME" == 'pull_request' ]]; then

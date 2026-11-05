@@ -268,5 +268,7 @@ test('workflow independently forces full native E2E if PR-editable CI authority 
     assert.ok(scope.includes(`${key}: ` + '${{ steps.guarded.outputs.' + key + ' }}'), key)
   }
   assert.match(scope, /if \[\[ "\$PROVENANCE_UNCHANGED" != 'true' \]\]/)
+  assert.match(scope, /GIT_NO_REPLACE_OBJECTS: '1'/)
+  assert.match(scope, /'v2_linux=true' 'reason=CI policy\/proof source changed or unverifiable; full native validation'/)
   assert.match(scope, /reason=CI policy\/proof source changed or unverifiable; full native validation/)
 })
