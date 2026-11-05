@@ -2974,9 +2974,14 @@ export function isOpenCodeZenCatalogModelFree(input: {
     if (entries !== undefined && !Array.isArray(entries)) return false
     const matching = entries?.filter(provider => normalizeProviderId(provider.id) === input.providerId) ?? []
     if (matching.length > 1) return false
-    const models = asRecord(matching[0]?.models)
-    const model = asRecord(models?.[nestedId])
-    if (!model || model.cost === undefined) continue
+    const rawModels = matching[0]?.models
+    if (rawModels === undefined) continue
+    const models = asRecord(rawModels)
+    if (!models) return false
+    if (!Object.prototype.hasOwnProperty.call(models, nestedId)) continue
+    const model = asRecord(models[nestedId])
+    if (!model) return false
+    if (model.cost === undefined) continue
     const cost = asRecord(model.cost)
     if (!cost || cost.input !== 0 || cost.output !== 0) return false
     const allZero = (value: unknown): boolean => typeof value === 'number' ? value === 0
