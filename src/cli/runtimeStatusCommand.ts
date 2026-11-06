@@ -1,4 +1,5 @@
 import path from 'node:path'
+import { stat } from 'node:fs/promises'
 import { Command, Option } from '@commander-js/extra-typings'
 
 export interface RuntimeStatusOptions {
@@ -10,14 +11,17 @@ export interface RuntimeStatusOptions {
 }
 
 /** Keep status project selection explicit; never canonicalize a File Provider path with Bun. */
-export function normalizeRuntimeStatusProjectPath(projectPath?: string): string | undefined {
+export async function normalizeRuntimeStatusProjectPath(projectPath?: string): Promise<string | undefined> {
   if (projectPath === undefined) return undefined
   const value = projectPath.trim()
   if (!value || !path.isAbsolute(value) ||
     path.resolve(value) === path.parse(path.resolve(value)).root) {
     throw new Error('runtime status --project-path requires an absolute, non-root project path')
   }
-  return path.resolve(value)
+  const resolved = path.resolve(value)
+  const info = await stat(resolved)
+  if (!info.isDirectory()) throw new Error('runtime status --project-path must be an existing directory')
+  return resolved
 }
 
 /** Share argument validation between the lean entry path and the full CLI. */

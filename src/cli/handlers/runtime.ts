@@ -340,7 +340,7 @@ export async function runtimeStatus(opts: RuntimeStatusOptions): Promise<void> {
   const providerFilter = opts.provider && opts.provider !== 'all' ? opts.provider : undefined
 
   try {
-    const projectPath = normalizeRuntimeStatusProjectPath(opts.projectPath)
+    const projectPath = await normalizeRuntimeStatusProjectPath(opts.projectPath)
     const loadPayload = () =>
       getUnifiedRuntimeStatusPayload(
         providerFilter,
