@@ -1,4 +1,5 @@
 import type { RuntimeStatusOptions } from '../runtimeStatusCommand.js'
+import { normalizeRuntimeStatusProjectPath } from '../runtimeStatusCommand.js'
 /* eslint-disable custom-rules/no-process-exit -- CLI subcommand handler intentionally exits */
 
 import { getUnifiedRuntimeStatusPayload } from '../../services/runtimeBackends/registry.js'
@@ -337,16 +338,18 @@ function printProviderStatus(provider: RuntimeProviderStatus): void {
 
 export async function runtimeStatus(opts: RuntimeStatusOptions): Promise<void> {
   const providerFilter = opts.provider && opts.provider !== 'all' ? opts.provider : undefined
-  const loadPayload = () =>
-    getUnifiedRuntimeStatusPayload(
-      providerFilter,
-      {},
-      {
-        detailLevel: opts.summary ? 'summary' : 'full',
-      },
-    )
 
   try {
+    const projectPath = normalizeRuntimeStatusProjectPath(opts.projectPath)
+    const loadPayload = () =>
+      getUnifiedRuntimeStatusPayload(
+        providerFilter,
+        {},
+        {
+          detailLevel: opts.summary ? 'summary' : 'full',
+          projectPath,
+        },
+      )
     if (opts.text) {
       const payload = await loadPayload()
       const providerOrder: RuntimeProviderId[] = ['anthropic', 'codex', 'gemini', 'opencode']

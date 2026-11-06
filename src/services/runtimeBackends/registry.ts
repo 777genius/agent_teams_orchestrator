@@ -435,7 +435,7 @@ type RuntimeStatusRegistryDeps = OpenCodePassiveStatusDeps & {
     | RuntimeProviderSubscriptionRateLimitSnapshot
     | null
     | Promise<RuntimeProviderSubscriptionRateLimitSnapshot | null>
-  getOpenCodeInventorySnapshot?: () => Promise<OpenCodeInventorySnapshot>
+  getOpenCodeInventorySnapshot?: (projectPath?: string | null) => Promise<OpenCodeInventorySnapshot>
   openCodeInventoryTimeoutMs?: number
 }
 
@@ -605,7 +605,7 @@ function getOpenCodeModelReasoningProfile(modelId: string): {
 
 async function buildOpenCodeStatus(
   deps: RuntimeStatusRegistryDeps = {},
-  options: { detailLevel?: RuntimeStatusDetailLevel } = {},
+  options: { detailLevel?: RuntimeStatusDetailLevel; projectPath?: string } = {},
 ): Promise<RuntimeProviderStatus> {
   const summary = options.detailLevel === 'summary'
   if (summary) {
@@ -620,9 +620,9 @@ async function buildOpenCodeStatus(
   let readAcquisitionPending = false
   const startedAt = Date.now(), deadline = startedAt + timeoutMs
   const probe = deps.getOpenCodeInventorySnapshot
-      ? deps.getOpenCodeInventorySnapshot()
+      ? deps.getOpenCodeInventorySnapshot(options.projectPath)
       : openCodeInventoryService.probe(
-          null,
+          options.projectPath,
           {
             mode: 'full',
             includeAppMcp: false,
@@ -1125,7 +1125,7 @@ function buildCodexStatuses(): {
 export async function getUnifiedRuntimeStatusPayload(
   providerFilter?: RuntimeProviderId | null,
   deps: RuntimeStatusRegistryDeps = {},
-  options: { detailLevel?: RuntimeStatusDetailLevel } = {},
+  options: { detailLevel?: RuntimeStatusDetailLevel; projectPath?: string } = {},
 ): Promise<RuntimeStatusPayload> {
   const summary = options.detailLevel === 'summary'
   const providers: Partial<Record<RuntimeProviderId, RuntimeProviderStatus>> =
@@ -1296,6 +1296,7 @@ export async function getUnifiedRuntimeStatusPayload(
   if (!providerFilter || providerFilter === 'opencode') {
     providers.opencode = await buildOpenCodeStatus(deps, {
       detailLevel: options.detailLevel,
+      projectPath: options.projectPath,
     })
   }
 
