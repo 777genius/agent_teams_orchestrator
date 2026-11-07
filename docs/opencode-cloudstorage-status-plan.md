@@ -11,10 +11,10 @@ Date: 2026-11-06. Research evidence, not a claim of reproducing the customer's f
 
 ## Decision: explicit project identity, independent of process working directory
 
-1. Extend only `runtime status` with optional `--project-path <absolute-path>`.
+1. Extend OpenCode read-only `runtime status` and `model list` with optional `--project-path <absolute-path>`.
 2. Validate absolute/non-root project path before reading; never infer project from a launch helper or from `HOME` if explicitly supplied.
-3. Pass that path to the existing OpenCode inventory probe and the retained model/auth/readiness check. Keep existing behavior when omitted.
-4. Electron invokes the new command for OpenCode preflight from a known-accessible user home (on macOS) while preserving the exact selected project via the argument. Do **not** change other providers' working directories, actual launches, or read permissions.
+3. Pass that path to the existing OpenCode inventory probe and retained model/auth/readiness checks for both commands. Keep existing behavior when omitted.
+4. Electron invokes both OpenCode read-only commands from a known-accessible user home (on macOS) while preserving the exact selected project via the argument. Cover model-list reads in launch identity and default-model preparation as well as status UI. Do **not** change other providers' working directories, actual launches, or read permissions.
 5. Create regression tests for project selection versus `cwd`, invalid paths, default/backward compatibility, and readiness fail-closed; validate on macOS CI where possible.
 6. Release the changed orchestrator as a new pinned bundled runtime, then update `agent-teams-ai/runtime.lock.json` and test Electron packaging. No silent fallback to the old binary.
 
