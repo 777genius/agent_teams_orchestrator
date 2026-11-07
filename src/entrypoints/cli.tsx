@@ -134,6 +134,38 @@ async function runRuntimeStatusFastPath(args: string[]): Promise<boolean> {
   return true
 }
 
+/** Keep model inventory independent of the full interactive startup path. */
+async function runModelListFastPath(args: string[]): Promise<boolean> {
+  if (args[0] !== 'model' || args[1] !== 'list') return false
+  const { createModelListCommand } = await import('../cli/modelListCommand.js')
+  const command = createModelListCommand(async opts => {
+    try {
+      const { modelList } = await import('../cli/handlers/model.js')
+      await modelList(opts)
+    } catch (error) {
+      // The full-CLI global rejection listener is telemetry-only: a failed
+      // inventory must never exit 0 with empty stdout (false-ready model list).
+      const message = error instanceof Error ? error.message : String(error)
+      await new Promise<void>(resolve => process.stderr.write(`Model list failed: ${message}\n`, () => resolve()))
+      process.exitCode = 1
+    }
+  })
+  command.hook('preAction', async () => {
+    const { ensureMdmSettingsLoaded } = await import('../utils/settings/mdm/settings.js')
+    await ensureMdmSettingsLoaded()
+    const { enableConfigs } = await import('../utils/config.js')
+    enableConfigs()
+    const { applySafeConfigEnvironmentVariables } = await import('../utils/managedEnv.js')
+    applySafeConfigEnvironmentVariables()
+    const { applyExtraCACertsFromConfig } = await import('../utils/caCertsConfig.js')
+    applyExtraCACertsFromConfig()
+    const { configureGlobalAgents } = await import('../utils/proxy.js')
+    configureGlobalAgents()
+  })
+  await command.parseAsync(args.slice(2), { from: 'user' })
+  return true
+}
+
 async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
   if (args[0] !== 'runtime' || args[1] !== 'providers' || hasHelpOption(args)) {
     return false
@@ -284,6 +316,7 @@ async function main(): Promise<void> {
   }
 
   if (await runRuntimeStatusFastPath(args)) return
+  if (await runModelListFastPath(args)) return
 
   if (args[0] === 'runtime' && args[1] === 'transcript' && !hasHelpOption(args)) {
     profileCheckpoint('cli_runtime_transcript_path')

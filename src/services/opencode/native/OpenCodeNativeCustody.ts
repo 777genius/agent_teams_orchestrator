@@ -331,7 +331,15 @@ function bind(reference: NativeCustodyReference, child: ChildProcess | null): Na
         if (byEndpoint.get(reference.baseUrl) === custody) byEndpoint.delete(reference.baseUrl)
         if (await nativeExitConfirmed(authority)) await reclaimRetiredNativeImages(reference.images).catch(() => undefined)
       } catch (error) {
-        if (await nativeExitConfirmed(authority)) {
+        // A control helper can close before the original custodian's durable
+        // exit receipt is visible. Wait briefly for that exact proof, never
+        // retry Stop or infer death from a PID/child-close event.
+        let exited = await nativeExitConfirmed(authority)
+        for (let attempt = 0; !exited && attempt < 8; attempt++) {
+          await Bun.sleep(25)
+          exited = await nativeExitConfirmed(authority)
+        }
+        if (exited) {
           await writeNativeAuthority(authorityFile(reference), { ...authority, phase: 'dead' })
           if (byEndpoint.get(reference.baseUrl) === custody) byEndpoint.delete(reference.baseUrl)
           await reclaimRetiredNativeImages(reference.images).catch(() => undefined)

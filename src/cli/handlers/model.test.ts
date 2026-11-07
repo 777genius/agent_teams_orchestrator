@@ -3,6 +3,26 @@ import { describe, expect, test } from 'bun:test'
 import { getProviderModels, modelList } from './model.js'
 
 describe('model list handler', () => {
+  test('forwards an explicit project to the OpenCode model inventory without using cwd', async () => {
+    const selected = '/TEST/Library/CloudStorage/GoogleDrive/My Portfolio'
+    const received: Array<string | undefined> = []
+    const details = await getProviderModels('opencode', {
+      getOpenCodeInventorySnapshot: async projectPath => {
+        received.push(projectPath)
+        return {
+          detected: false, binaryPath: null, version: null,
+          projectPath: projectPath ?? '/TEST/wrong-cwd',
+          profile: null, connectedProviders: [], availableProviders: [],
+          models: [], agents: [], authStorePath: null, probeError: null, diagnostics: [],
+        }
+      },
+    }, selected)
+    expect(received).toEqual([selected])
+    expect(details.models).toEqual([])
+    expect(details.defaultModel).toBe('')
+  })
+
+
   test('uses the shared Codex runtime model catalog', async () => {
     const details = await getProviderModels('codex', {
       getCodexModelCatalog: async () => ({

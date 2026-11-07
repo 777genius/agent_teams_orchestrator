@@ -16,6 +16,7 @@ import { getAnthropicRuntimeModelCatalog } from '../../services/runtimeBackends/
 import { getAnthropicDefaultLaunchModel } from '../../services/runtimeBackends/effectiveDefaultModel.js'
 import { getCodexRuntimeModelCatalog } from '../../services/runtimeBackends/codexModelCatalog.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
+import { normalizeRuntimeStatusProjectPath } from '../runtimeStatusCommand.js'
 
 import type { OpenCodeInventorySnapshot } from '../../services/opencode/types.js'
 
@@ -32,7 +33,7 @@ type ModelSummary = {
 
 type ModelListDeps = {
   getCodexModelCatalog?: typeof getCodexRuntimeModelCatalog
-  getOpenCodeInventorySnapshot?: () => Promise<OpenCodeInventorySnapshot>
+  getOpenCodeInventorySnapshot?: (projectPath?: string) => Promise<OpenCodeInventorySnapshot>
 }
 
 function getDefaultProvider(): InternalModelProvider {
@@ -49,6 +50,7 @@ function getDefaultProvider(): InternalModelProvider {
 export async function getProviderModels(
   provider: InternalModelProvider,
   deps: ModelListDeps = {},
+  projectPath?: string,
 ): Promise<{
   defaultModel: string
   displayName: string
@@ -86,8 +88,8 @@ export async function getProviderModels(
       }
     case 'opencode': {
       const snapshot = await (
-        deps.getOpenCodeInventorySnapshot ?? (() => openCodeInventoryService.probe())
-      )()
+        deps.getOpenCodeInventorySnapshot ?? ((selected?: string) => openCodeInventoryService.probe(selected))
+      )(projectPath)
       const models = filterOpenCodeAgentModels(snapshot.models, snapshot.modelMetadata)
       const managedDefault = snapshot.readGeneration === 'v2' && snapshot.readStatus?.catalog === 'ready'
         ? (await readOpenCodeManagedDefaultSelection(snapshot.projectPath)).defaultModel : null
@@ -128,6 +130,7 @@ export async function modelList(opts: {
   json?: boolean
   text?: boolean
   provider?: ModelProviderTarget
+  projectPath?: string
 }): Promise<void> {
   const providers: InternalModelProvider[] = (() => {
     if (opts.provider === 'all') {
@@ -143,8 +146,9 @@ export async function modelList(opts: {
     return [getDefaultProvider()]
   })()
 
+  const projectPath = await normalizeRuntimeStatusProjectPath(opts.projectPath)
   const providerEntries = await Promise.all(
-    providers.map(async provider => [provider, await getProviderModels(provider)] as const),
+    providers.map(async provider => [provider, await getProviderModels(provider, {}, projectPath)] as const),
   )
 
   const output = {
