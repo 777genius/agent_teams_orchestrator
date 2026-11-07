@@ -1,3 +1,4 @@
+import { createModelListCommand } from './cli/modelListCommand.js';
 import { createRuntimeStatusCommand } from './cli/runtimeStatusCommand.js';
 // These side-effects must run before all other imports:
 // 1. profileCheckpoint marks entry before heavy module evaluation begins
@@ -4291,17 +4292,10 @@ async function run(): Promise<CommanderCommand> {
   });
 
   const model = program.command('model').description('Inspect model availability').configureHelp(createSortedHelpConfig());
-  model.command('list').description('List available models by provider').addOption(new Option('--provider <provider>', 'Provider to inspect').choices(['anthropic', 'codex', 'gemini', 'opencode', 'all'])).option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').option('--project-path <path>', 'Selected OpenCode project for model inventory').action(async (opts: {
-    json?: boolean;
-    text?: boolean;
-    provider?: 'anthropic' | 'codex' | 'gemini' | 'opencode' | 'all';
-    projectPath?: string;
-  }) => {
-    const {
-      modelList
-    } = await import('./cli/handlers/model.js');
+  model.addCommand(createModelListCommand(async opts => {
+    const { modelList } = await import('./cli/handlers/model.js');
     await modelList(opts);
-  });
+  }));
 
   const runtime = program.command('runtime').description('Inspect runtime backend availability').configureHelp(createSortedHelpConfig());
   runtime.addCommand(createRuntimeStatusCommand(async opts => {

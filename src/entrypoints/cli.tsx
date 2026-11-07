@@ -134,6 +134,30 @@ async function runRuntimeStatusFastPath(args: string[]): Promise<boolean> {
   return true
 }
 
+/** Keep model inventory independent of the full interactive startup path. */
+async function runModelListFastPath(args: string[]): Promise<boolean> {
+  if (args[0] !== 'model' || args[1] !== 'list') return false
+  const { createModelListCommand } = await import('../cli/modelListCommand.js')
+  const command = createModelListCommand(async opts => {
+    const { modelList } = await import('../cli/handlers/model.js')
+    await modelList(opts)
+  })
+  command.hook('preAction', async () => {
+    const { ensureMdmSettingsLoaded } = await import('../utils/settings/mdm/settings.js')
+    await ensureMdmSettingsLoaded()
+    const { enableConfigs } = await import('../utils/config.js')
+    enableConfigs()
+    const { applySafeConfigEnvironmentVariables } = await import('../utils/managedEnv.js')
+    applySafeConfigEnvironmentVariables()
+    const { applyExtraCACertsFromConfig } = await import('../utils/caCertsConfig.js')
+    applyExtraCACertsFromConfig()
+    const { configureGlobalAgents } = await import('../utils/proxy.js')
+    configureGlobalAgents()
+  })
+  await command.parseAsync(args.slice(2), { from: 'user' })
+  return true
+}
+
 async function runRuntimeProvidersFastPath(args: string[]): Promise<boolean> {
   if (args[0] !== 'runtime' || args[1] !== 'providers' || hasHelpOption(args)) {
     return false
@@ -284,6 +308,7 @@ async function main(): Promise<void> {
   }
 
   if (await runRuntimeStatusFastPath(args)) return
+  if (await runModelListFastPath(args)) return
 
   if (args[0] === 'runtime' && args[1] === 'transcript' && !hasHelpOption(args)) {
     profileCheckpoint('cli_runtime_transcript_path')
