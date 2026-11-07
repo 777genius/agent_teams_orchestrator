@@ -7,7 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { OpenCodeClientFactory } from '../OpenCodeClientFactory.js'
-import { launchNativeCustody, recoverNativeCustody, nativeCustodyForEndpoint, bindNativeRequestOwner, type NativeCustody } from './OpenCodeNativeCustody.js'
+import { launchNativeCustody, recoverNativeCustody, nativeCustodyForEndpoint, bindNativeRequestOwner, nativeHelperFailureDiagnostic, type NativeCustody } from './OpenCodeNativeCustody.js'
 import { OpenCodeHostManager } from '../OpenCodeHostManager.js'
 import type { OpenCodePreparedProfile } from '../types.js'
 import { fetchNativeOpenCode, nativeRequestFailureGate } from './OpenCodeNativeRequestLease.js'
@@ -26,6 +26,11 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
   const active = new Set<NativeCustody>()
   const epochs = new Set<NativeCustody>()
   const execute = promisify(execFile)
+  // Phase-only diagnostic; never log auth headers, captured helpers or private paths.
+  const reportHelperFailure = (error: unknown) => {
+    const diagnostic = nativeHelperFailureDiagnostic(error)
+    if (diagnostic) console.error('TEST native helper lifecycle:', JSON.stringify(diagnostic))
+  }
   beforeAll(async () => {
     root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-opencode-native-custody-')))
     await chmod(root, 0o700)
@@ -124,7 +129,7 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
         try { await client.getConfig(); return custody }
         catch (error) { if (attempt === 49) throw error; await Bun.sleep(20) }
       }
-    } catch (error) { preserve = true; throw error }
+    } catch (error) { reportHelperFailure(error); preserve = true; throw error }
   }
   test('the ordinary production factory refuses an unbound foreign listener before HTTP bytes', async () => {
     let bytes = 0
@@ -275,7 +280,7 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
         active.delete(custody)
         expect((await readNativeAuthority(nativeAuthorityPath(profileRoot, host.hostKey))).phase).toBe('dead')
         await manager.drainPendingLifecycleCleanups()
-      } catch (error) { preserve = true; throw error }
+      } catch (error) { reportHelperFailure(error); preserve = true; throw error }
       finally { for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value } }
     }, 60000)
   }
@@ -394,7 +399,8 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
     let observed = false
     for (let attempt = 0; attempt < 50; attempt++) { if (await listening()) { observed = true; break }; await Bun.sleep(20) }
     expect(observed).toBe(true)
-    await custody.stopExact(); active.delete(custody)
+    try { await custody.stopExact() } catch (error) { reportHelperFailure(error); throw error }
+    active.delete(custody)
     expect(await listening()).toBe(false)
     expect(await new OpenCodeClientFactory().create(sentinel.reference.baseUrl, undefined, bindNativeRequestOwner({}, sentinel)).getConfig()).toMatchObject({ marker: 'A' })
   }, 20000)
