@@ -139,8 +139,16 @@ async function runModelListFastPath(args: string[]): Promise<boolean> {
   if (args[0] !== 'model' || args[1] !== 'list') return false
   const { createModelListCommand } = await import('../cli/modelListCommand.js')
   const command = createModelListCommand(async opts => {
-    const { modelList } = await import('../cli/handlers/model.js')
-    await modelList(opts)
+    try {
+      const { modelList } = await import('../cli/handlers/model.js')
+      await modelList(opts)
+    } catch (error) {
+      // The full-CLI global rejection listener is telemetry-only: a failed
+      // inventory must never exit 0 with empty stdout (false-ready model list).
+      const message = error instanceof Error ? error.message : String(error)
+      await new Promise<void>(resolve => process.stderr.write(`Model list failed: ${message}\n`, () => resolve()))
+      process.exitCode = 1
+    }
   })
   command.hook('preAction', async () => {
     const { ensureMdmSettingsLoaded } = await import('../utils/settings/mdm/settings.js')
