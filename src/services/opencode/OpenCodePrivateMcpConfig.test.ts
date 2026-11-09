@@ -36,6 +36,36 @@ test('publishes a private first config and replacement without changing legacy c
   expect(await readdir(credentialDirectory())).toEqual(['opencode.json'])
 })
 
+test('serializes parallel private publication without false inode errors or leftovers', async () => {
+  const files = await Promise.all(Array.from({ length: 8 }, (_, index) =>
+    publishPrivateCursorMcpConfig(root, { ...secretConfig, version: index })))
+  expect(files).toEqual(Array.from({ length: 8 }, () => credentialFile()))
+  const result = JSON.parse(await readFile(credentialFile(), 'utf8'))
+  expect(result.mcp).toEqual(secretConfig.mcp)
+  expect(Number.isInteger(result.version) && result.version >= 0 && result.version < 8).toBe(true)
+  expect(await readdir(credentialDirectory())).toEqual(['opencode.json'])
+  expect(await readdir(root)).toEqual(['mcp-credentials'])
+  if (process.platform !== 'win32') {
+    expect((await lstat(credentialFile())).mode & 0o777).toBe(0o600)
+    expect((await lstat(credentialDirectory())).mode & 0o777).toBe(0o700)
+  }
+})
+
+test('serializes independent runtime processes preparing the same credential generation', async () => {
+  const source = new URL('./OpenCodePrivateMcpConfig.ts', import.meta.url).href
+  const script = `const { publishPrivateCursorMcpConfig } = await import(${JSON.stringify(source)}); await publishPrivateCursorMcpConfig(${JSON.stringify(root)}, { source: process.env.TEST_MCP_PUBLICATION_ID });`
+  const children = Array.from({ length: 3 }, (_, index) => Bun.spawn({
+    cmd: [process.execPath, '-e', script],
+    env: { ...process.env, TEST_MCP_PUBLICATION_ID: String(index) },
+    stdout: 'ignore',
+    stderr: 'inherit',
+  }))
+  expect(await Promise.all(children.map(child => child.exited))).toEqual([0, 0, 0])
+  expect(['0', '1', '2']).toContain(JSON.parse(await readFile(credentialFile(), 'utf8')).source)
+  expect(await readdir(credentialDirectory())).toEqual(['opencode.json'])
+  expect(await readdir(root)).toEqual(['mcp-credentials'])
+}, 30_000)
+
 test.skipIf(process.platform !== 'win32')('accepts a case-only Windows state-root spelling with original ACL checks', async () => {
   const alternate = path.join(path.dirname(root), path.basename(root).toUpperCase())
   const file = await publishPrivateCursorMcpConfig(alternate, secretConfig)
