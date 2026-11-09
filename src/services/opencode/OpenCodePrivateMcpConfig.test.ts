@@ -4,7 +4,7 @@ import { chmod, chown, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath,
 import os from 'node:os'
 import path from 'node:path'
 
-import { assertPrivateWindowsAcl, assertPrivateWindowsAclAsync, validateWindowsAcl, validateWindowsAncestorAcl, runWindowsMcpAclScript, runWindowsMcpAclScriptAsync } from './OpenCodePrivateMcpAcl.js'
+import { assertPrivateWindowsAcl, assertPrivateWindowsAclAsync, validateWindowsAcl, validateWindowsAncestorAcl, runWindowsMcpAclScriptAsync } from './OpenCodePrivateMcpAcl.js'
 import * as lockfile from '../../utils/lockfile.js'
 import { publishPrivateCursorMcpConfig } from './OpenCodePrivateMcpConfig.js'
 
@@ -216,18 +216,18 @@ test.skipIf(process.platform !== 'win32')('rejects an actual writable Windows an
   await expect(assertPrivateWindowsAclAsync(root)).rejects.toThrow()
 })
 
-test.skipIf(process.platform !== 'win32')('uses the trusted WinPS5 module context without inheriting a credential environment', () => {
+test.skipIf(process.platform !== 'win32')('uses the trusted WinPS5 module context without inheriting a credential environment', async () => {
   const oldModulePath = process.env.PSModulePath
   const secretKey = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_HEADERS_JSON'
   const oldCredential = process.env[secretKey]
   try {
     process.env.PSModulePath = 'C:\\TEST-incompatible-PowerShell7-modules'
     process.env[secretKey] = 'TEST-synthetic-credential-must-not-enter-ACL-child'
-    const actual = JSON.parse(runWindowsMcpAclScript(`@{major=$PSVersionTable.PSVersion.Major;modulePath=$env:PSModulePath;inheritedCredential=[bool][System.Environment]::GetEnvironmentVariable('${secretKey}')} | ConvertTo-Json -Compress`))
+    const actual = JSON.parse(await runWindowsMcpAclScriptAsync(`@{major=$PSVersionTable.PSVersion.Major;modulePath=$env:PSModulePath;inheritedCredential=[bool][System.Environment]::GetEnvironmentVariable('${secretKey}')} | ConvertTo-Json -Compress`))
     expect(actual.major).toBe(5)
     expect(actual.modulePath.toLowerCase()).toBe(path.win32.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'Modules').toLowerCase())
     expect(actual.inheritedCredential).toBe(false)
-    assertPrivateWindowsAcl(root)
+    await assertPrivateWindowsAclAsync(root)
   } finally {
     if (oldModulePath === undefined) delete process.env.PSModulePath
     else process.env.PSModulePath = oldModulePath
