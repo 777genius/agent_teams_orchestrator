@@ -70,8 +70,8 @@ export async function publishPrivateCursorMcpConfig(stateRoot: string, config: u
   // The lock directory must live *inside* the already validated 0700 root.
   // A sibling of mcp-credentials could be exposed by a looser stateRoot mode.
   let lockCompromised = false
-  const assertLockCurrent = () => { if (lockCompromised) throw unsafe() }
-  const release = await lockfile.lock(path.join(directory, '.publication'), {
+  const lockFile = path.join(directory, '.publication')
+  const release = await lockfile.lock(lockFile, {
     realpath: false,
     stale: 30_000,
     update: 5_000,
@@ -82,6 +82,13 @@ export async function publishPrivateCursorMcpConfig(stateRoot: string, config: u
     retries: { retries: 170, minTimeout: 25, maxTimeout: 250 },
   })
   try {
+    // An asynchronous inode recheck also yields to the lock heartbeat after
+    // synchronous platform ACL probes. Never publish under a stolen lock.
+    const lockIdentity = await lstat(`${lockFile}.lock`)
+    const assertLockCurrent = async () => {
+      const current = await lstat(`${lockFile}.lock`).catch(() => null)
+      if (lockCompromised || !current || !sameFile(lockIdentity, current)) throw unsafe()
+    }
     await inspectDirectory()
     const file = path.join(directory, 'opencode.json')
     const inspectFile = async (): Promise<Stats | null> => {
@@ -111,10 +118,10 @@ export async function publishPrivateCursorMcpConfig(stateRoot: string, config: u
       if ((previous === null) !== (current === null)
         || (previous && current && !sameFile(previous, current))) throw unsafe()
       if (!sameFile(opened, await validatePrivate(temporary))) throw unsafe()
-      assertLockCurrent()
+      await assertLockCurrent()
       await rename(temporary, file)
       if (!sameFile(opened, await validatePrivate(file))) throw unsafe()
-      assertLockCurrent()
+      await assertLockCurrent()
       return file
     } finally {
       if (!closed) await handle.close().catch(() => undefined)
