@@ -119,5 +119,4 @@ export async function publishPrivateCursorMcpConfig(stateRoot: string, config: u
   } finally {
     await release()
   }
-
 }
