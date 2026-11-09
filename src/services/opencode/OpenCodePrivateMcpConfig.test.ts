@@ -4,7 +4,7 @@ import { chmod, chown, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath,
 import os from 'node:os'
 import path from 'node:path'
 
-import { assertPrivateWindowsAcl, assertPrivateWindowsAclAsync, validateWindowsAcl, validateWindowsAncestorAcl, runWindowsMcpAclScriptAsync } from './OpenCodePrivateMcpAcl.js'
+import { assertPrivateWindowsAclAsync, validateWindowsAcl, validateWindowsAncestorAcl, runWindowsMcpAclScriptAsync } from './OpenCodePrivateMcpAcl.js'
 import * as lockfile from '../../utils/lockfile.js'
 import { publishPrivateCursorMcpConfig } from './OpenCodePrivateMcpConfig.js'
 
@@ -26,8 +26,8 @@ test('publishes a private first config and replacement without changing legacy c
   expect(await readFile(legacy, 'utf8')).toBe('legacy sentinel')
   if (process.platform === 'win32') {
     // Actual inherited ACLs from the runner's default temporary profile, not a mode mock.
-    assertPrivateWindowsAcl(credentialDirectory())
-    assertPrivateWindowsAcl(file)
+    await assertPrivateWindowsAclAsync(credentialDirectory())
+    await assertPrivateWindowsAclAsync(file)
   } else {
     expect((await lstat(credentialDirectory())).mode & 0o777).toBe(0o700)
     expect((await lstat(file)).mode & 0o777).toBe(0o600)
