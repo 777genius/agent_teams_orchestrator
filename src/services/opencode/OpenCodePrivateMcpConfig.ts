@@ -85,10 +85,11 @@ export async function publishPrivateCursorMcpConfig(stateRoot: string, config: u
   let lockIdentity: Stats | null = null
   try {
     // Re-check the lock after each asynchronous ACL metadata probe.
-    lockIdentity = await lstat(`${lockFile}.lock`)
+    const acquiredLock = await lstat(`${lockFile}.lock`)
+    lockIdentity = acquiredLock
     const assertLockCurrent = async () => {
       const current = await lstat(`${lockFile}.lock`).catch(() => null)
-      if (lockCompromised || !current || !sameFile(lockIdentity, current)) throw unsafe()
+      if (lockCompromised || !current || !sameFile(acquiredLock, current)) throw unsafe()
     }
     await inspectDirectory()
     const file = path.join(directory, 'opencode.json')
