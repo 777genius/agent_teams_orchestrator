@@ -4,7 +4,7 @@ import { chmod, chown, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath,
 import os from 'node:os'
 import path from 'node:path'
 
-import { assertPrivateWindowsAcl, validateWindowsAcl, validateWindowsAncestorAcl, runWindowsMcpAclScript } from './OpenCodePrivateMcpAcl.js'
+import { assertPrivateWindowsAcl, assertPrivateWindowsAclAsync, validateWindowsAcl, validateWindowsAncestorAcl, runWindowsMcpAclScript } from './OpenCodePrivateMcpAcl.js'
 import * as lockfile from '../../utils/lockfile.js'
 import { publishPrivateCursorMcpConfig } from './OpenCodePrivateMcpConfig.js'
 
@@ -38,12 +38,16 @@ test('publishes a private first config and replacement without changing legacy c
 })
 
 test('serializes parallel private publication without false inode errors or leftovers', async () => {
-  const files = await Promise.all(Array.from({ length: 8 }, (_, index) =>
+  // Windows verifies each filesystem ACL through a real PowerShell subprocess.
+  // Two simultaneous writers still prove the race without approaching the
+  // 30-second per-test budget; POSIX exercises the higher contention count.
+  const writers = process.platform === 'win32' ? 2 : 8
+  const files = await Promise.all(Array.from({ length: writers }, (_, index) =>
     publishPrivateCursorMcpConfig(root, { ...secretConfig, version: index })))
-  expect(files).toEqual(Array.from({ length: 8 }, () => credentialFile()))
+  expect(files).toEqual(Array.from({ length: writers }, () => credentialFile()))
   const result = JSON.parse(await readFile(credentialFile(), 'utf8'))
   expect(result.mcp).toEqual(secretConfig.mcp)
-  expect(Number.isInteger(result.version) && result.version >= 0 && result.version < 8).toBe(true)
+  expect(Number.isInteger(result.version) && result.version >= 0 && result.version < writers).toBe(true)
   expect(await readdir(credentialDirectory())).toEqual(['opencode.json'])
   expect(await readdir(root)).toEqual(['mcp-credentials'])
   if (process.platform !== 'win32') {
@@ -105,7 +109,8 @@ test.skipIf(process.platform !== 'win32')('accepts a case-only Windows state-roo
   const alternate = path.join(path.dirname(root), path.basename(root).toUpperCase())
   const file = await publishPrivateCursorMcpConfig(alternate, secretConfig)
   expect(JSON.parse(await readFile(file, 'utf8'))).toEqual(secretConfig)
-  assertPrivateWindowsAcl(file)
+  // Check the same async ACL boundary used during actual publication.
+  await assertPrivateWindowsAclAsync(file)
 })
 
 test.skipIf(process.platform === 'win32')('rejects an existing broad file without chmod or secret writes', async () => {
