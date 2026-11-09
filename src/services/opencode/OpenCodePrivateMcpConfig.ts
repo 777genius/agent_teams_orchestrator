@@ -67,12 +67,14 @@ export async function publishPrivateCursorMcpConfig(stateRoot: string, config: u
   await inspectDirectory()
   // Distinct runtime commands can prepare this same generation concurrently.
   // Serialize its publication without weakening the inode/ACL fail-closed checks.
-  // proper-lockfile uses a sibling lock directory outside mcp-credentials.
-  const release = await lockfile.lock(directory, {
+  // The lock directory must live *inside* the already validated 0700 root.
+  // A sibling of mcp-credentials could be exposed by a looser stateRoot mode.
+  const release = await lockfile.lock(path.join(directory, '.publication'), {
     realpath: false,
     stale: 30_000,
     update: 5_000,
-    retries: { retries: 40, minTimeout: 25, maxTimeout: 250 },
+    // Covers an abandoned lock's stale window after a killed publisher.
+    retries: { retries: 170, minTimeout: 25, maxTimeout: 250 },
   })
   try {
     await inspectDirectory()
