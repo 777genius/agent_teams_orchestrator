@@ -3,6 +3,8 @@ import { constants, type Stats } from 'node:fs'
 import { lstat, mkdir, open, realpath, rename, unlink } from 'node:fs/promises'
 import path from 'node:path'
 
+import * as lockfile from '../../utils/lockfile.js'
+
 import { assertPrivateWindowsAcl, assertSafeDarwinMcpAcl, assertWindowsMcpAncestry } from './OpenCodePrivateMcpAcl.js'
 
 // Storage boundary v1. ACL policy is ported from agent-teams-ai local-http-auth
@@ -63,44 +65,59 @@ export async function publishPrivateCursorMcpConfig(stateRoot: string, config: u
     await validatePrivate(directory, true)
   }
   await inspectDirectory()
-  const file = path.join(directory, 'opencode.json')
-  const inspectFile = async (): Promise<Stats | null> => {
-    try { await lstat(file) } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-      throw error
-    }
-    return validatePrivate(file)
-  }
-  const previous = await inspectFile()
-  const temporary = path.join(directory, `${randomUUID()}.tmp`)
-  const handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY
-    | (constants.O_NOFOLLOW ?? 0), 0o600)
-  const opened = await handle.stat()
-  let closed = false
+  // Distinct runtime commands can prepare this same generation concurrently.
+  // Serialize its publication without weakening the inode/ACL fail-closed checks.
+  // proper-lockfile uses a sibling lock directory outside mcp-credentials.
+  const release = await lockfile.lock(directory, {
+    realpath: false,
+    stale: 30_000,
+    update: 5_000,
+    retries: { retries: 40, minTimeout: 25, maxTimeout: 250 },
+  })
   try {
-    // Verify actual inherited Windows ACLs and owner/mode before writing any secret bytes.
-    const empty = await validatePrivate(temporary)
-    if (!sameFile(opened, empty) || !opened.isFile() || opened.nlink !== 1) throw unsafe()
     await inspectDirectory()
-    await handle.writeFile(`${JSON.stringify(config)}\n`, 'utf8')
-    await handle.sync()
-    await handle.close()
-    closed = true
-    await inspectDirectory()
-    const current = await inspectFile()
-    if ((previous === null) !== (current === null)
-      || (previous && current && !sameFile(previous, current))) throw unsafe()
-    if (!sameFile(opened, await validatePrivate(temporary))) throw unsafe()
-    await rename(temporary, file)
-    if (!sameFile(opened, await validatePrivate(file))) throw unsafe()
-    return file
-  } finally {
-    if (!closed) await handle.close().catch(() => undefined)
-    // Delete only our own remaining empty/staged inode, never a replacement object.
-    try {
-      if (sameFile(opened, await lstat(temporary))) await unlink(temporary)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    const file = path.join(directory, 'opencode.json')
+    const inspectFile = async (): Promise<Stats | null> => {
+      try { await lstat(file) } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+        throw error
+      }
+      return validatePrivate(file)
     }
+    const previous = await inspectFile()
+    const temporary = path.join(directory, `${randomUUID()}.tmp`)
+    const handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY
+      | (constants.O_NOFOLLOW ?? 0), 0o600)
+    const opened = await handle.stat()
+    let closed = false
+    try {
+      // Verify actual inherited Windows ACLs and owner/mode before writing any secret bytes.
+      const empty = await validatePrivate(temporary)
+      if (!sameFile(opened, empty) || !opened.isFile() || opened.nlink !== 1) throw unsafe()
+      await inspectDirectory()
+      await handle.writeFile(`${JSON.stringify(config)}\n`, 'utf8')
+      await handle.sync()
+      await handle.close()
+      closed = true
+      await inspectDirectory()
+      const current = await inspectFile()
+      if ((previous === null) !== (current === null)
+        || (previous && current && !sameFile(previous, current))) throw unsafe()
+      if (!sameFile(opened, await validatePrivate(temporary))) throw unsafe()
+      await rename(temporary, file)
+      if (!sameFile(opened, await validatePrivate(file))) throw unsafe()
+      return file
+    } finally {
+      if (!closed) await handle.close().catch(() => undefined)
+      // Delete only our own remaining empty/staged inode, never a replacement object.
+      try {
+        if (sameFile(opened, await lstat(temporary))) await unlink(temporary)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+    }
+  } finally {
+    await release()
   }
+
 }
