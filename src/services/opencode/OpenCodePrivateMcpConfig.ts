@@ -5,7 +5,7 @@ import path from 'node:path'
 
 import * as lockfile from '../../utils/lockfile.js'
 
-import { assertPrivateWindowsAcl, assertSafeDarwinMcpAcl, assertWindowsMcpAncestry } from './OpenCodePrivateMcpAcl.js'
+import { assertPrivateWindowsAclAsync, assertSafeDarwinMcpAclAsync, assertWindowsMcpAncestryAsync } from './OpenCodePrivateMcpAcl.js'
 
 // Storage boundary v1. ACL policy is ported from agent-teams-ai local-http-auth
 // windowsPrivateAcl.ts at d2f7f3df79db71b3f3718b99636f352d46d2402d;
@@ -22,7 +22,7 @@ async function validateAncestry(root: string): Promise<void> {
     const entry = await lstat(cursor)
     ancestors.push(cursor)
     if (!entry.isDirectory() || entry.isSymbolicLink()) throw unsafe()
-    if (process.platform === 'darwin') assertSafeDarwinMcpAcl(cursor, false)
+    if (process.platform === 'darwin') await assertSafeDarwinMcpAclAsync(cursor, false)
     if (process.getuid) {
       const owner = process.getuid()
       // Root-owned sticky system temp directories cannot rename another user's child.
@@ -38,7 +38,7 @@ async function validateAncestry(root: string): Promise<void> {
   const canonicalRoot = await realpath(root)
   // Windows realpath may normalize directory lettercase without changing identity.
   if ((process.platform === 'win32' ? canonicalRoot.toLowerCase() !== root.toLowerCase() : canonicalRoot !== root)) throw unsafe()
-  if (process.platform === 'win32') assertWindowsMcpAncestry(ancestors)
+  if (process.platform === 'win32') await assertWindowsMcpAncestryAsync(ancestors)
 }
 
 async function validatePrivate(target: string, directory = false): Promise<Stats> {
@@ -47,8 +47,8 @@ async function validatePrivate(target: string, directory = false): Promise<Stats
     || (!directory && entry.nlink !== 1)
     || (process.getuid && (entry.uid !== process.getuid()
       || (entry.mode & 0o777) !== (directory ? 0o700 : 0o600)))) throw unsafe()
-  if (process.platform === 'win32') assertPrivateWindowsAcl(target)
-  if (process.platform === 'darwin') assertSafeDarwinMcpAcl(target, true)
+  if (process.platform === 'win32') await assertPrivateWindowsAclAsync(target)
+  if (process.platform === 'darwin') await assertSafeDarwinMcpAclAsync(target, true)
   return entry
 }
 
@@ -81,9 +81,9 @@ export async function publishPrivateCursorMcpConfig(stateRoot: string, config: u
     // Covers an abandoned lock's stale window after a killed publisher.
     retries: { retries: 170, minTimeout: 25, maxTimeout: 250 },
   })
+  let publicationFailed = false
   try {
-    // An asynchronous inode recheck also yields to the lock heartbeat after
-    // synchronous platform ACL probes. Never publish under a stolen lock.
+    // Re-check the lock after each asynchronous ACL metadata probe.
     const lockIdentity = await lstat(`${lockFile}.lock`)
     const assertLockCurrent = async () => {
       const current = await lstat(`${lockFile}.lock`).catch(() => null)
@@ -132,7 +132,16 @@ export async function publishPrivateCursorMcpConfig(stateRoot: string, config: u
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       }
     }
+  } catch (error) {
+    publicationFailed = true
+    throw error
   } finally {
-    await release()
+    try {
+      await release()
+    } catch (error) {
+      // Preserve the original security/IO failure, not a secondary cleanup error
+      // from a lock that was compromised after that failure.
+      if (!publicationFailed) throw error
+    }
   }
 }
