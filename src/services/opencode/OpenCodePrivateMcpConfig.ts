@@ -82,9 +82,10 @@ export async function publishPrivateCursorMcpConfig(stateRoot: string, config: u
     retries: { retries: 170, minTimeout: 25, maxTimeout: 250 },
   })
   let publicationFailed = false
+  let lockIdentity: Stats | null = null
   try {
     // Re-check the lock after each asynchronous ACL metadata probe.
-    const lockIdentity = await lstat(`${lockFile}.lock`)
+    lockIdentity = await lstat(`${lockFile}.lock`)
     const assertLockCurrent = async () => {
       const current = await lstat(`${lockFile}.lock`).catch(() => null)
       if (lockCompromised || !current || !sameFile(lockIdentity, current)) throw unsafe()
@@ -136,12 +137,17 @@ export async function publishPrivateCursorMcpConfig(stateRoot: string, config: u
     publicationFailed = true
     throw error
   } finally {
-    try {
-      await release()
-    } catch (error) {
-      // Preserve the original security/IO failure, not a secondary cleanup error
-      // from a lock that was compromised after that failure.
-      if (!publicationFailed) throw error
+    // A recovered lease may now belong to another publisher. Never call the
+    // release API against an inode we no longer own; it uses the pathname.
+    const currentLock = await lstat(`${lockFile}.lock`).catch(() => null)
+    if (!lockCompromised && lockIdentity && currentLock && sameFile(lockIdentity, currentLock)) {
+      try {
+        await release()
+      } catch (error) {
+        // Preserve the original security/IO failure, not a secondary cleanup error
+        // from a lock that was compromised after that failure.
+        if (!publicationFailed) throw error
+      }
     }
   }
 }
