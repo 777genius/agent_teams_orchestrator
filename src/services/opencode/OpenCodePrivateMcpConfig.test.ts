@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { execFileSync } from 'node:child_process'
-import { chmod, chown, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, chown, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -49,6 +49,17 @@ test('serializes parallel private publication without false inode errors or left
     expect((await lstat(credentialFile())).mode & 0o777).toBe(0o600)
     expect((await lstat(credentialDirectory())).mode & 0o777).toBe(0o700)
   }
+})
+
+test('recovers an abandoned publication lock without leaving stale state', async () => {
+  await mkdir(credentialDirectory(), { mode: 0o700 })
+  const lock = path.join(credentialDirectory(), '.publication.lock')
+  await mkdir(lock, { mode: 0o700 })
+  const expired = new Date(Date.now() - 40_000)
+  await utimes(lock, expired, expired)
+  await publishPrivateCursorMcpConfig(root, secretConfig)
+  expect(JSON.parse(await readFile(credentialFile(), 'utf8'))).toEqual(secretConfig)
+  expect(await readdir(credentialDirectory())).toEqual(['opencode.json'])
 })
 
 test('serializes independent runtime processes preparing the same credential generation', async () => {
