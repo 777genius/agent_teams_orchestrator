@@ -213,7 +213,7 @@ test.skipIf(process.platform !== 'win32')('rejects an actual writable Windows an
   await runWindowsMcpAclScriptAsync(script)
   await expect(publishPrivateCursorMcpConfig(state, secretConfig)).rejects.toThrow('not private')
   expect(await readdir(state)).toEqual([])
-  expect(() => assertPrivateWindowsAcl(root)).toThrow()
+  await expect(assertPrivateWindowsAclAsync(root)).rejects.toThrow()
 })
 
 test.skipIf(process.platform !== 'win32')('uses the trusted WinPS5 module context without inheriting a credential environment', () => {
