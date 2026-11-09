@@ -4,7 +4,7 @@ import { chmod, chown, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath,
 import os from 'node:os'
 import path from 'node:path'
 
-import { assertPrivateWindowsAcl, assertPrivateWindowsAclAsync, validateWindowsAcl, validateWindowsAncestorAcl, runWindowsMcpAclScript } from './OpenCodePrivateMcpAcl.js'
+import { assertPrivateWindowsAcl, assertPrivateWindowsAclAsync, validateWindowsAcl, validateWindowsAncestorAcl, runWindowsMcpAclScript, runWindowsMcpAclScriptAsync } from './OpenCodePrivateMcpAcl.js'
 import * as lockfile from '../../utils/lockfile.js'
 import { publishPrivateCursorMcpConfig } from './OpenCodePrivateMcpConfig.js'
 
@@ -201,7 +201,7 @@ test.skipIf(process.platform !== 'darwin')('rejects actual macOS allow ACLs desp
 test.skipIf(process.platform !== 'win32')('rejects an actual broad Windows file ACL before replacing its bytes', async () => {
   const file = await publishPrivateCursorMcpConfig(root, { sentinel: true })
   const script = `$p='${file.replace(/'/g, "''")}'; $a=[System.IO.File]::GetAccessControl($p); $r=[System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),[System.Security.AccessControl.FileSystemRights]::Read,[System.Security.AccessControl.AccessControlType]::Allow); $a.AddAccessRule($r); [System.IO.File]::SetAccessControl($p,$a)`
-  runWindowsMcpAclScript(script)
+  await runWindowsMcpAclScriptAsync(script)
   await expect(publishPrivateCursorMcpConfig(root, secretConfig)).rejects.toThrow('not private')
   expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({ sentinel: true })
 })
@@ -210,7 +210,7 @@ test.skipIf(process.platform !== 'win32')('rejects an actual writable Windows an
   const state = path.join(root, 'generation-state')
   await mkdir(state)
   const script = `$p='${root.replace(/'/g, "''")}'; $a=[System.IO.Directory]::GetAccessControl($p); $r=[System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),[System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,[System.Security.AccessControl.AccessControlType]::Allow); $a.AddAccessRule($r); [System.IO.Directory]::SetAccessControl($p,$a)`
-  runWindowsMcpAclScript(script)
+  await runWindowsMcpAclScriptAsync(script)
   await expect(publishPrivateCursorMcpConfig(state, secretConfig)).rejects.toThrow('not private')
   expect(await readdir(state)).toEqual([])
   expect(() => assertPrivateWindowsAcl(root)).toThrow()
