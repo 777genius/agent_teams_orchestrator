@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
-import { execFileSync } from 'node:child_process'
-import { chmod, chown, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { execFileSync, spawn } from 'node:child_process'
+import { chmod, chown, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { assertPrivateWindowsAcl, validateWindowsAcl, validateWindowsAncestorAcl, runWindowsMcpAclScript } from './OpenCodePrivateMcpAcl.js'
+import { assertPrivateWindowsAclAsync, validateWindowsAcl, validateWindowsAncestorAcl, runWindowsMcpAclScriptAsync } from './OpenCodePrivateMcpAcl.js'
+import * as lockfile from '../../utils/lockfile.js'
 import { publishPrivateCursorMcpConfig } from './OpenCodePrivateMcpConfig.js'
 
 let root: string
@@ -25,8 +26,8 @@ test('publishes a private first config and replacement without changing legacy c
   expect(await readFile(legacy, 'utf8')).toBe('legacy sentinel')
   if (process.platform === 'win32') {
     // Actual inherited ACLs from the runner's default temporary profile, not a mode mock.
-    assertPrivateWindowsAcl(credentialDirectory())
-    assertPrivateWindowsAcl(file)
+    await assertPrivateWindowsAclAsync(credentialDirectory())
+    await assertPrivateWindowsAclAsync(file)
   } else {
     expect((await lstat(credentialDirectory())).mode & 0o777).toBe(0o700)
     expect((await lstat(file)).mode & 0o777).toBe(0o600)
@@ -36,11 +37,80 @@ test('publishes a private first config and replacement without changing legacy c
   expect(await readdir(credentialDirectory())).toEqual(['opencode.json'])
 })
 
+test('serializes parallel private publication without false inode errors or leftovers', async () => {
+  // Windows verifies each filesystem ACL through a real PowerShell subprocess.
+  // Two simultaneous writers still prove the race without approaching the
+  // 30-second per-test budget; POSIX exercises the higher contention count.
+  const writers = process.platform === 'win32' ? 2 : 8
+  const files = await Promise.all(Array.from({ length: writers }, (_, index) =>
+    publishPrivateCursorMcpConfig(root, { ...secretConfig, version: index })))
+  expect(files).toEqual(Array.from({ length: writers }, () => credentialFile()))
+  const result = JSON.parse(await readFile(credentialFile(), 'utf8'))
+  expect(result.mcp).toEqual(secretConfig.mcp)
+  expect(Number.isInteger(result.version) && result.version >= 0 && result.version < writers).toBe(true)
+  expect(await readdir(credentialDirectory())).toEqual(['opencode.json'])
+  expect(await readdir(root)).toEqual(['mcp-credentials'])
+  if (process.platform !== 'win32') {
+    expect((await lstat(credentialFile())).mode & 0o777).toBe(0o600)
+    expect((await lstat(credentialDirectory())).mode & 0o777).toBe(0o700)
+  }
+})
+
+test('recovers an abandoned publication lock without leaving stale state', async () => {
+  await mkdir(credentialDirectory(), { mode: 0o700 })
+  const lock = path.join(credentialDirectory(), '.publication.lock')
+  await mkdir(lock, { mode: 0o700 })
+  const expired = new Date(Date.now() - 40_000)
+  await utimes(lock, expired, expired)
+  await publishPrivateCursorMcpConfig(root, secretConfig)
+  expect(JSON.parse(await readFile(credentialFile(), 'utf8'))).toEqual(secretConfig)
+  expect(await readdir(credentialDirectory())).toEqual(['opencode.json'])
+})
+
+test('serializes publication across processes while another process owns the lock', async () => {
+  await mkdir(credentialDirectory(), { mode: 0o700 })
+  const release = await lockfile.lock(path.join(credentialDirectory(), '.publication'), {
+    realpath: false,
+    stale: 30_000,
+    update: 5_000,
+  })
+  const source = new URL('./OpenCodePrivateMcpConfig.ts', import.meta.url).href
+  const script = `const { publishPrivateCursorMcpConfig } = await import(${JSON.stringify(source)}); process.stdout.write('ready\\n'); await publishPrivateCursorMcpConfig(${JSON.stringify(root)}, { source: 'child' });`
+  const child = spawn(process.execPath, ['-e', script], { stdio: ['ignore', 'pipe', 'inherit'] })
+  const completed = new Promise<number | null>((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', resolve)
+  })
+  let exited = false
+  void completed.then(() => { exited = true }, () => { exited = true })
+  let released = false
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.stdout.once('data', (chunk: Buffer) =>
+        chunk.toString('utf8').includes('ready') ? resolve() : reject(new Error('Child not ready')))
+      child.once('error', reject)
+    })
+    // Child is ready to publish, but cannot pass a lock held by this process.
+    await Bun.sleep(500)
+    expect(exited).toBe(false)
+    expect(await readdir(credentialDirectory())).toEqual(['.publication.lock'])
+    await release()
+    released = true
+    expect(await completed).toBe(0)
+  } finally {
+    if (!released) await release()
+    child.kill()
+  }
+  expect(JSON.parse(await readFile(credentialFile(), 'utf8'))).toEqual({ source: 'child' })
+  expect(await readdir(credentialDirectory())).toEqual(['opencode.json'])
+}, 30_000)
+
 test.skipIf(process.platform !== 'win32')('accepts a case-only Windows state-root spelling with original ACL checks', async () => {
   const alternate = path.join(path.dirname(root), path.basename(root).toUpperCase())
   const file = await publishPrivateCursorMcpConfig(alternate, secretConfig)
   expect(JSON.parse(await readFile(file, 'utf8'))).toEqual(secretConfig)
-  assertPrivateWindowsAcl(file)
+  // Check the same async ACL boundary used during actual publication.
+  await assertPrivateWindowsAclAsync(file)
 })
 
 test.skipIf(process.platform === 'win32')('rejects an existing broad file without chmod or secret writes', async () => {
@@ -131,7 +201,7 @@ test.skipIf(process.platform !== 'darwin')('rejects actual macOS allow ACLs desp
 test.skipIf(process.platform !== 'win32')('rejects an actual broad Windows file ACL before replacing its bytes', async () => {
   const file = await publishPrivateCursorMcpConfig(root, { sentinel: true })
   const script = `$p='${file.replace(/'/g, "''")}'; $a=[System.IO.File]::GetAccessControl($p); $r=[System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),[System.Security.AccessControl.FileSystemRights]::Read,[System.Security.AccessControl.AccessControlType]::Allow); $a.AddAccessRule($r); [System.IO.File]::SetAccessControl($p,$a)`
-  runWindowsMcpAclScript(script)
+  await runWindowsMcpAclScriptAsync(script)
   await expect(publishPrivateCursorMcpConfig(root, secretConfig)).rejects.toThrow('not private')
   expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({ sentinel: true })
 })
@@ -140,24 +210,24 @@ test.skipIf(process.platform !== 'win32')('rejects an actual writable Windows an
   const state = path.join(root, 'generation-state')
   await mkdir(state)
   const script = `$p='${root.replace(/'/g, "''")}'; $a=[System.IO.Directory]::GetAccessControl($p); $r=[System.Security.AccessControl.FileSystemAccessRule]::new([System.Security.Principal.SecurityIdentifier]::new('S-1-1-0'),[System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,[System.Security.AccessControl.AccessControlType]::Allow); $a.AddAccessRule($r); [System.IO.Directory]::SetAccessControl($p,$a)`
-  runWindowsMcpAclScript(script)
+  await runWindowsMcpAclScriptAsync(script)
   await expect(publishPrivateCursorMcpConfig(state, secretConfig)).rejects.toThrow('not private')
   expect(await readdir(state)).toEqual([])
-  expect(() => assertPrivateWindowsAcl(root)).toThrow()
+  await expect(assertPrivateWindowsAclAsync(root)).rejects.toThrow()
 })
 
-test.skipIf(process.platform !== 'win32')('uses the trusted WinPS5 module context without inheriting a credential environment', () => {
+test.skipIf(process.platform !== 'win32')('uses the trusted WinPS5 module context without inheriting a credential environment', async () => {
   const oldModulePath = process.env.PSModulePath
   const secretKey = 'CLAUDE_MULTIMODEL_AGENT_TEAMS_MCP_HEADERS_JSON'
   const oldCredential = process.env[secretKey]
   try {
     process.env.PSModulePath = 'C:\\TEST-incompatible-PowerShell7-modules'
     process.env[secretKey] = 'TEST-synthetic-credential-must-not-enter-ACL-child'
-    const actual = JSON.parse(runWindowsMcpAclScript(`@{major=$PSVersionTable.PSVersion.Major;modulePath=$env:PSModulePath;inheritedCredential=[bool][System.Environment]::GetEnvironmentVariable('${secretKey}')} | ConvertTo-Json -Compress`))
+    const actual = JSON.parse(await runWindowsMcpAclScriptAsync(`@{major=$PSVersionTable.PSVersion.Major;modulePath=$env:PSModulePath;inheritedCredential=[bool][System.Environment]::GetEnvironmentVariable('${secretKey}')} | ConvertTo-Json -Compress`))
     expect(actual.major).toBe(5)
     expect(actual.modulePath.toLowerCase()).toBe(path.win32.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'Modules').toLowerCase())
     expect(actual.inheritedCredential).toBe(false)
-    assertPrivateWindowsAcl(root)
+    await assertPrivateWindowsAclAsync(root)
   } finally {
     if (oldModulePath === undefined) delete process.env.PSModulePath
     else process.env.PSModulePath = oldModulePath

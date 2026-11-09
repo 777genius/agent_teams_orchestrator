@@ -3,7 +3,9 @@ import { constants, type Stats } from 'node:fs'
 import { lstat, mkdir, open, realpath, rename, unlink } from 'node:fs/promises'
 import path from 'node:path'
 
-import { assertPrivateWindowsAcl, assertSafeDarwinMcpAcl, assertWindowsMcpAncestry } from './OpenCodePrivateMcpAcl.js'
+import * as lockfile from '../../utils/lockfile.js'
+
+import { assertPrivateWindowsAclAsync, assertSafeDarwinMcpAclAsync, assertWindowsMcpAncestryAsync } from './OpenCodePrivateMcpAcl.js'
 
 // Storage boundary v1. ACL policy is ported from agent-teams-ai local-http-auth
 // windowsPrivateAcl.ts at d2f7f3df79db71b3f3718b99636f352d46d2402d;
@@ -20,7 +22,7 @@ async function validateAncestry(root: string): Promise<void> {
     const entry = await lstat(cursor)
     ancestors.push(cursor)
     if (!entry.isDirectory() || entry.isSymbolicLink()) throw unsafe()
-    if (process.platform === 'darwin') assertSafeDarwinMcpAcl(cursor, false)
+    if (process.platform === 'darwin') await assertSafeDarwinMcpAclAsync(cursor, false)
     if (process.getuid) {
       const owner = process.getuid()
       // Root-owned sticky system temp directories cannot rename another user's child.
@@ -36,7 +38,7 @@ async function validateAncestry(root: string): Promise<void> {
   const canonicalRoot = await realpath(root)
   // Windows realpath may normalize directory lettercase without changing identity.
   if ((process.platform === 'win32' ? canonicalRoot.toLowerCase() !== root.toLowerCase() : canonicalRoot !== root)) throw unsafe()
-  if (process.platform === 'win32') assertWindowsMcpAncestry(ancestors)
+  if (process.platform === 'win32') await assertWindowsMcpAncestryAsync(ancestors)
 }
 
 async function validatePrivate(target: string, directory = false): Promise<Stats> {
@@ -45,8 +47,8 @@ async function validatePrivate(target: string, directory = false): Promise<Stats
     || (!directory && entry.nlink !== 1)
     || (process.getuid && (entry.uid !== process.getuid()
       || (entry.mode & 0o777) !== (directory ? 0o700 : 0o600)))) throw unsafe()
-  if (process.platform === 'win32') assertPrivateWindowsAcl(target)
-  if (process.platform === 'darwin') assertSafeDarwinMcpAcl(target, true)
+  if (process.platform === 'win32') await assertPrivateWindowsAclAsync(target)
+  if (process.platform === 'darwin') await assertSafeDarwinMcpAclAsync(target, true)
   return entry
 }
 
@@ -63,44 +65,90 @@ export async function publishPrivateCursorMcpConfig(stateRoot: string, config: u
     await validatePrivate(directory, true)
   }
   await inspectDirectory()
-  const file = path.join(directory, 'opencode.json')
-  const inspectFile = async (): Promise<Stats | null> => {
-    try { await lstat(file) } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-      throw error
-    }
-    return validatePrivate(file)
-  }
-  const previous = await inspectFile()
-  const temporary = path.join(directory, `${randomUUID()}.tmp`)
-  const handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY
-    | (constants.O_NOFOLLOW ?? 0), 0o600)
-  const opened = await handle.stat()
-  let closed = false
+  // Distinct runtime commands can prepare this same generation concurrently.
+  // Serialize its publication without weakening the inode/ACL fail-closed checks.
+  // The lock directory must live *inside* the already validated 0700 root.
+  // A sibling of mcp-credentials could be exposed by a looser stateRoot mode.
+  let lockCompromised = false
+  const lockFile = path.join(directory, '.publication')
+  const release = await lockfile.lock(lockFile, {
+    realpath: false,
+    stale: 30_000,
+    update: 5_000,
+    // Never throw asynchronously from the lock heartbeat; fail closed on the
+    // publication path instead if ownership has been lost.
+    onCompromised: () => { lockCompromised = true },
+    // Covers an abandoned lock's stale window after a killed publisher.
+    retries: { retries: 170, minTimeout: 25, maxTimeout: 250 },
+  })
+  let publicationFailed = false
+  let lockIdentity: Stats | null = null
   try {
-    // Verify actual inherited Windows ACLs and owner/mode before writing any secret bytes.
-    const empty = await validatePrivate(temporary)
-    if (!sameFile(opened, empty) || !opened.isFile() || opened.nlink !== 1) throw unsafe()
+    // Re-check the lock after each asynchronous ACL metadata probe.
+    const acquiredLock = await lstat(`${lockFile}.lock`)
+    lockIdentity = acquiredLock
+    const assertLockCurrent = async () => {
+      const current = await lstat(`${lockFile}.lock`).catch(() => null)
+      if (lockCompromised || !current || !sameFile(acquiredLock, current)) throw unsafe()
+    }
     await inspectDirectory()
-    await handle.writeFile(`${JSON.stringify(config)}\n`, 'utf8')
-    await handle.sync()
-    await handle.close()
-    closed = true
-    await inspectDirectory()
-    const current = await inspectFile()
-    if ((previous === null) !== (current === null)
-      || (previous && current && !sameFile(previous, current))) throw unsafe()
-    if (!sameFile(opened, await validatePrivate(temporary))) throw unsafe()
-    await rename(temporary, file)
-    if (!sameFile(opened, await validatePrivate(file))) throw unsafe()
-    return file
-  } finally {
-    if (!closed) await handle.close().catch(() => undefined)
-    // Delete only our own remaining empty/staged inode, never a replacement object.
+    const file = path.join(directory, 'opencode.json')
+    const inspectFile = async (): Promise<Stats | null> => {
+      try { await lstat(file) } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+        throw error
+      }
+      return validatePrivate(file)
+    }
+    const previous = await inspectFile()
+    const temporary = path.join(directory, `${randomUUID()}.tmp`)
+    const handle = await open(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY
+      | (constants.O_NOFOLLOW ?? 0), 0o600)
+    const opened = await handle.stat()
+    let closed = false
     try {
-      if (sameFile(opened, await lstat(temporary))) await unlink(temporary)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      // Verify actual inherited Windows ACLs and owner/mode before writing any secret bytes.
+      const empty = await validatePrivate(temporary)
+      if (!sameFile(opened, empty) || !opened.isFile() || opened.nlink !== 1) throw unsafe()
+      await inspectDirectory()
+      await handle.writeFile(`${JSON.stringify(config)}\n`, 'utf8')
+      await handle.sync()
+      await handle.close()
+      closed = true
+      await inspectDirectory()
+      const current = await inspectFile()
+      if ((previous === null) !== (current === null)
+        || (previous && current && !sameFile(previous, current))) throw unsafe()
+      if (!sameFile(opened, await validatePrivate(temporary))) throw unsafe()
+      await assertLockCurrent()
+      await rename(temporary, file)
+      if (!sameFile(opened, await validatePrivate(file))) throw unsafe()
+      await assertLockCurrent()
+      return file
+    } finally {
+      if (!closed) await handle.close().catch(() => undefined)
+      // Delete only our own remaining empty/staged inode, never a replacement object.
+      try {
+        if (sameFile(opened, await lstat(temporary))) await unlink(temporary)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+    }
+  } catch (error) {
+    publicationFailed = true
+    throw error
+  } finally {
+    // A recovered lease may now belong to another publisher. Never call the
+    // release API against an inode we no longer own; it uses the pathname.
+    const currentLock = await lstat(`${lockFile}.lock`).catch(() => null)
+    if (!lockCompromised && lockIdentity && currentLock && sameFile(lockIdentity, currentLock)) {
+      try {
+        await release()
+      } catch (error) {
+        // Preserve the original security/IO failure, not a secondary cleanup error
+        // from a lock that was compromised after that failure.
+        if (!publicationFailed) throw error
+      }
     }
   }
 }

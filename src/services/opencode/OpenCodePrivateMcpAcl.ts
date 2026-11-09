@@ -1,13 +1,29 @@
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
 import path from 'node:path';
 import { userInfo } from 'node:os';
 
+const execFileAsync = promisify(execFile);
+
 /** macOS named allow-ACLs are independent of POSIX mode bits. Never pass file contents. */
+const darwinAclOptions = {
+  encoding: 'utf8' as const, timeout: 5_000, env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' },
+};
+
 export function assertSafeDarwinMcpAcl(file: string, privateObject: boolean): void {
   const listing = execFileSync('/bin/ls', ['-lde', file], {
-    encoding: 'utf8', timeout: 5_000, env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' },
-    stdio: ['ignore', 'pipe', 'pipe'],
+    ...darwinAclOptions, stdio: ['ignore', 'pipe', 'pipe'],
   });
+  validateDarwinMcpAclListing(listing, privateObject);
+}
+
+/** Used under a publication lock so ACL subprocesses cannot starve its heartbeat. */
+export async function assertSafeDarwinMcpAclAsync(file: string, privateObject: boolean): Promise<void> {
+  const { stdout } = await execFileAsync('/bin/ls', ['-lde', file], darwinAclOptions);
+  validateDarwinMcpAclListing(stdout, privateObject);
+}
+
+function validateDarwinMcpAclListing(listing: string, privateObject: boolean): void {
   const lines = listing.trimEnd().split('\n');
   if (!/^[d-][rwxStTs-]{9}[+@]?\s/.test(lines[0] ?? '')) {
     throw new Error('Cursor MCP credential ACL could not be verified');
@@ -84,7 +100,7 @@ export function validateWindowsAcl(snapshot: WindowsAclSnapshot): void {
 
 export type WindowsAclRunner = (script: string) => string;
 /** Trusted WinPS5 toolchain only, including when the parent was PowerShell 7 through Bun. */
-export const runWindowsMcpAclScript: WindowsAclRunner = (script) => {
+function windowsMcpAclCommand(script: string) {
   const windowsRoot = process.env.SystemRoot ?? 'C:\\Windows';
   const powerShellHome = path.win32.join(
     windowsRoot,
@@ -96,16 +112,16 @@ export const runWindowsMcpAclScript: WindowsAclRunner = (script) => {
   // Implicit module discovery can select PS7 modules in an indirect WinPS5 child.
   // Load only the OS-shipped JSON cmdlet module; ACL reads use .NET Framework directly.
   const bootstrap = "$ErrorActionPreference='Stop'; $PSModuleAutoLoadingPreference='None'; $env:PSModulePath=[System.IO.Path]::Combine($PSHOME,'Modules'); Import-Module -Name ([System.IO.Path]::Combine($PSHOME,'Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1')) -ErrorAction Stop; ";
-  return execFileSync(
+  return {
     executable,
-    [
+    args: [
       '-NoProfile',
       '-NonInteractive',
       '-EncodedCommand',
       Buffer.from(bootstrap + script, 'utf16le').toString('base64'),
     ],
-    {
-      encoding: 'utf8',
+    options: {
+      encoding: 'utf8' as const,
       env: {
         SystemRoot: windowsRoot,
         WINDIR: windowsRoot,
@@ -116,35 +132,73 @@ export const runWindowsMcpAclScript: WindowsAclRunner = (script) => {
       },
       timeout: 10_000,
       windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }
-  );
+    },
+  };
+}
+
+export const runWindowsMcpAclScript: WindowsAclRunner = (script) => {
+  const { executable, args, options } = windowsMcpAclCommand(script);
+  return execFileSync(executable, args, {
+    ...options, stdio: ['ignore', 'pipe', 'pipe'],
+  });
 };
 
+export async function runWindowsMcpAclScriptAsync(script: string): Promise<string> {
+  const { executable, args, options } = windowsMcpAclCommand(script);
+  const { stdout } = await execFileAsync(executable, args, options);
+  return stdout;
+}
+
 /** Read effective filesystem ACLs; failure/malformed output fails closed. No credential is passed to a process. */
-export function assertPrivateWindowsAcl(file: string, runner: WindowsAclRunner = runWindowsMcpAclScript): void {
+function privateWindowsAclScript(file: string): string {
   const literal = file.replace(/'/g, "''");
-  const script = `$u=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $p='${literal}'; $a=if ([System.IO.Directory]::Exists($p)) { [System.IO.Directory]::GetAccessControl($p) } else { [System.IO.File]::GetAccessControl($p) }; @{userSid=$u;ownerSid=$a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;rules=@($a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | ForEach-Object { @{sid=$_.IdentityReference.Value;type=$_.AccessControlType.ToString()} })} | ConvertTo-Json -Compress -Depth 4`;
+  return `$u=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $p='${literal}'; $a=if ([System.IO.Directory]::Exists($p)) { [System.IO.Directory]::GetAccessControl($p) } else { [System.IO.File]::GetAccessControl($p) }; @{userSid=$u;ownerSid=$a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;rules=@($a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | ForEach-Object { @{sid=$_.IdentityReference.Value;type=$_.AccessControlType.ToString()} })} | ConvertTo-Json -Compress -Depth 4`;
+}
+
+export function assertPrivateWindowsAcl(file: string, runner: WindowsAclRunner = runWindowsMcpAclScript): void {
   try {
-    validateWindowsAcl(JSON.parse(runner(script)) as WindowsAclSnapshot);
+    validateWindowsAcl(JSON.parse(runner(privateWindowsAclScript(file))) as WindowsAclSnapshot);
+  } catch {
+    throw new Error('API credential ACL is not private to the current Windows user');
+  }
+}
+
+export async function assertPrivateWindowsAclAsync(file: string): Promise<void> {
+  try {
+    validateWindowsAcl(JSON.parse(await runWindowsMcpAclScriptAsync(privateWindowsAclScript(file))) as WindowsAclSnapshot);
   } catch {
     throw new Error('API credential ACL is not private to the current Windows user');
   }
 }
 
 /** One metadata-only command checks the private root and every existing ancestor. */
-export function assertWindowsMcpAncestry(paths: string[], runner: WindowsAclRunner = runWindowsMcpAclScript): void {
+function windowsMcpAncestryScript(paths: string[]): string {
   const literals = paths.map(file => `'${file.replace(/'/g, "''")}'`).join(',');
-  const script = `$u=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; @(${literals}) | ForEach-Object { $p=$_; $a=[System.IO.Directory]::GetAccessControl($p); @{path=$p;userSid=$u;ownerSid=$a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;rules=@($a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | ForEach-Object { @{sid=$_.IdentityReference.Value;type=$_.AccessControlType.ToString();rights=[long]$_.FileSystemRights;inheritOnly=[bool]($_.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly)} })} } | ConvertTo-Json -Compress -Depth 5`;
+  return `$u=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; @(${literals}) | ForEach-Object { $p=$_; $a=[System.IO.Directory]::GetAccessControl($p); @{path=$p;userSid=$u;ownerSid=$a.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;rules=@($a.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier]) | ForEach-Object { @{sid=$_.IdentityReference.Value;type=$_.AccessControlType.ToString();rights=[long]$_.FileSystemRights;inheritOnly=[bool]($_.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly)} })} } | ConvertTo-Json -Compress -Depth 5`;
+}
+
+function validateWindowsMcpAncestryReply(paths: string[], output: string): void {
+  const parsed: unknown = JSON.parse(output);
+  const records = Array.isArray(parsed) ? parsed : [parsed];
+  if (!paths.length || records.length !== paths.length) throw new Error('Invalid ACL ancestry');
+  for (const [index, record] of records.entries()) {
+    if (!record || typeof record !== 'object' || record.path !== paths[index]) throw new Error('Invalid ACL ancestry');
+    validateWindowsAncestorAcl(record as WindowsAclSnapshot);
+  }
+  validateWindowsAcl(records[0] as WindowsAclSnapshot);
+}
+
+export function assertWindowsMcpAncestry(paths: string[], runner: WindowsAclRunner = runWindowsMcpAclScript): void {
   try {
-    const parsed: unknown = JSON.parse(runner(script));
-    const records = Array.isArray(parsed) ? parsed : [parsed];
-    if (!paths.length || records.length !== paths.length) throw new Error('Invalid ACL ancestry');
-    for (const [index, record] of records.entries()) {
-      if (!record || typeof record !== 'object' || record.path !== paths[index]) throw new Error('Invalid ACL ancestry');
-      validateWindowsAncestorAcl(record as WindowsAclSnapshot);
-    }
-    validateWindowsAcl(records[0] as WindowsAclSnapshot);
+    validateWindowsMcpAncestryReply(paths, runner(windowsMcpAncestryScript(paths)));
+  } catch {
+    throw new Error('Cursor MCP ancestor ACL is not private and owner controlled');
+  }
+}
+
+export async function assertWindowsMcpAncestryAsync(paths: string[]): Promise<void> {
+  try {
+    validateWindowsMcpAncestryReply(paths, await runWindowsMcpAclScriptAsync(windowsMcpAncestryScript(paths)));
   } catch {
     throw new Error('Cursor MCP ancestor ACL is not private and owner controlled');
   }
