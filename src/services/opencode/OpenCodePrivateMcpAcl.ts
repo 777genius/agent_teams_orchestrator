@@ -143,7 +143,7 @@ export const runWindowsMcpAclScript: WindowsAclRunner = (script) => {
   });
 };
 
-async function runWindowsMcpAclScriptAsync(script: string): Promise<string> {
+export async function runWindowsMcpAclScriptAsync(script: string): Promise<string> {
   const { executable, args, options } = windowsMcpAclCommand(script);
   const { stdout } = await execFileAsync(executable, args, options);
   return stdout;
