@@ -69,10 +69,15 @@ export async function publishPrivateCursorMcpConfig(stateRoot: string, config: u
   // Serialize its publication without weakening the inode/ACL fail-closed checks.
   // The lock directory must live *inside* the already validated 0700 root.
   // A sibling of mcp-credentials could be exposed by a looser stateRoot mode.
+  let lockCompromised = false
+  const assertLockCurrent = () => { if (lockCompromised) throw unsafe() }
   const release = await lockfile.lock(path.join(directory, '.publication'), {
     realpath: false,
     stale: 30_000,
     update: 5_000,
+    // Never throw asynchronously from the lock heartbeat; fail closed on the
+    // publication path instead if ownership has been lost.
+    onCompromised: () => { lockCompromised = true },
     // Covers an abandoned lock's stale window after a killed publisher.
     retries: { retries: 170, minTimeout: 25, maxTimeout: 250 },
   })
@@ -106,8 +111,10 @@ export async function publishPrivateCursorMcpConfig(stateRoot: string, config: u
       if ((previous === null) !== (current === null)
         || (previous && current && !sameFile(previous, current))) throw unsafe()
       if (!sameFile(opened, await validatePrivate(temporary))) throw unsafe()
+      assertLockCurrent()
       await rename(temporary, file)
       if (!sameFile(opened, await validatePrivate(file))) throw unsafe()
+      assertLockCurrent()
       return file
     } finally {
       if (!closed) await handle.close().catch(() => undefined)
