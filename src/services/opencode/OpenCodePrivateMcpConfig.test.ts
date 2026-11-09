@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { chmod, chown, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, utimes, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
 import { assertPrivateWindowsAcl, validateWindowsAcl, validateWindowsAncestorAcl, runWindowsMcpAclScript } from './OpenCodePrivateMcpAcl.js'
+import * as lockfile from '../../utils/lockfile.js'
 import { publishPrivateCursorMcpConfig } from './OpenCodePrivateMcpConfig.js'
 
 let root: string
@@ -62,19 +63,42 @@ test('recovers an abandoned publication lock without leaving stale state', async
   expect(await readdir(credentialDirectory())).toEqual(['opencode.json'])
 })
 
-test('serializes independent runtime processes preparing the same credential generation', async () => {
+test('serializes publication across processes while another process owns the lock', async () => {
+  await mkdir(credentialDirectory(), { mode: 0o700 })
+  const release = await lockfile.lock(path.join(credentialDirectory(), '.publication'), {
+    realpath: false,
+    stale: 30_000,
+    update: 5_000,
+  })
   const source = new URL('./OpenCodePrivateMcpConfig.ts', import.meta.url).href
-  const script = `const { publishPrivateCursorMcpConfig } = await import(${JSON.stringify(source)}); await publishPrivateCursorMcpConfig(${JSON.stringify(root)}, { source: process.env.TEST_MCP_PUBLICATION_ID });`
-  const children = Array.from({ length: 3 }, (_, index) => Bun.spawn({
-    cmd: [process.execPath, '-e', script],
-    env: { ...process.env, TEST_MCP_PUBLICATION_ID: String(index) },
-    stdout: 'ignore',
-    stderr: 'inherit',
-  }))
-  expect(await Promise.all(children.map(child => child.exited))).toEqual([0, 0, 0])
-  expect(['0', '1', '2']).toContain(JSON.parse(await readFile(credentialFile(), 'utf8')).source)
+  const script = `const { publishPrivateCursorMcpConfig } = await import(${JSON.stringify(source)}); process.stdout.write('ready\\n'); await publishPrivateCursorMcpConfig(${JSON.stringify(root)}, { source: 'child' });`
+  const child = spawn(process.execPath, ['-e', script], { stdio: ['ignore', 'pipe', 'inherit'] })
+  const completed = new Promise<number | null>((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', resolve)
+  })
+  let exited = false
+  void completed.then(() => { exited = true }, () => { exited = true })
+  let released = false
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.stdout.once('data', (chunk: Buffer) =>
+        chunk.toString('utf8').includes('ready') ? resolve() : reject(new Error('Child not ready')))
+      child.once('error', reject)
+    })
+    // Child is ready to publish, but cannot pass a lock held by this process.
+    await Bun.sleep(500)
+    expect(exited).toBe(false)
+    expect(await readdir(credentialDirectory())).toEqual(['.publication.lock'])
+    await release()
+    released = true
+    expect(await completed).toBe(0)
+  } finally {
+    if (!released) await release()
+    child.kill()
+  }
+  expect(JSON.parse(await readFile(credentialFile(), 'utf8'))).toEqual({ source: 'child' })
   expect(await readdir(credentialDirectory())).toEqual(['opencode.json'])
-  expect(await readdir(root)).toEqual(['mcp-credentials'])
 }, 30_000)
 
 test.skipIf(process.platform !== 'win32')('accepts a case-only Windows state-root spelling with original ACL checks', async () => {
