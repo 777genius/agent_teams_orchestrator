@@ -323,6 +323,8 @@ for (const version of ['2.1.4'] as const) test(`${version} team launch requires 
     expectedBehaviorFingerprint: samePolicyProof.expectedBehaviorEvidence.expectedBehaviorFingerprint,
     expectedManifestHighWatermark: null, commandLeaseId: 'TEST-lease', idempotencyKey: 'TEST-launch' }
   const launch = { ...request, body: { ...request.body, executionProof: samePolicyProof, preconditions } }
+  probe.mockImplementationOnce(async () => ({ state: 'pending', proof: null, reasonCode: 'execution_probe_busy', reason: 'provider busy' }))
+  await expect(createOpenCodeV2LaunchPlan(launch)).rejects.toThrow('run_launch_provider_busy')
   nativeReceiptCalls = 0
   const plan = await createOpenCodeV2LaunchPlan(launch)
   expect(nativeReceiptCalls).toBe(1)
