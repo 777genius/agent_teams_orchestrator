@@ -74,6 +74,22 @@ test('settings directory retains summary credential evidence without CLI sweeps 
       assert.equal(full.value.entries.find(row => row.providerId === 'kiro').state, 'available', 'Config-only providers need credential evidence')
       assert.equal(full.value.entries.find(row => row.providerId === 'opencode').state, 'available', 'Anonymous Zen is available without a connection')
       assert.ok(!JSON.stringify(full).includes(fixtureKey))
+      // Anonymous Zen is available, but a real saved Zen credential must become connected.
+      credentials.opencode = { type: 'api', key: fixtureKey }
+      await writeFile(authPath, JSON.stringify(credentials))
+      const zenWithCredentials = await service.probe(root, { mode: 'full', v1SettingsOnly: true })
+      assert.ok(zenWithCredentials.connectedProviders.some(row =>
+        row.id === 'opencode' && row.source === 'credentials'))
+      const zenSummary = await directory.loadDirectory({
+        runtimeId: 'opencode', projectPath: root, summary: true, refresh: true, limit: 100,
+      })
+      assert.equal(zenSummary.ok, true)
+      assert.equal(zenSummary.value.entries.find(row => row.providerId === 'opencode').state, 'connected')
+      commands.length = 0
+      const zenFull = await directory.loadDirectory({ runtimeId: 'opencode', projectPath: root, limit: 100 })
+      assert.equal(zenFull.ok, true)
+      assert.equal(zenFull.value.entries.find(row => row.providerId === 'opencode').state, 'connected')
+      assert.deepEqual(commands, [], 'Full Settings still avoids CLI sweeps after Zen credentials')
       // Removing a saved connection must affect the next uncached inventory.
       delete credentials['github-copilot']
       await writeFile(authPath, JSON.stringify(credentials))
