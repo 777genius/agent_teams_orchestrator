@@ -4593,6 +4593,7 @@ export class OpenCodeProviderManagementAdapter
         projectPath: canonicalProjectPath,
         purpose: 'catalog',
         selectedModel: `${providerId}/catalog`,
+        abortSignal: deadline.signal,
       }), deadline.signal)
     } catch (error) {
       reportFailure('scope')

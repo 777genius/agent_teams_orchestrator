@@ -40,6 +40,51 @@ test('expired shared budget refuses V1 before starting catalog work', async () =
   expect(code).toBe(0)
 }, 20_000)
 
+test('V1 catalog deadline cancels scope preparation before any late profile or host work', async () => {
+  const script = `
+    import { mock } from 'bun:test'
+    import assert from 'node:assert/strict'
+    const identityPath = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/compatibility/OpenCodeNativeIdentity.ts'))}
+    const identity = await import(identityPath)
+    mock.module(identityPath, () => ({ ...identity, inspectOpenCodeReadSelection: async () => ({
+      policy: { generation: 'v1', version: '1.19.4' }, native: null,
+    }) }))
+    const profilePath = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/OpenCodeProfileManager.ts'))}
+    const profile = await import(profilePath)
+    let cancelled = false, published = false, inventoryReads = 0, release
+    const waiting = new Promise(resolve => { release = resolve })
+    mock.module(profilePath, () => ({ ...profile,
+      canonicalizeOpenCodeProjectPath: async () => '/TEST/catalog-scope',
+      resolveOpenCodeProfileScope: async input => {
+        await new Promise((resolve, reject) => {
+          waiting.then(resolve)
+          input.abortSignal?.addEventListener('abort', () => {
+            cancelled = true; reject(input.abortSignal.reason)
+          }, { once: true })
+        })
+        published = true
+        return { scopeToken: 'TEST-late-scope' }
+      },
+    }))
+    const { OpenCodeProviderManagementAdapter } = await import(${JSON.stringify(import.meta.resolve('./OpenCodeProviderManagementAdapter.ts'))})
+    const adapter = new OpenCodeProviderManagementAdapter({ catalogOverallTimeoutMs: 50,
+      inventoryService: { probe: async () => { inventoryReads++; throw Error('TEST unexpected catalog continuation') } } })
+    try {
+      const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter', projectPath: '/TEST/catalog-scope' })
+      assert.equal(result.ok, false)
+      assert.equal(result.error.code, 'runtime-unhealthy')
+      assert.equal(cancelled, true, 'The caller timeout must cancel its owned scope preparation')
+      release(); await Bun.sleep(5)
+      assert.equal(published, false, 'An expired read must never publish a late scoped profile')
+      assert.equal(inventoryReads, 0)
+    } finally { release(); mock.restore() }
+  `
+  const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe', env: { ...process.env, NODE_ENV: 'test' } })
+  const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+  expect(stderr).not.toContain('AssertionError')
+  expect(code).toBe(0)
+}, 20_000)
+
 for (const phase of ['selection', 'profile-scope', 'profile-auth', 'receipt'] as const) test(`V2 model catalog cancels stalled ${phase} before any native acquisition`, async () => {
   const script = `
     import { mock } from 'bun:test'
