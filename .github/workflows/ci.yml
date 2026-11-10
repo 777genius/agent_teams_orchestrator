@@ -387,6 +387,8 @@ jobs:
         run: bun test src/features/runtimeProviderManagement/adapters/opencode/OpenCodeProviderSelectionFailure.test.ts --timeout 30000
       - name: Test V2 catalog cache in isolation
         run: bun test src/services/opencode/OpenCodeInventoryService.v2-cache.test.ts --timeout 30000
+      - name: Test V2 probe contention and caller cancellation
+        run: bun test src/services/opencode/bridge/OpenCodeV2ExecutionProbe.lock.test.ts src/cli/handlers/runtimeOpenCodeCommand.v2-cancellation.test.ts --timeout 30000
       - name: Test V2 probe session titles and launch plans in isolation
         if: runner.os != 'Windows'
         run: bun test src/services/opencode/bridge/OpenCodeV2LaunchPlan.unattended.test.ts --timeout 30000

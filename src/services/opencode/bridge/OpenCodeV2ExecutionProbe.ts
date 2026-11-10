@@ -176,7 +176,17 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
     if (noOwnerSettlement) assertNotCancelled(); else assertDeadline()
   }
   try {
-    release = await lockfile.lock(guard, { retries: { retries: 10, minTimeout: 20, maxTimeout: 200 } })
+    try {
+      // This guard spans the original native probe, which can outlive a CLI
+      // handshake. Another caller must defer without starting a second owner
+      // or treating occupancy as evidence that the selected model failed.
+      release = await lockfile.lock(guard, { retries: 0 })
+    } catch (error) {
+      assertDeadline()
+      if (error === null || typeof error !== 'object' || !('code' in error) || error.code !== 'ELOCKED') throw error
+      return { state: 'pending' as const, proof: null,
+        reason: 'provider busy: selected-model verification is already in progress. Retry after the current verification finishes.' }
+    }
     assertDeadline()
     let record: ProbeRecord | null = null
     try {
