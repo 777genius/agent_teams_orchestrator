@@ -3480,24 +3480,24 @@ export class OpenCodeProviderManagementAdapter
     const canonicalProjectPath = await canonicalizeOpenCodeProjectPath(projectPath)
     const abortController = new AbortController()
     const progress = options?.progress ?? createOpenCodeInventoryProbeProgressTracker()
+    const queueAware = options?.mode === 'summary' && options.abortSignal && options.remainingMs
+    const timeoutMs = this.deps.inventoryTimeoutMs ?? (options?.mode === 'summary'
+      ? OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS : OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS)
     const abortFromCaller = () => abortController.abort(options?.abortSignal?.reason)
     options?.abortSignal?.addEventListener('abort', abortFromCaller, { once: true })
     if (options?.abortSignal?.aborted) abortFromCaller()
     try {
       return await withOpenCodeInventoryProbeTimeout(
-        inventoryService.probe(canonicalProjectPath, {
+        onQueueWait => raceOpenCodeAbortSignal(inventoryService.probe(canonicalProjectPath, {
           ...options,
           includeAppMcp: false,
           abortSignal: abortController.signal,
           progress,
-        }),
+          onCommandLockWaitChanged: queueAware ? onQueueWait : undefined,
+        }), options?.abortSignal),
         {
           projectPath: canonicalProjectPath,
-          timeoutMs:
-            this.deps.inventoryTimeoutMs ??
-            (options?.mode === 'summary'
-              ? OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS
-              : OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS),
+          timeoutMs,
           progress,
           onTimeout: () => abortController.abort(),
         },

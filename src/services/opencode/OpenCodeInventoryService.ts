@@ -1,4 +1,5 @@
 import { OPEN_CODE_LOADING_TIMEOUT_MS } from './OpenCodeLoadingBudget.js'
+import { OpenCodeInventoryActiveTimeout } from './OpenCodeInventoryActiveTimeout.js'
 import { mkdir, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import stripAnsi from 'strip-ansi'
@@ -149,6 +150,7 @@ async function acquireOpenCodeLock(
 type OpenCodeInventoryProbeMode = 'full' | 'summary' | 'profile' | 'passive'
 
 type OpenCodeInventoryProbeOptions = {
+  onCommandLockWaitChanged?: (waiting: boolean) => void
   onV2ReadStarted?: () => void
   onReadAcquisitionStarted?: () => void
   onReadAcquisitionSettled?: () => void
@@ -608,17 +610,19 @@ async function withOpenCodeInventoryCommandLock<T>(
   callback: () => Promise<T>,
   abortSignal?: AbortSignal,
   progress?: OpenCodeInventoryProbeProgressTracker,
+  onWaitChanged?: (waiting: boolean) => void,
 ): Promise<T> {
   const leaveLock = progress?.enterStep('wait for OpenCode inventory command lock')
   const lockPath = path.join(profile.profileRootPath, 'inventory-command.lock')
   await mkdir(path.dirname(lockPath), { recursive: true })
   await writeFile(lockPath, '', { flag: 'a' })
 
+  onWaitChanged?.(true)
   const release = await acquireOpenCodeLock(
     lockPath,
     OPEN_CODE_INVENTORY_COMMAND_LOCK_OPTIONS,
     abortSignal,
-  ).finally(() => leaveLock?.())
+  ).finally(() => { onWaitChanged?.(false); leaveLock?.() })
   try {
     if (abortSignal?.aborted) throwOpenCodeAbortReason(abortSignal)
     return await callback()
@@ -723,7 +727,7 @@ export function buildOpenCodeInventoryTimeoutSnapshot(input: {
 }
 
 export async function withOpenCodeInventoryProbeTimeout(
-  probe: Promise<OpenCodeInventorySnapshot>,
+  probe: Promise<OpenCodeInventorySnapshot> | ((onQueueWait: (waiting: boolean) => void) => Promise<OpenCodeInventorySnapshot>),
   input: {
     projectPath?: string | null
     timeoutMs: number
@@ -731,25 +735,20 @@ export async function withOpenCodeInventoryProbeTimeout(
     onTimeout?: () => void
   },
 ): Promise<OpenCodeInventorySnapshot> {
-  let timeout: ReturnType<typeof setTimeout> | null = null
+  let timeout: OpenCodeInventoryActiveTimeout | undefined
+  const expired = new Promise<OpenCodeInventorySnapshot>(resolve => {
+    timeout = new OpenCodeInventoryActiveTimeout(input.timeoutMs, () => {
+      input.onTimeout?.()
+      resolve(buildOpenCodeInventoryTimeoutSnapshot({
+        projectPath: input.projectPath, timeoutMs: input.timeoutMs,
+        progress: input.progress?.snapshot() ?? null,
+      }))
+    })
+  })
   try {
-    return await Promise.race([
-      probe,
-      new Promise<OpenCodeInventorySnapshot>(resolve => {
-        timeout = setTimeout(() => {
-          input.onTimeout?.()
-          resolve(
-            buildOpenCodeInventoryTimeoutSnapshot({
-              projectPath: input.projectPath,
-              timeoutMs: input.timeoutMs,
-              progress: input.progress?.snapshot() ?? null,
-            }),
-          )
-        }, input.timeoutMs)
-      }),
-    ])
+    return await Promise.race([typeof probe === 'function' ? probe(timeout!.setQueueWaiting) : probe, expired])
   } finally {
-    if (timeout) clearTimeout(timeout)
+    timeout?.dispose()
   }
 }
 
@@ -1270,7 +1269,7 @@ export class OpenCodeInventoryService {
         binaryPath,
         profile,
         verifiedVersion: options.v1SettingsOnly ? selection.policy.version ?? undefined : undefined,
-      }), options.abortSignal, options.progress,
+      }), options.abortSignal, options.progress, options.onCommandLockWaitChanged,
     )
   }
 
