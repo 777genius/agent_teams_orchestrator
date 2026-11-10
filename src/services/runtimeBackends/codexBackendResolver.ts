@@ -38,6 +38,7 @@ export type CodexRuntimeResolution = {
 }
 
 const CODEX_LOGIN_STATUS_CACHE_MS = 5_000
+const CODEX_LOGIN_STATUS_TIMEOUT_MS = 10_000
 
 let cachedCodexCliLoginState:
   | {
@@ -148,6 +149,7 @@ export function detectCodexCliLoginState(
     env?: NodeJS.ProcessEnv
     which?: (command: string) => string | null | undefined
     spawnSync?: typeof spawnSyncPortableCli
+    monotonicNow?: () => number
   },
 ): CodexCliLoginState {
   const env = params?.env ?? process.env
@@ -170,6 +172,8 @@ export function detectCodexCliLoginState(
   }
 
   let nextValue: CodexCliLoginState = 'unknown'
+  const monotonicNow = params?.monotonicNow ?? (() => performance.now())
+  const startedAt = monotonicNow()
 
   try {
     const result = (params?.spawnSync ?? spawnSyncPortableCli)(
@@ -179,20 +183,26 @@ export function detectCodexCliLoginState(
         encoding: 'utf8',
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: CODEX_LOGIN_STATUS_TIMEOUT_MS,
+        killSignal: 'SIGKILL',
       },
     )
     const combinedOutput = `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim()
 
-    if (result.status === 0) {
-      nextValue = 'logged_in'
-    } else if (/not logged in/i.test(combinedOutput)) {
-      nextValue = 'not_logged_in'
+    // Partial output from a killed/failed query cannot prove an auth state.
+    if (!result.error && !result.signal && result.status !== null) {
+      if (result.status === 0) {
+        nextValue = 'logged_in'
+      } else if (/not logged in/i.test(combinedOutput)) {
+        nextValue = 'not_logged_in'
+      }
     }
   } catch {
     nextValue = 'unknown'
   }
 
-  cachedCodexCliLoginState = { checkedAtMs: nowMs, cacheKey, value: nextValue }
+  const completedAtMs = nowMs + Math.max(0, monotonicNow() - startedAt)
+  cachedCodexCliLoginState = { checkedAtMs: completedAtMs, cacheKey, value: nextValue }
   return nextValue
 }
 
