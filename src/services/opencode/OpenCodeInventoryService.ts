@@ -1002,7 +1002,7 @@ export function deriveOpenCodeProfileConnectedProviders(input: {
 }): { providers: OpenCodeConnectedProvider[]; profileScopeError: boolean } {
   const requestedScope = input.profileScope
   const preparedScope = input.profile.profileScope
-  // Unscoped settings obtains auth and connections from the managed HTTP host.
+  // Unscoped Settings reads saved-auth summaries separately from scoped identity.
   if (input.settingsOnly && !requestedScope && !preparedScope) {
     return { providers: [], profileScopeError: false }
   }
@@ -1331,15 +1331,21 @@ export class OpenCodeInventoryService {
 
     const version = versionResult.code === 0 ? versionResult.stdout.trim() || null : null
     const providerParse = parseOpenCodeProvidersOutput(providersResult.stdout)
+    // Unscoped Settings skips CLI discovery, but still needs saved credential
+    // evidence: /provider.connected also includes config-only and anonymous rows.
+    // Selected-provider profiles must continue to inspect only their own identity.
+    const settingsAuthInventory = mode === 'profile' && options.v1SettingsOnly === true
+      && !options.profileScope && !profile.profileScope
+    const readAuthInventory = mode !== 'profile' || settingsAuthInventory
     const globalAuthProviderIds = new Set(
-      mode === 'profile' || !profile.globalAuthPath
+      !readAuthInventory || !profile.globalAuthPath
         ? []
         : (await readOpenCodeAuthProviderSummaries(profile.globalAuthPath, ['managed']).catch(
             () => [],
           )).map(provider => provider.id),
     )
     const sourceAuthProviderIds = new Set(
-      mode === 'profile' || !profile.sourceAuthPath
+      !readAuthInventory || !profile.sourceAuthPath
         ? []
         : (await readOpenCodeAuthProviderSummaries(profile.sourceAuthPath, ['local']).catch(
             () => [],
@@ -1351,7 +1357,7 @@ export class OpenCodeInventoryService {
       if (sourceAuthProviderIds.has(providerId)) scopes.push('local')
       return scopes.length > 0 ? scopes : ['managed']
     }
-    const discovered = mode === 'profile'
+    const discovered = mode === 'profile' && !settingsAuthInventory
       ? deriveOpenCodeProfileConnectedProviders({
           profileScope: options.profileScope, profile,
           settingsOnly: options.v1SettingsOnly === true,

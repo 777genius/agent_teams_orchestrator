@@ -1584,12 +1584,18 @@ function hasExplicitConnectionEvidence(
 }
 
 function shouldDisplayProviderAsConnected(input: {
+  providerId: string
   connected: boolean
   connectedProvider: OpenCodeConnectedProvider | null | undefined
   configuredAuthless: boolean
 }): boolean {
   if (!input.connected) {
     return false
+  }
+  // Native OpenCode reports Zen as connected even when it only supplies its
+  // anonymous models. Display a saved connection only with credential evidence.
+  if (input.providerId === 'opencode') {
+    return hasExplicitConnectionEvidence(input.connectedProvider)
   }
   if (!input.configuredAuthless) {
     return true
@@ -1972,6 +1978,7 @@ function buildProviderConnections(input: {
       providers: input.providers,
     })
     const displayConnected = shouldDisplayProviderAsConnected({
+      providerId,
       connected,
       connectedProvider,
       configuredAuthless,
@@ -2430,6 +2437,7 @@ function buildProviderDirectory(input: {
       providers: input.providers,
     })
     const displayConnected = shouldDisplayProviderAsConnected({
+      providerId,
       connected,
       connectedProvider,
       configuredAuthless,
