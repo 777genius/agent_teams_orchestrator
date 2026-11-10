@@ -266,10 +266,10 @@ function response(envelope: BridgeEnvelope, started: number, data: unknown, pin:
     runtime: { providerId: 'opencode', binaryPath: qualification?.binaryPath ?? null, binaryFingerprint: qualification?.binaryFingerprint ?? (pin ? `version:${pin}` : null),
       version: qualification?.version ?? pin, capabilitySnapshotId: qualification?.capabilitySnapshotId ?? null }, diagnostics: [], data }
 }
-function refusal(envelope: BridgeEnvelope, started: number, message: string) {
+function refusal(envelope: BridgeEnvelope, started: number, message: string, diagnostics: string[] = []) {
   return { ok: false, schemaVersion: 1, requestId: envelope.requestId, command: envelope.command,
     completedAt: new Date().toISOString(), durationMs: Math.max(0, Date.now() - started),
-    error: { kind: 'runtime_not_ready', message, retryable: false }, diagnostics: [] }
+    error: { kind: 'runtime_not_ready', message, retryable: message === 'run_launch_provider_busy' }, diagnostics }
 }
 
 /** Runtime source qualification is derived from the exact private owner and measured member evidence.
@@ -623,8 +623,10 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
     const operation = error !== null && typeof error === 'object' && 'nativeOperation' in error &&
       typeof (error as { nativeOperation?: unknown }).nativeOperation === 'string'
       ? (error as { nativeOperation: string }).nativeOperation : null
+    const diagnostics = message === 'run_launch_provider_busy' && error instanceof Error && typeof error.cause === 'string'
+      ? [error.cause] : []
     return refusal(envelope, started, operation && !message.includes('@native:')
-      ? `${message} @native:${operation}` : message)
+      ? `${message} @native:${operation}` : message, diagnostics)
   } finally { clearTimeout(readinessExpiry) }
 }
 

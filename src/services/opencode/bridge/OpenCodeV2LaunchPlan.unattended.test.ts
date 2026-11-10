@@ -323,8 +323,11 @@ for (const version of ['2.1.4'] as const) test(`${version} team launch requires 
     expectedBehaviorFingerprint: samePolicyProof.expectedBehaviorEvidence.expectedBehaviorFingerprint,
     expectedManifestHighWatermark: null, commandLeaseId: 'TEST-lease', idempotencyKey: 'TEST-launch' }
   const launch = { ...request, body: { ...request.body, executionProof: samePolicyProof, preconditions } }
-  probe.mockImplementationOnce(async () => ({ state: 'pending', proof: null, reasonCode: 'execution_probe_busy', reason: 'provider busy' }))
-  await expect(createOpenCodeV2LaunchPlan(launch)).rejects.toThrow('run_launch_provider_busy')
+  const busyAdvice = 'provider busy: selected-model verification is already in progress. Retry after the current verification finishes.'
+  probe.mockImplementationOnce(async () => ({ state: 'pending', proof: null, reasonCode: 'execution_probe_busy', reason: busyAdvice }))
+  await expect(createOpenCodeV2LaunchPlan(launch)).rejects.toMatchObject({
+    message: 'run_launch_provider_busy', cause: busyAdvice,
+  })
   nativeReceiptCalls = 0
   const plan = await createOpenCodeV2LaunchPlan(launch)
   expect(nativeReceiptCalls).toBe(1)
