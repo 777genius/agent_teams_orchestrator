@@ -71,6 +71,7 @@ test('concurrent model checks defer without another native owner, input or execu
       expect(result.state).toBe('pending')
       expect(result.proof).toBeNull()
       expect(result.reason).toContain('provider busy')
+      expect('reasonCode' in result && result.reasonCode).toBe('execution_probe_busy')
       expect(result.reason).not.toContain('Lock file')
     }
     expect(build).not.toHaveBeenCalled()

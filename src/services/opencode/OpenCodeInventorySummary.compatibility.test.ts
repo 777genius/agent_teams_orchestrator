@@ -50,7 +50,7 @@ test('settings directory retains summary credential evidence without CLI sweeps 
     }
 
     const rows = [...connected, 'opencode', 'kiro'].map(id => ({ id, models: { fixture: {} } }))
-    const directory = new OpenCodeProviderManagementAdapter({ inventoryService: service,
+    const createDirectory = () => new OpenCodeProviderManagementAdapter({ inventoryService: service,
       hostManager: {
         ensureHost: async () => ({ hostKey: 'TEST', baseUrl: 'http://TEST.invalid', version: '1.18.31' }),
         releaseHost: async () => {},
@@ -61,6 +61,7 @@ test('settings directory retains summary credential evidence without CLI sweeps 
         getProviderAuth: async () => ({}),
       }) },
     })
+    const directory = createDirectory()
     try {
       const summary = await directory.loadDirectory({ runtimeId: 'opencode', projectPath: root, summary: true, limit: 100 })
       assert.equal(summary.ok, true)
@@ -86,7 +87,8 @@ test('settings directory retains summary credential evidence without CLI sweeps 
       assert.equal(zenSummary.ok, true)
       assert.equal(zenSummary.value.entries.find(row => row.providerId === 'opencode').state, 'connected')
       commands.length = 0
-      const zenFull = await directory.loadDirectory({ runtimeId: 'opencode', projectPath: root, limit: 100 })
+      // Read with an uncached adapter: the preceding summary refresh does not invalidate a cached full directory.
+      const zenFull = await createDirectory().loadDirectory({ runtimeId: 'opencode', projectPath: root, limit: 100 })
       assert.equal(zenFull.ok, true)
       assert.equal(zenFull.value.entries.find(row => row.providerId === 'opencode').state, 'connected')
       assert.deepEqual(commands, [], 'Full Settings still avoids CLI sweeps after Zen credentials')

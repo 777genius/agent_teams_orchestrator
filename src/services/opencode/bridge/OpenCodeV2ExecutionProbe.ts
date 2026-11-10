@@ -184,7 +184,7 @@ export async function resolveOpenCodeV2ExecutionProbe(envelope: BridgeEnvelope, 
     } catch (error) {
       assertDeadline()
       if (error === null || typeof error !== 'object' || !('code' in error) || error.code !== 'ELOCKED') throw error
-      return { state: 'pending' as const, proof: null,
+      return { state: 'pending' as const, proof: null, reasonCode: 'execution_probe_busy' as const,
         reason: 'provider busy: selected-model verification is already in progress. Retry after the current verification finishes.' }
     }
     assertDeadline()

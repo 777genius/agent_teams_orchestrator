@@ -194,6 +194,7 @@ export async function createOpenCodeV2LaunchPlan(envelope: BridgeEnvelope): Prom
   const { native, availability } = await prepareSelectedOpenCodeV2SourceAvailability(selection)
   const verified = await resolveOpenCodeV2ExecutionProbe(envelope, availability, false, { unattendedTeam: true })
   executionAssert(!('reasonCode' in verified && verified.reasonCode === 'execution_proof_expired'), 'run_launch_execution_proof_expired')
+  executionAssert(!('reasonCode' in verified && verified.reasonCode === 'execution_probe_busy'), 'run_launch_provider_busy')
   const supplied = parseOpenCodeExecutionProof(body.executionProof)
   executionAssert(verified.proof && verified.proof.projectPath === normalizeOpenCodeProjectIdentity(selection.project) &&
     verified.proof.modelId === `${selection.model.providerID}/${selection.model.id}` &&
