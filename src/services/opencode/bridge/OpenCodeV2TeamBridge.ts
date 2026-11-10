@@ -341,7 +341,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       readinessStage = 'owner_discovery'
       let owner: Extract<RunControlResult, { kind: 'status' }> | null = null
       if (bridge && await boundOpenCodeRead(bridge.discover(), remaining(), readinessSignal)) {
-        const found = await bridge.call({ operation: 'status' }, remaining())
+        const found = await boundOpenCodeRead(bridge.call({ operation: 'status' }, remaining()), remaining(), readinessSignal)
         remaining()
         executionAssert(found.kind === 'status', 'run_status_unknown'); owner = found
       }
@@ -362,8 +362,8 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         originalIdentity.runtime.version = measured.version
         originalIdentity.featureFlags.opencodeStateChangingCommands = true
         if (text(body.memberName) && openCodeV2SupportedSourcePredicate(owner)) {
-          const member = await bridge.resolveMember(required(body.memberName, 'memberName'), text(body.laneId), text(body.runtimeSessionId ?? body.sessionId), remaining())
-          const group = await bridge.call({ operation: 'groupProof', memberId: member.memberId, originalSessionId: member.originalSessionId }, remaining())
+          const member = await boundOpenCodeRead(bridge.resolveMember(required(body.memberName, 'memberName'), text(body.laneId), text(body.runtimeSessionId ?? body.sessionId), remaining()), remaining(), readinessSignal)
+          const group = await boundOpenCodeRead(bridge.call({ operation: 'groupProof', memberId: member.memberId, originalSessionId: member.originalSessionId }, remaining()), remaining(), readinessSignal)
           remaining()
           executionAssert(group.kind === 'groupProof', 'GROUP_RECIPIENT_INCOMPATIBLE')
           if (group.proof) {
