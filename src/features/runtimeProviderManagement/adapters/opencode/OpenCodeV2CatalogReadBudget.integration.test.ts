@@ -192,6 +192,9 @@ test('catalog profile cancellation reaches the real auth publication lock withou
 }, 20_000)
 
 for (const source of ['project-config', 'imported-config', 'project-default', 'global-default', 'global-default-cli'] as const) {
+  // Reading global defaults follows project/profile preparation. Keep the FIFO
+  // read reachable before testing cancellation on busy CI runners.
+  const budgetMs = source === 'global-default' ? 1_000 : 200
   test.skipIf(process.platform === 'win32')(`catalog deadline interrupts a blocked ${source} read and joins private profile cleanup`, async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-catalog-file-cancel-'))
     const script = `
@@ -244,13 +247,13 @@ for (const source of ['project-config', 'imported-config', 'project-default', 'g
         assert(result, 'The catalog deadline must finish before the blocked read is released')
         assert.equal(result.ok, false)
         assert.equal(result.error.code, 'runtime-unhealthy')
-        assert.match(result.error.message, /catalog timed out during profile.*budget 200ms/)
+        assert.match(result.error.message, new RegExp('catalog timed out during profile.*budget ' + ${budgetMs} + 'ms'))
         assert.deepEqual(await profileNames(), [], 'Private credentials must be cleaned before returning')
         assert.equal(receipts, 0); assert.equal(acquisitions, 0)
       }
       let work, watchdog
       try {
-        const adapter = new OpenCodeProviderManagementAdapter({ catalogOverallTimeoutMs: 200 })
+        const adapter = new OpenCodeProviderManagementAdapter({ catalogOverallTimeoutMs: ${budgetMs} })
         if (source === 'global-default-cli') {
           const load = adapter.loadModels.bind(adapter)
           adapter.loadModels = async input => {
@@ -294,7 +297,7 @@ for (const source of ['project-config', 'imported-config', 'project-default', 'g
       if (source === 'global-default-cli') {
         const response = JSON.parse(stdout)
         expect(response.error.code).toBe('runtime-unhealthy')
-        expect(response.error.message).toMatch(/catalog timed out during profile.*budget 200ms/)
+        expect(response.error.message).toMatch(new RegExp('catalog timed out during profile.*budget ' + budgetMs + 'ms'))
       }
     } finally {
       clearTimeout(watchdog)
