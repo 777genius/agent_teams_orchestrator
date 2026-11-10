@@ -51,11 +51,12 @@ test('V1 catalog deadline cancels scope preparation before any late profile or h
     }) }))
     const profilePath = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/OpenCodeProfileManager.ts'))}
     const profile = await import(profilePath)
-    let cancelled = false, published = false, inventoryReads = 0, release
+    let cancelled = false, published = false, inventoryReads = 0, scopeStarted = false, release
     const waiting = new Promise(resolve => { release = resolve })
     mock.module(profilePath, () => ({ ...profile,
       canonicalizeOpenCodeProjectPath: async () => '/TEST/catalog-scope',
       resolveOpenCodeProfileScope: async input => {
+        scopeStarted = true
         await new Promise((resolve, reject) => {
           waiting.then(resolve)
           input.abortSignal?.addEventListener('abort', () => {
@@ -67,12 +68,14 @@ test('V1 catalog deadline cancels scope preparation before any late profile or h
       },
     }))
     const { OpenCodeProviderManagementAdapter } = await import(${JSON.stringify(import.meta.resolve('./OpenCodeProviderManagementAdapter.ts'))})
-    const adapter = new OpenCodeProviderManagementAdapter({ catalogOverallTimeoutMs: 50,
+    // The deadline must cover selection startup before testing the scope cancellation.
+    const adapter = new OpenCodeProviderManagementAdapter({ catalogOverallTimeoutMs: 5_000,
       inventoryService: { probe: async () => { inventoryReads++; throw Error('TEST unexpected catalog continuation') } } })
     try {
       const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter', projectPath: '/TEST/catalog-scope' })
       assert.equal(result.ok, false)
       assert.equal(result.error.code, 'runtime-unhealthy')
+      assert.equal(scopeStarted, true, 'The test must reach scoped preparation before its deadline')
       assert.equal(cancelled, true, 'The caller timeout must cancel its owned scope preparation')
       release(); await Bun.sleep(5)
       assert.equal(published, false, 'An expired read must never publish a late scoped profile')
