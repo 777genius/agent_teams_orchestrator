@@ -266,10 +266,10 @@ function response(envelope: BridgeEnvelope, started: number, data: unknown, pin:
     runtime: { providerId: 'opencode', binaryPath: qualification?.binaryPath ?? null, binaryFingerprint: qualification?.binaryFingerprint ?? (pin ? `version:${pin}` : null),
       version: qualification?.version ?? pin, capabilitySnapshotId: qualification?.capabilitySnapshotId ?? null }, diagnostics: [], data }
 }
-function refusal(envelope: BridgeEnvelope, started: number, message: string) {
+function refusal(envelope: BridgeEnvelope, started: number, message: string, diagnostics: string[] = []) {
   return { ok: false, schemaVersion: 1, requestId: envelope.requestId, command: envelope.command,
     completedAt: new Date().toISOString(), durationMs: Math.max(0, Date.now() - started),
-    error: { kind: 'runtime_not_ready', message, retryable: false }, diagnostics: [] }
+    error: { kind: 'runtime_not_ready', message, retryable: message === 'run_launch_provider_busy' }, diagnostics }
 }
 
 /** Runtime source qualification is derived from the exact private owner and measured member evidence.
@@ -301,7 +301,7 @@ function projectV2TeamStatus(status: Extract<RunControlResult, { kind: 'status' 
 }
 
 /** `started`: when this command entered the runtime, so stages before V2 selection share its budget. */
-async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: OpenCodeV2TeamBridge | null, started = Date.now()) {
+async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: OpenCodeV2TeamBridge | null, started = Date.now(), signal?: AbortSignal) {
   const body: Record<string, unknown> = { ...envelope.body, runId: envelope.body.runId ?? envelope.body.expectedRunId }
   envelope = { ...envelope, body }
   let measured: RunQualification | undefined
@@ -331,16 +331,18 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       // expire together, early enough to answer inside the caller's own watchdog.
       const deadline = readinessDeadline = openCodeV2ReadinessDeadline(envelope, started)
       const expiry = new AbortController()
+      const readinessSignal = signal ? AbortSignal.any([signal, expiry.signal]) : expiry.signal
       readinessExpiry = setTimeout(() => expiry.abort(new Error('execution_timeout')), Math.max(0, deadline - Date.now()))
       const remaining = () => {
-        expiry.signal.throwIfAborted()
+        readinessSignal.throwIfAborted()
         executionAssert(Date.now() < deadline, 'execution_timeout')
         return Math.max(1, Math.min(8000, deadline - Date.now()))
       }
       readinessStage = 'owner_discovery'
       let owner: Extract<RunControlResult, { kind: 'status' }> | null = null
-      if (bridge && await boundOpenCodeRead(bridge.discover(), remaining(), expiry.signal)) {
-        const found = await bridge.call({ operation: 'status' }, remaining())
+      if (bridge && await boundOpenCodeRead(bridge.discover(), remaining(), readinessSignal)) {
+        const statusTimeout = remaining()
+        const found = await boundOpenCodeRead(bridge.call({ operation: 'status' }, statusTimeout), statusTimeout, readinessSignal)
         remaining()
         executionAssert(found.kind === 'status', 'run_status_unknown'); owner = found
       }
@@ -361,8 +363,10 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
         originalIdentity.runtime.version = measured.version
         originalIdentity.featureFlags.opencodeStateChangingCommands = true
         if (text(body.memberName) && openCodeV2SupportedSourcePredicate(owner)) {
-          const member = await bridge.resolveMember(required(body.memberName, 'memberName'), text(body.laneId), text(body.runtimeSessionId ?? body.sessionId), remaining())
-          const group = await bridge.call({ operation: 'groupProof', memberId: member.memberId, originalSessionId: member.originalSessionId }, remaining())
+          const memberTimeout = remaining()
+          const member = await boundOpenCodeRead(bridge.resolveMember(required(body.memberName, 'memberName'), text(body.laneId), text(body.runtimeSessionId ?? body.sessionId), memberTimeout), memberTimeout, readinessSignal)
+          const groupTimeout = remaining()
+          const group = await boundOpenCodeRead(bridge.call({ operation: 'groupProof', memberId: member.memberId, originalSessionId: member.originalSessionId }, groupTimeout), groupTimeout, readinessSignal)
           remaining()
           executionAssert(group.kind === 'groupProof', 'GROUP_RECIPIENT_INCOMPATIBLE')
           if (group.proof) {
@@ -382,7 +386,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       const ownerModel = owner?.members[0]?.selectedModel
       readinessStage = 'source_availability'
       const selection = await inspectOpenCodeV2SourceAvailability({ ...envelope,
-        body: { ...body, selectedModel: body.selectedModel ?? ownerModel } }, { signal: expiry.signal, deadlineMs: deadline })
+        body: { ...body, selectedModel: body.selectedModel ?? ownerModel } }, { signal: readinessSignal, deadlineMs: deadline })
       if (owner) executionAssert(owner.members.every(member => member.selectedModel === `${selection.model.providerID}/${selection.model.id}`), 'run_selected_model_changed')
       const qualified = owner !== null && openCodeV2SupportedSourcePredicate(owner)
       const sourceCapabilities = { teamLaunch: true, memberSession: qualified, permission: false }
@@ -391,7 +395,7 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
       executionAssert(freshRequestId === undefined || envelope.command === 'opencode.readiness' && body.requireExecutionProbe === true &&
         typeof freshRequestId === 'string' && /^[a-zA-Z0-9._:-]{1,200}$/.test(freshRequestId), 'probe_fresh_request_invalid')
       const probe = await resolveOpenCodeV2ExecutionProbe(envelope, selection, envelope.command === 'opencode.readiness' && body.requireExecutionProbe === true,
-        { unattendedTeam: true, deadline, signal: expiry.signal, onPhase: phase => { probePhase = phase },
+        { unattendedTeam: true, deadline, signal: readinessSignal, onPhase: phase => { probePhase = phase },
           ...(freshRequestId === undefined ? {} : { freshExecutionProofRequestId: freshRequestId as string }) })
       readinessStage = undefined; probePhase = undefined
       measured = owner?.qualification ?? { capabilitySnapshotId: selection.capabilitySnapshotId,
@@ -622,8 +626,10 @@ async function executeV2(envelope: BridgeEnvelope, pin: string | null, bridge: O
     const operation = error !== null && typeof error === 'object' && 'nativeOperation' in error &&
       typeof (error as { nativeOperation?: unknown }).nativeOperation === 'string'
       ? (error as { nativeOperation: string }).nativeOperation : null
+    const diagnostics = message === 'run_launch_provider_busy' && error instanceof Error && typeof error.cause === 'string'
+      ? [error.cause] : []
     return refusal(envelope, started, operation && !message.includes('@native:')
-      ? `${message} @native:${operation}` : message)
+      ? `${message} @native:${operation}` : message, diagnostics)
   } finally { clearTimeout(readinessExpiry) }
 }
 
@@ -662,11 +668,12 @@ export async function executeExistingOpenCodeV2TranscriptEnvelope(input: unknown
 
 /** Public protocol1 routing. The existing V1 executor is passed unchanged. */
 export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknown,
-  executeV1: (input: unknown) => Promise<unknown>): Promise<unknown> {
+  executeV1: (input: unknown) => Promise<unknown>, options: { signal?: AbortSignal } = {}): Promise<unknown> {
   // Owner discovery and runtime selection below spend the same command budget as V2 readiness.
   const started = Date.now()
   let envelope: BridgeEnvelope
   try { envelope = validateEnvelope(input) } catch { return executeV1(input) }
+  options.signal?.throwIfAborted()
   let binding: ReturnType<typeof resolveOpenCodeV2RunBinding>
   try {
     const recovery = envelope.body.stopRecovery === undefined ? null : parseOpenCodeStopRequest(envelope.body.stopRecovery).target
@@ -688,15 +695,15 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
     try {
       const readiness = envelope.command === 'opencode.readiness' || envelope.command === 'opencode.handshake'
       const owner = readiness
-        ? await boundOpenCodeRead(bridge.discover(), Math.max(1, openCodeV2ReadinessDeadline(envelope, started) - Date.now()))
+        ? await boundOpenCodeRead(bridge.discover(), Math.max(1, openCodeV2ReadinessDeadline(envelope, started) - Date.now()), options.signal)
         : await bridge.discover()
       if (readiness && Date.now() >= openCodeV2ReadinessDeadline(envelope, started))
         return refusal(envelope, started, 'execution_timeout:owner_discovery')
-      if (owner) return executeV2(envelope, null, bridge, started)
+      if (owner) return executeV2(envelope, null, bridge, started, options.signal)
     }
     catch (error) {
       if (envelope.command === 'opencode.commandStatus' || envelope.command === 'opencode.recoverDeliveryJournal')
-        return executeV2(envelope, null, bridge, started)
+        return executeV2(envelope, null, bridge, started, options.signal)
       if ((envelope.command === 'opencode.readiness' || envelope.command === 'opencode.handshake')
         && error !== null && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
         return refusal(envelope, Date.now(), 'readiness_file_missing:owner_discovery')
@@ -727,11 +734,12 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
   const selectionReadiness = envelope.command === 'opencode.readiness' || envelope.command === 'opencode.handshake'
   const selectionDeadline = selectionReadiness ? openCodeV2ReadinessDeadline(envelope, started) : undefined
   const selectionExpiry = new AbortController()
+  const selectionSignal = options.signal ? AbortSignal.any([options.signal, selectionExpiry.signal]) : selectionExpiry.signal
   const selectionTimer = selectionDeadline === undefined ? undefined : setTimeout(() =>
     selectionExpiry.abort(new Error('execution_timeout')), Math.max(0, selectionDeadline - Date.now()))
   try {
     // The version reader owns abort and physical cleanup. Do not race away from it.
-    selection = await inspectOpenCodeRuntimeAdapterSelection(selectionReadiness ? selectionExpiry.signal : undefined, undefined, selectionDeadline)
+    selection = await inspectOpenCodeRuntimeAdapterSelection(selectionReadiness ? selectionSignal : options.signal, undefined, selectionDeadline)
     if (selectionReadiness && selection.policy.generation === 'v2' && Date.now() >= selectionDeadline!)
       return refusal(envelope, started, 'execution_timeout:runtime_selection')
   }
@@ -750,7 +758,7 @@ export async function executeSelectedOpenCodeBridgeCommandEnvelope(input: unknow
   finally { clearTimeout(selectionTimer) }
   const selected = selectOpenCodeRuntimeAdapter(selection.policy, {
     v1: () => () => executeV1(input),
-    v2: pin => () => executeV2(envelope, pin, bridge, started),
+    v2: pin => () => executeV2(envelope, pin, bridge, started, options.signal),
   })
   if (selected.generation === 'unsupported')
     return refusal(envelope, Date.now(), 'Selected OpenCode generation is unsupported; capabilities remain false.')

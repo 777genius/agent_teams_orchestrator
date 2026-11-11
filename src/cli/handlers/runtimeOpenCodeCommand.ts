@@ -114,7 +114,7 @@ export async function runtimeOpenCodeCommand(opts: {
 }, deps: RuntimeOpenCodeCommandDeps = {}): Promise<void> {
   const readInput = deps.readInput ?? (path => readFile(path, 'utf8'))
   const executeEnvelope = deps.executeEnvelope ?? ((input: unknown, options: { signal?: AbortSignal }) =>
-    executeSelectedOpenCodeBridgeCommandEnvelope(input, value => executeOpenCodeBridgeCommandEnvelope(value, options)))
+    executeSelectedOpenCodeBridgeCommandEnvelope(input, value => executeOpenCodeBridgeCommandEnvelope(value, options), options))
   const writePayload = deps.writePayload ?? (async (commandOpts, payload) => {
     if (commandOpts.output?.trim()) {
       await writeOutputFileAtomically(commandOpts.output.trim(), payload)

@@ -51,6 +51,23 @@ test('fresh and original-owner handshakes bind all returned fields in the identi
    assert.equal(identityHash,executionHash(unsigned))
    assert.notEqual(identityHash,executionHash({...unsigned,sourceCapabilities:{...unsigned.sourceCapabilities,teamLaunch:!unsigned.sourceCapabilities.teamLaunch}}))
   }
+  // A read-only original-owner status call must not hold a cancelled CLI open.
+  const originalCall=OpenCodeV2TeamBridge.prototype.call
+  let enteredStatus
+  const statusEntered=new Promise(resolve=>{enteredStatus=resolve})
+  OpenCodeV2TeamBridge.prototype.call=async()=>{enteredStatus();return new Promise(()=>{})}
+  originalOwner=true
+  const cancelled=new AbortController()
+  const stalled=execute({schemaVersion:1,requestId:'TEST-cancelled-handshake',command:'opencode.handshake',cwd:'/TEST',
+    startedAt:new Date().toISOString(),timeoutMs:8000,body:{client,selectedModel:'groq/c41-upstream',teamId:'TEST',runId:'TEST-run'}},
+    async()=>{throw Error('V1 fallback forbidden')},{signal:cancelled.signal})
+  await statusEntered
+  cancelled.abort()
+  const interrupted=await Promise.race([stalled,Bun.sleep(500).then(()=>null)])
+  assert(interrupted,'Cancelled original owner status read must settle promptly')
+  assert.equal(interrupted.ok,false)
+  assert.equal(interrupted.error.message,'cancelled')
+  OpenCodeV2TeamBridge.prototype.call=originalCall
   originalOwner=false
   const before={inspections,probes}
   const readiness=await execute({schemaVersion:1,requestId:'TEST-readiness',command:'opencode.readiness',cwd:'/TEST',

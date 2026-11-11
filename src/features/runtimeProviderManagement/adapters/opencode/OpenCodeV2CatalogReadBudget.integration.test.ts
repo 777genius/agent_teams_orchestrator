@@ -40,6 +40,54 @@ test('expired shared budget refuses V1 before starting catalog work', async () =
   expect(code).toBe(0)
 }, 20_000)
 
+test('V1 catalog deadline cancels scope preparation before any late profile or host work', async () => {
+  const script = `
+    import { mock } from 'bun:test'
+    import assert from 'node:assert/strict'
+    const identityPath = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/compatibility/OpenCodeNativeIdentity.ts'))}
+    const identity = await import(identityPath)
+    mock.module(identityPath, () => ({ ...identity, inspectOpenCodeReadSelection: async () => ({
+      policy: { generation: 'v1', version: '1.19.4' }, native: null,
+    }) }))
+    const profilePath = ${JSON.stringify(import.meta.resolve('../../../../services/opencode/OpenCodeProfileManager.ts'))}
+    const profile = await import(profilePath)
+    let cancelled = false, published = false, inventoryReads = 0, scopeStarted = false, release
+    const waiting = new Promise(resolve => { release = resolve })
+    mock.module(profilePath, () => ({ ...profile,
+      canonicalizeOpenCodeProjectPath: async () => '/TEST/catalog-scope',
+      resolveOpenCodeProfileScope: async input => {
+        scopeStarted = true
+        await new Promise((resolve, reject) => {
+          waiting.then(resolve)
+          input.abortSignal?.addEventListener('abort', () => {
+            cancelled = true; reject(input.abortSignal.reason)
+          }, { once: true })
+        })
+        published = true
+        return { scopeToken: 'TEST-late-scope' }
+      },
+    }))
+    const { OpenCodeProviderManagementAdapter } = await import(${JSON.stringify(import.meta.resolve('./OpenCodeProviderManagementAdapter.ts'))})
+    // The deadline must cover selection startup before testing the scope cancellation.
+    const adapter = new OpenCodeProviderManagementAdapter({ catalogOverallTimeoutMs: 5_000,
+      inventoryService: { probe: async () => { inventoryReads++; throw Error('TEST unexpected catalog continuation') } } })
+    try {
+      const result = await adapter.loadModels({ runtimeId: 'opencode', providerId: 'openrouter', projectPath: '/TEST/catalog-scope' })
+      assert.equal(result.ok, false)
+      assert.equal(result.error.code, 'runtime-unhealthy')
+      assert.equal(scopeStarted, true, 'The test must reach scoped preparation before its deadline')
+      assert.equal(cancelled, true, 'The caller timeout must cancel its owned scope preparation')
+      release(); await Bun.sleep(5)
+      assert.equal(published, false, 'An expired read must never publish a late scoped profile')
+      assert.equal(inventoryReads, 0)
+    } finally { release(); mock.restore() }
+  `
+  const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe', env: { ...process.env, NODE_ENV: 'test' } })
+  const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()])
+  expect(stderr).not.toContain('AssertionError')
+  expect(code).toBe(0)
+}, 20_000)
+
 for (const phase of ['selection', 'profile-scope', 'profile-auth', 'receipt'] as const) test(`V2 model catalog cancels stalled ${phase} before any native acquisition`, async () => {
   const script = `
     import { mock } from 'bun:test'
@@ -144,6 +192,9 @@ test('catalog profile cancellation reaches the real auth publication lock withou
 }, 20_000)
 
 for (const source of ['project-config', 'imported-config', 'project-default', 'global-default', 'global-default-cli'] as const) {
+  // Reading global defaults follows project/profile preparation. Keep the FIFO
+  // read reachable before testing cancellation on busy CI runners.
+  const budgetMs = source === 'global-default' ? 1_000 : 200
   test.skipIf(process.platform === 'win32')(`catalog deadline interrupts a blocked ${source} read and joins private profile cleanup`, async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-catalog-file-cancel-'))
     const script = `
@@ -196,13 +247,13 @@ for (const source of ['project-config', 'imported-config', 'project-default', 'g
         assert(result, 'The catalog deadline must finish before the blocked read is released')
         assert.equal(result.ok, false)
         assert.equal(result.error.code, 'runtime-unhealthy')
-        assert.match(result.error.message, /catalog timed out during profile.*budget 200ms/)
+        assert.match(result.error.message, new RegExp('catalog timed out during profile.*budget ' + ${budgetMs} + 'ms'))
         assert.deepEqual(await profileNames(), [], 'Private credentials must be cleaned before returning')
         assert.equal(receipts, 0); assert.equal(acquisitions, 0)
       }
       let work, watchdog
       try {
-        const adapter = new OpenCodeProviderManagementAdapter({ catalogOverallTimeoutMs: 200 })
+        const adapter = new OpenCodeProviderManagementAdapter({ catalogOverallTimeoutMs: ${budgetMs} })
         if (source === 'global-default-cli') {
           const load = adapter.loadModels.bind(adapter)
           adapter.loadModels = async input => {
@@ -246,7 +297,7 @@ for (const source of ['project-config', 'imported-config', 'project-default', 'g
       if (source === 'global-default-cli') {
         const response = JSON.parse(stdout)
         expect(response.error.code).toBe('runtime-unhealthy')
-        expect(response.error.message).toMatch(/catalog timed out during profile.*budget 200ms/)
+        expect(response.error.message).toMatch(new RegExp('catalog timed out during profile.*budget ' + budgetMs + 'ms'))
       }
     } finally {
       clearTimeout(watchdog)

@@ -92,6 +92,44 @@ describe('codexBackendResolver', () => {
     ])
   })
 
+  test('bounds login status and rejects partial auth output from failed queries', () => {
+    const failures = [
+      { error: Object.assign(new Error('query timed out'), { code: 'ETIMEDOUT' }), status: 1 },
+      { signal: 'SIGKILL', status: 1 },
+      { status: null },
+    ]
+    for (const [index, failure] of failures.entries()) {
+      const state = detectCodexCliLoginState(20_000, {
+        env: { CODEX_CLI_PATH: `/test/codex-failed-query-${index}` },
+        spawnSync: (_executable, _args, options) => {
+          expect(options.timeout).toBe(10_000)
+          expect(options.killSignal).toBe('SIGKILL')
+          return { stdout: 'Not logged in', stderr: '', ...failure } as never
+        },
+      })
+      expect(state).toBe('unknown')
+    }
+  })
+
+  test('caches a slow login query for five seconds after completion', () => {
+    let elapsed = 0
+    let calls = 0
+    const params = {
+      env: { CODEX_CLI_PATH: '/test/codex-slow-query' },
+      monotonicNow: () => elapsed,
+      spawnSync: () => {
+        calls++
+        elapsed += 7_500
+        return { status: 0, stdout: 'Logged in using ChatGPT', stderr: '' } as never
+      },
+    }
+    expect(detectCodexCliLoginState(30_000, params)).toBe('logged_in')
+    expect(detectCodexCliLoginState(42_499, params)).toBe('logged_in')
+    expect(calls).toBe(1)
+    expect(detectCodexCliLoginState(42_500, params)).toBe('logged_in')
+    expect(calls).toBe(2)
+  })
+
   test('reads the host-managed forced login method from inline settings', () => {
     expect(
       getCodexForcedLoginMethod({

@@ -1584,12 +1584,18 @@ function hasExplicitConnectionEvidence(
 }
 
 function shouldDisplayProviderAsConnected(input: {
+  providerId: string
   connected: boolean
   connectedProvider: OpenCodeConnectedProvider | null | undefined
   configuredAuthless: boolean
 }): boolean {
   if (!input.connected) {
     return false
+  }
+  // Native OpenCode reports Zen as connected even when it only supplies its
+  // anonymous models. Display a saved connection only with credential evidence.
+  if (input.providerId === 'opencode') {
+    return hasExplicitConnectionEvidence(input.connectedProvider)
   }
   if (!input.configuredAuthless) {
     return true
@@ -1972,6 +1978,7 @@ function buildProviderConnections(input: {
       providers: input.providers,
     })
     const displayConnected = shouldDisplayProviderAsConnected({
+      providerId,
       connected,
       connectedProvider,
       configuredAuthless,
@@ -2430,6 +2437,7 @@ function buildProviderDirectory(input: {
       providers: input.providers,
     })
     const displayConnected = shouldDisplayProviderAsConnected({
+      providerId,
       connected,
       connectedProvider,
       configuredAuthless,
@@ -3472,24 +3480,24 @@ export class OpenCodeProviderManagementAdapter
     const canonicalProjectPath = await canonicalizeOpenCodeProjectPath(projectPath)
     const abortController = new AbortController()
     const progress = options?.progress ?? createOpenCodeInventoryProbeProgressTracker()
+    const queueAware = options?.mode === 'summary' && options.abortSignal && options.remainingMs
+    const timeoutMs = this.deps.inventoryTimeoutMs ?? (options?.mode === 'summary'
+      ? OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS : OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS)
     const abortFromCaller = () => abortController.abort(options?.abortSignal?.reason)
     options?.abortSignal?.addEventListener('abort', abortFromCaller, { once: true })
     if (options?.abortSignal?.aborted) abortFromCaller()
     try {
       return await withOpenCodeInventoryProbeTimeout(
-        inventoryService.probe(canonicalProjectPath, {
+        onQueueWait => raceOpenCodeAbortSignal(inventoryService.probe(canonicalProjectPath, {
           ...options,
           includeAppMcp: false,
           abortSignal: abortController.signal,
           progress,
-        }),
+          onCommandLockWaitChanged: queueAware ? onQueueWait : undefined,
+        }), options?.abortSignal),
         {
           projectPath: canonicalProjectPath,
-          timeoutMs:
-            this.deps.inventoryTimeoutMs ??
-            (options?.mode === 'summary'
-              ? OPEN_CODE_INVENTORY_SUMMARY_TIMEOUT_MS
-              : OPEN_CODE_INVENTORY_FULL_TIMEOUT_MS),
+          timeoutMs,
           progress,
           onTimeout: () => abortController.abort(),
         },
@@ -4585,6 +4593,7 @@ export class OpenCodeProviderManagementAdapter
         projectPath: canonicalProjectPath,
         purpose: 'catalog',
         selectedModel: `${providerId}/catalog`,
+        abortSignal: deadline.signal,
       }), deadline.signal)
     } catch (error) {
       reportFailure('scope')
