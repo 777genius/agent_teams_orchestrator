@@ -6,6 +6,7 @@ import {
   getCodexForcedLoginMethod,
   getCodexRuntimeBackendPreference,
   normalizeCodexBackendPreference,
+  probeCodexCliLoginState,
   resolveCodexCliBinary,
   resolveCodexRuntimeSelection,
 } from './codexBackendResolver.js'
@@ -127,6 +128,84 @@ describe('codexBackendResolver', () => {
     expect(detectCodexCliLoginState(42_499, params)).toBe('logged_in')
     expect(calls).toBe(1)
     expect(detectCodexCliLoginState(42_500, params)).toBe('logged_in')
+    expect(calls).toBe(2)
+  })
+
+  test.each([
+    [
+      'spawn error',
+      { status: null, error: Object.assign(new Error('private-output'), { code: 'ENOENT' }) },
+      { reason: 'execution_error', code: 'ENOENT' },
+    ],
+    [
+      'timeout',
+      {
+        status: null,
+        error: Object.assign(new Error('private-output'), { code: 'ETIMEDOUT' }),
+        signal: 'SIGTERM',
+      },
+      { reason: 'execution_error', code: 'ETIMEDOUT', signal: 'SIGTERM' },
+    ],
+    ['signal', { status: null, signal: 'SIGTERM' }, { reason: 'terminated', signal: 'SIGTERM' }],
+    ['nonzero exit', { status: 2 }, { reason: 'nonzero_exit', exitCode: 2 }],
+  ] as const)(
+    'preserves safe %s evidence without treating an inconclusive probe as logged out',
+    (label, result, failure) => {
+      const probe = probeCodexCliLoginState(40_000, {
+        env: { CODEX_CLI_PATH: '/test/codex', CODEX_HOME: `/nonexistent/test-probe-${label}` },
+        spawnSync: () => ({ stdout: '', stderr: 'private-output', ...result }) as never,
+      })
+      expect(probe).toEqual({ state: 'unknown', failure })
+      expect(JSON.stringify(probe)).not.toContain('private-output')
+    },
+  )
+
+  test('does not accept stale logged-out output when the probe was terminated', () => {
+    const probe = probeCodexCliLoginState(50_000, {
+      env: { CODEX_CLI_PATH: '/test/codex', CODEX_HOME: '/nonexistent/test-probe-terminated' },
+      spawnSync: () => ({ status: null, signal: 'SIGTERM', stderr: 'Not logged in' }) as never,
+    })
+    expect(probe.state).toBe('unknown')
+    expect(probe.failure?.reason).toBe('terminated')
+  })
+
+  test('retains safe thrown error codes without exposing raw errors', () => {
+    const probe = probeCodexCliLoginState(60_000, {
+      env: { CODEX_CLI_PATH: '/test/codex', CODEX_HOME: '/nonexistent/test-probe-throw' },
+      spawnSync: () => {
+        throw Object.assign(new Error('private-output'), { code: 'EACCES' })
+      },
+    })
+    expect(probe).toEqual({
+      state: 'unknown',
+      failure: { reason: 'execution_error', code: 'EACCES' },
+    })
+    expect(JSON.stringify(probe)).not.toContain('private-output')
+  })
+
+  test('omits unrecognized error codes instead of exposing arbitrary error properties', () => {
+    const probe = probeCodexCliLoginState(65_000, {
+      env: { CODEX_CLI_PATH: '/test/codex', CODEX_HOME: '/nonexistent/test-probe-code' },
+      spawnSync: () => ({
+        status: null,
+        error: Object.assign(new Error('private-output'), { code: 'PRIVATE_OUTPUT' }),
+      }) as never,
+    })
+    expect(probe).toEqual({ state: 'unknown', failure: { reason: 'execution_error' } })
+  })
+
+  test('rechecks unknown immediately but retains the known-state cache', () => {
+    let calls = 0
+    const params = {
+      env: { CODEX_CLI_PATH: '/test/codex', CODEX_HOME: '/nonexistent/test-probe-recovery' },
+      spawnSync: () => {
+        calls += 1
+        return { status: calls === 1 ? 2 : 0, stdout: '', stderr: '' } as never
+      },
+    }
+    expect(detectCodexCliLoginState(70_000, params)).toBe('unknown')
+    expect(detectCodexCliLoginState(70_001, params)).toBe('logged_in')
+    expect(detectCodexCliLoginState(70_002, params)).toBe('logged_in')
     expect(calls).toBe(2)
   })
 
@@ -254,8 +333,10 @@ describe('codexBackendResolver', () => {
       authMethod: null,
       authCheckIndeterminate: true,
       canLoginFromUi: false,
-      statusMessage: 'Codex native runtime unavailable',
+      statusMessage: 'Codex login verification unavailable',
     })
+    expect(result.detailMessage).toContain('Retry the status check before retrying the task.')
+    expect(result.detailMessage).not.toContain('requires an active')
   })
 
   test('does not mark pinned ChatGPT auth as ready when codex login is inactive', () => {
@@ -347,8 +428,8 @@ describe('codexBackendResolver', () => {
       authCheckIndeterminate: true,
       authenticated: false,
       authMethod: null,
-      statusMessage: 'Codex native runtime degraded',
-      detailMessage: 'Codex native runtime is not ready.',
+      statusMessage: 'Codex login verification unavailable',
+      detailMessage: 'Codex login status could not be confirmed. Retry the status check before retrying the task.',
     })
   })
 

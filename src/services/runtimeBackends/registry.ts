@@ -1056,16 +1056,16 @@ function buildCodexStatuses(): {
     ? 'ready'
     : !resolution.nativeBinaryDetected
       ? 'runtime-missing'
-      : !resolution.nativeApiKeyConfigured
+      : !resolution.nativeApiKeyConfigured && !resolution.authCheckIndeterminate
         ? 'authentication-required'
         : 'degraded'
   const codexNativeStatusMessage = codexNativeAvailable
     ? 'Ready'
     : !resolution.nativeBinaryDetected
       ? 'Codex CLI not found'
-      : !resolution.nativeApiKeyConfigured
+      : !resolution.nativeApiKeyConfigured && !resolution.authCheckIndeterminate
         ? 'Authentication required'
-        : 'Degraded'
+        : resolution.authCheckIndeterminate ? 'Verification unavailable' : 'Degraded'
   const statusCheck = resolution.authCheckIndeterminate
     ? {
         statusCheckOutcome: 'transient_error' as const,
