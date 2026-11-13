@@ -333,6 +333,9 @@ export async function getAnthropicClient({
 
     const codexApiKey = getCodexApiKey()
     const codexRuntimeDetail = resolution.detailMessage?.trim()
+    if (resolution.authCheckIndeterminate && codexRuntimeDetail) {
+      throw new Error(codexRuntimeDetail)
+    }
     throw new Error(
       codexApiKey
         ? 'Codex provider is pinned to the native runtime, but this code path still expects the removed legacy transport. Route through the dedicated codex-native execution lane instead.'

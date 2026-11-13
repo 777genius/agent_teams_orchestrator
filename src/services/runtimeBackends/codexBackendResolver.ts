@@ -10,6 +10,16 @@ export const CODEX_FORCED_LOGIN_METHOD_ENV_VAR =
   'CLAUDE_CODE_CODEX_FORCED_LOGIN_METHOD'
 export type CodexForcedLoginMethod = 'chatgpt' | 'api'
 export type CodexCliLoginState = 'logged_in' | 'not_logged_in' | 'unknown'
+export type CodexCliLoginProbeFailure = {
+  reason: 'missing_binary' | 'execution_error' | 'terminated' | 'nonzero_exit'
+  code?: string
+  signal?: string
+  exitCode?: number
+}
+export type CodexCliLoginProbeResult = {
+  state: CodexCliLoginState
+  failure?: CodexCliLoginProbeFailure
+}
 export type CodexCliBinarySource = 'configured-env' | 'system-path'
 
 export type CodexCliBinaryResolution = {
@@ -39,6 +49,10 @@ export type CodexRuntimeResolution = {
 
 const CODEX_LOGIN_STATUS_CACHE_MS = 5_000
 const CODEX_LOGIN_STATUS_TIMEOUT_MS = 10_000
+const LOGIN_PROBE_ERROR_CODES = new Set([
+  'ENOENT', 'EACCES', 'EPERM', 'ETIMEDOUT', 'ENOMEM', 'EAGAIN', 'EINVAL',
+  'ENOTDIR', 'ENAMETOOLONG', 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+])
 
 let cachedCodexCliLoginState:
   | {
@@ -143,7 +157,7 @@ function getCodexLoginStateCacheKey(
   ].join('\0')
 }
 
-export function detectCodexCliLoginState(
+export function probeCodexCliLoginState(
   nowMs: number = Date.now(),
   params?: {
     env?: NodeJS.ProcessEnv
@@ -151,7 +165,7 @@ export function detectCodexCliLoginState(
     spawnSync?: typeof spawnSyncPortableCli
     monotonicNow?: () => number
   },
-): CodexCliLoginState {
+): CodexCliLoginProbeResult {
   const env = params?.env ?? process.env
   const codexBinary = resolveCodexCliBinary({
     env,
@@ -163,15 +177,15 @@ export function detectCodexCliLoginState(
     && cachedCodexCliLoginState.cacheKey === cacheKey
     && nowMs - cachedCodexCliLoginState.checkedAtMs < CODEX_LOGIN_STATUS_CACHE_MS
   ) {
-    return cachedCodexCliLoginState.value
+    return { state: cachedCodexCliLoginState.value }
   }
 
   if (!codexBinary) {
-    cachedCodexCliLoginState = { checkedAtMs: nowMs, cacheKey, value: 'unknown' }
-    return 'unknown'
+    return { state: 'unknown', failure: { reason: 'missing_binary' } }
   }
 
   let nextValue: CodexCliLoginState = 'unknown'
+  let failure: CodexCliLoginProbeFailure | undefined
   const monotonicNow = params?.monotonicNow ?? (() => performance.now())
   const startedAt = monotonicNow()
 
@@ -189,21 +203,60 @@ export function detectCodexCliLoginState(
     )
     const combinedOutput = `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim()
 
-    // Partial output from a killed/failed query cannot prove an auth state.
-    if (!result.error && !result.signal && result.status !== null) {
-      if (result.status === 0) {
-        nextValue = 'logged_in'
-      } else if (/not logged in/i.test(combinedOutput)) {
-        nextValue = 'not_logged_in'
-      }
+    if (result.error) {
+      failure = loginProbeFailure('execution_error', result.error, result.status, result.signal)
+    } else if (result.signal) {
+      failure = loginProbeFailure('terminated', null, result.status, result.signal)
+    } else if (result.status === 0) {
+      nextValue = 'logged_in'
+    } else if (result.status != null && result.status > 0 && /not logged in/i.test(combinedOutput)) {
+      nextValue = 'not_logged_in'
+    } else {
+      failure = loginProbeFailure('nonzero_exit', null, result.status, result.signal)
     }
-  } catch {
-    nextValue = 'unknown'
+  } catch (error) {
+    failure = loginProbeFailure('execution_error', error)
   }
 
   const completedAtMs = nowMs + Math.max(0, monotonicNow() - startedAt)
-  cachedCodexCliLoginState = { checkedAtMs: completedAtMs, cacheKey, value: nextValue }
-  return nextValue
+  // An inconclusive probe must not suppress a fresh check on the next user retry.
+  if (nextValue !== 'unknown') {
+    cachedCodexCliLoginState = { checkedAtMs: completedAtMs, cacheKey, value: nextValue }
+  }
+  return { state: nextValue, ...(failure ? { failure } : {}) }
+}
+
+function loginProbeFailure(
+  reason: CodexCliLoginProbeFailure['reason'],
+  error: unknown,
+  exitCode?: number | null,
+  signal?: string | null,
+): CodexCliLoginProbeFailure {
+  const code = asRecord(error)?.code
+  // Never expose raw messages, child output, or arbitrary error properties.
+  return {
+    reason,
+    ...(typeof code === 'string' && LOGIN_PROBE_ERROR_CODES.has(code) ? { code } : {}),
+    ...(typeof signal === 'string' && /^SIG[A-Z0-9]{1,20}$/.test(signal) ? { signal } : {}),
+    ...(typeof exitCode === 'number' && Number.isInteger(exitCode) ? { exitCode } : {}),
+  }
+}
+
+export function detectCodexCliLoginState(
+  nowMs: number = Date.now(),
+  params?: Parameters<typeof probeCodexCliLoginState>[1],
+): CodexCliLoginState {
+  return probeCodexCliLoginState(nowMs, params).state
+}
+
+function getLoginProbeFailureDetail(failure: CodexCliLoginProbeFailure | undefined): string {
+  if (!failure) return ''
+  return ` Probe: ${[
+    `reason=${failure.reason}`,
+    failure.code ? `code=${failure.code}` : null,
+    failure.signal ? `signal=${failure.signal}` : null,
+    failure.exitCode != null ? `exit=${failure.exitCode}` : null,
+  ].filter(Boolean).join('; ')}.`
 }
 
 function getConfiguredCodexRuntimeContextDetail(
@@ -258,11 +311,12 @@ export function resolveCodexRuntimeSelection(params?: {
   const chatgptModePinned = forcedLoginMethod === 'chatgpt'
   const hostManagedChatGptAuthSelected =
     chatgptModePinned || (forcedLoginMethod == null && oauthAuthenticated)
-  const chatgptLoginState =
-    params?.chatgptLoginState
-    ?? (hostManagedChatGptAuthSelected
-      ? detectCodexCliLoginState(Date.now(), { env })
-      : 'unknown')
+  const loginProbe: CodexCliLoginProbeResult = params?.chatgptLoginState != null
+    ? { state: params.chatgptLoginState }
+    : hostManagedChatGptAuthSelected
+      ? probeCodexCliLoginState(Date.now(), { env })
+      : { state: 'unknown' }
+  const chatgptLoginState = loginProbe.state
   const hostManagedChatGptAuthReady =
     hostManagedChatGptAuthSelected &&
     chatgptLoginState === 'logged_in'
@@ -296,6 +350,14 @@ export function resolveCodexRuntimeSelection(params?: {
     statusMessage = 'Codex native runtime unavailable'
     detailMessage =
       'Codex native runtime requires the codex CLI binary to be installed and discoverable.'
+  } else if (authCheckIndeterminate) {
+    statusMessage = 'Codex login verification unavailable'
+    detailMessage =
+      `Codex login status could not be confirmed. Retry the status check before retrying the task.${getConfiguredCodexRuntimeContextDetail(
+        env,
+        nativeBinaryResolution,
+        chatgptLoginState,
+      )}${getLoginProbeFailureDetail(loginProbe.failure)}`
   } else if (!nativeApiKeyConfigured) {
     statusMessage = 'Codex native runtime unavailable'
     detailMessage =
