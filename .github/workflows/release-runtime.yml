@@ -353,7 +353,29 @@ jobs:
           # manual staging step nobody performs on a real install.
           [[ -d dist/cursor-managed ]] || { echo "Managed Cursor assets missing"; exit 1; }
           cp -R dist/cursor-managed release/runtime/cursor-managed
+          # The Linux native custody helper is compiled and verified by
+          # package-runtime.ts, but cannot be resolved if it is omitted from
+          # the shipped archive. Bundle only this build lane's verified helper.
+          if [[ "${{ matrix.platform }}" == linux-* ]]; then
+            custody_target="dist/native/opencode-custody/${{ matrix.platform }}"
+            [[ -f "$custody_target/custodian" && -f "$custody_target/custodian.json" ]] || {
+              echo "Verified Linux native custody helper or manifest is missing" >&2
+              exit 1
+            }
+            mkdir -p release/runtime/native/opencode-custody
+            cp -R "$custody_target" release/runtime/native/opencode-custody/
+            EXPECTED_PLATFORM="${{ matrix.platform }}" bun --no-install -e '
+              import { verifyLinuxCustodyArtifact } from "./scripts/lib/opencode-custody-artifact.ts"
+              verifyLinuxCustodyArtifact("./release/runtime/native", process.env.EXPECTED_PLATFORM, "./native/opencode-custody/linux.c")
+            '
+          fi
           tar -czf "release/${{ matrix.archive_name }}" -C release runtime
+          if [[ "${{ matrix.platform }}" == linux-* ]]; then
+            tar -tzf "release/${{ matrix.archive_name }}" |
+              grep -Fx "runtime/native/opencode-custody/${{ matrix.platform }}/custodian"
+            tar -tzf "release/${{ matrix.archive_name }}" |
+              grep -Fx "runtime/native/opencode-custody/${{ matrix.platform }}/custodian.json"
+          fi
 
       - name: Package runtime archive (Windows)
         if: runner.os == 'Windows'
