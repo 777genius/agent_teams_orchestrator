@@ -150,6 +150,50 @@ describe('OpenCodeProfileManager project behavior contract', () => {
     }
   })
 
+  test.skipIf(process.platform !== 'linux')('Linux native profile root is private under umask 0002 without repairing unsafe existing roots', async () => {
+    const projectPath = path.join(tempDir, 'TEST-native-profile-project')
+    await mkdir(projectPath)
+    // Isolate the process-wide umask: other Bun tests and workers are unaffected.
+    const script = `
+      import * as fs from 'node:fs/promises'
+      import path from 'node:path'
+      import { OpenCodeProfileManager } from ${JSON.stringify(new URL('./OpenCodeProfileManager.ts', import.meta.url).href)}
+      process.umask(0o002)
+      const prepare = () => new OpenCodeProfileManager().prepareProfile(${JSON.stringify(projectPath)}, {
+        includeAppMcp: false, includeManagedSubscriptionPlugins: false,
+      })
+      const first = await prepare()
+      const root = first.profileRootPath
+      const mode = async () => (await fs.lstat(root)).mode & 0o777
+      if (await mode() !== 0o700) throw Error('new native root was not 0700')
+      const marker = path.join(root, 'TEST-existing-content')
+      await fs.writeFile(marker, 'preserved', { mode: 0o600 })
+      await fs.chmod(root, 0o755)
+      const reused = await prepare()
+      if (reused.profileRootPath !== root || await mode() !== 0o755)
+        throw Error('safe existing root was modified')
+      await fs.chmod(root, 0o775)
+      let denied = false
+      try { await prepare() } catch (error) {
+        denied = error instanceof Error && error.message === 'native_custody_image_mismatch'
+      }
+      if (!denied || await mode() !== 0o775 || await fs.readFile(marker, 'utf8') !== 'preserved')
+        throw Error('unsafe existing root was accepted or modified')
+      await fs.chmod(root, 0o700)
+      const original = root + '-original'
+      await fs.rename(root, original)
+      await fs.symlink(original, root)
+      let symlinkRefused = false
+      try { await prepare() } catch { symlinkRefused = true }
+      if (!symlinkRefused || !(await fs.lstat(root)).isSymbolicLink()
+        || await fs.readFile(path.join(original, 'TEST-existing-content'), 'utf8') !== 'preserved')
+        throw Error('symlink root was followed or mutated')
+      console.log('TEST-native-profile-permissions-pass')
+    `
+    expect(await runCommandCapture(process.execPath, ['--no-env-file', '-e', script], process.env))
+      .toContain('TEST-native-profile-permissions-pass')
+  })
+
   test('isolates scoped profile roots by normalized project, purpose, provider, and config', async () => {
     const manager = new OpenCodeProfileManager()
     const projectPath = path.join(tempDir, 'project')
