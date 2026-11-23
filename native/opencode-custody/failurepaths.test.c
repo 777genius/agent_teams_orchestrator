@@ -80,7 +80,7 @@ static void exercise_fd_layout(unsigned layout) {
   close(report[0]);
   int status = 0; assert(waitpid(child, &status, 0) == child);
   if (layout == 5) {
-    assert(received == sizeof(exec_errno) && (exec_errno == EACCES || exec_errno == ENOEXEC));
+    assert(received == (ssize_t)sizeof(exec_errno) && (exec_errno == EACCES || exec_errno == ENOEXEC));
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 112);
   } else {
     assert(received == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
