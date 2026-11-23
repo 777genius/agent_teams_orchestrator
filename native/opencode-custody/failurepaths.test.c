@@ -25,7 +25,65 @@ static void malformed(const unsigned char *body, unsigned size) {
   assert(read_fields(channel[0], CONTROL_LIMIT) == 0); close(channel[0]);
   for (unsigned i = 0; i < MAX_FIELDS; i++) assert(fields[i] == NULL);
 }
-int main(void) {
+/* Execute the real helper's child path with deterministic adversarial FD
+ * allocations. This ELF re-execs itself; no provider or external process. */
+static void exercise_fd_layout(unsigned layout) {
+  int report[2]; assert(pipe2(report, O_CLOEXEC) == 0);
+  pid_t child = fork(); assert(child >= 0);
+  if (child == 0) {
+    int error_write = fcntl(report[1], F_DUPFD_CLOEXEC, 50);
+    if (error_write < 50) _exit(113);
+    close(report[0]); close(report[1]);
+    for (int fd = 3; fd < 32; fd++) close(fd);
+    int output = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (output != 3 || dup2(output, 4) != 4) _exit(114);
+    int listener = -1;
+    if (layout == 0) { /* Image owns 5; originally closed before fexecve. */
+      image_fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+      listener = open("/dev/null", O_RDONLY | O_CLOEXEC);
+      if (image_fd != 5 || listener != 6) _exit(115);
+    } else if (layout == 1) { /* Listener owns 5. */
+      listener = open("/dev/null", O_RDONLY | O_CLOEXEC);
+      image_fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+      if (listener != 5 || image_fd != 6) _exit(116);
+    } else if (layout == 2) { /* Exec-error pipe owns 5. */
+      if (dup2(error_write, 5) != 5 || fcntl(5, F_SETFD, FD_CLOEXEC)) _exit(117);
+      close(error_write); error_write = 5;
+      listener = open("/dev/null", O_RDONLY | O_CLOEXEC);
+      image_fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+      if (listener != 6 || image_fd != 7) _exit(118);
+    } else if (layout == 3) { /* /dev/null stdin allocation reuses 5. */
+      int vacancy = open("/dev/null", O_RDONLY | O_CLOEXEC);
+      listener = open("/dev/null", O_RDONLY | O_CLOEXEC);
+      image_fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+      if (vacancy != 5 || listener != 6 || image_fd != 7) _exit(119);
+      close(vacancy);
+    } else { /* The inherited receipt owns 5. */
+      int receipt = open("/dev/null", O_WRONLY | O_CLOEXEC);
+      listener = open("/dev/null", O_RDONLY | O_CLOEXEC);
+      image_fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+      if (receipt != 5 || listener != 6 || image_fd != 7) _exit(120);
+    }
+    char *const argv[] = { "/proc/self/exe", "--fd-exec-probe", NULL };
+    char *const env[] = { "PATH=/usr/bin:/bin", NULL };
+    exec_private_child(listener, -1, error_write, "/", argv, env);
+  }
+  close(report[1]);
+  unsigned char status_byte;
+  assert(read(report[0], &status_byte, 1) == 0); /* CLOEXEC, no error. */
+  close(report[0]);
+  int status = 0; assert(waitpid(child, &status, 0) == child);
+  assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "--fd-exec-probe") == 0) {
+    // The native image never receives the helper's transport, receipt or
+    // executable descriptors; only standard streams survive exec.
+    for (int fd = 3; fd < 64; fd++) { errno = 0; if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) return 121; }
+    return 0;
+  }
+  for (unsigned layout = 0; layout < 5; layout++) exercise_fd_layout(layout);
   int before = descriptor_count();
   // A valid allocated first field followed by truncated length, overflow or NUL.
   const unsigned char truncated[] = {0, 0, 0, 3, 'o', 'n', 'e', 0, 0};
@@ -62,7 +120,7 @@ int main(void) {
   int listener = fcntl(seed, F_DUPFD_CLOEXEC, 10); assert(listener >= 10);
   image_fd = fcntl(seed, F_DUPFD_CLOEXEC, 10); assert(image_fd >= 10);
   process_fd = fcntl(seed, F_DUPFD_CLOEXEC, 10); assert(process_fd >= 10);
-  assert(dup2(seed, 5) == 5); close(seed);
+  assert(dup2(seed, 5) == 5); close(seed); inherited_fd5 = 5;
   int image = image_fd, process = process_fd;
   image_path = strdup("TEST-only-owned-image"); assert(image_path);
   close_launch_resources(listener);
