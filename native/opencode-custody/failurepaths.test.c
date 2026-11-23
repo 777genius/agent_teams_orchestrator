@@ -87,6 +87,26 @@ static void exercise_fd_layout(unsigned layout) {
   }
 }
 
+/* Actual measure transport may inherit fd 3 but no fd 4. Preserve the
+ * ignored stderr contract without allowing the listener to take fd 4. */
+static void exercise_missing_stderr_channel(int measurement) {
+  pid_t child = fork(); assert(child >= 0);
+  if (child == 0) {
+    for (int fd = 3; fd < 32; fd++) close(fd);
+    if (open("/dev/null", O_WRONLY | O_CLOEXEC) != 3) _exit(124);
+    prepare_launch_channels(measurement);
+    if (!measurement) _exit(125); /* A real launch must fail closed. */
+    int flags = fcntl(4, F_GETFD);
+    if (flags < 0 || !(flags & FD_CLOEXEC)) _exit(126);
+    int listener = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    int image = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+    if (listener != 5 || image != 6 || inherited_fd5 != -1) _exit(127);
+    _exit(0);
+  }
+  int status = 0; assert(waitpid(child, &status, 0) == child);
+  assert(WIFEXITED(status) && WEXITSTATUS(status) == (measurement ? 0 : 112));
+}
+
 int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--fd-exec-probe") == 0) {
     // The native image never receives the helper's transport, receipt or
@@ -95,6 +115,8 @@ int main(int argc, char **argv) {
     return 0;
   }
   for (unsigned layout = 0; layout < 6; layout++) exercise_fd_layout(layout);
+  exercise_missing_stderr_channel(1);
+  exercise_missing_stderr_channel(0);
   int before = descriptor_count();
   // A valid allocated first field followed by truncated length, overflow or NUL.
   const unsigned char truncated[] = {0, 0, 0, 3, 'o', 'n', 'e', 0, 0};
