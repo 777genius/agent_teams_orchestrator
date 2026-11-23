@@ -355,12 +355,9 @@ static void exec_private_child(int listener, int error_read, int error_write,
   int failure = errno; (void)full_write(error_write, &failure, sizeof(failure)); _exit(112);
 }
 
-static void launch(unsigned count, int measurement) {
-  /* launch, epoch, image, cwd, persistent, dev, ino, argc, argv..., envc, env... */
-  if (count < 10 || strlen(fields[1]) != 64) fail();
-  // Source measurement supplies an output pipe at 3 but deliberately
-  // ignores channel 4. Materialize its stderr sink *before* allocating the
-  // listener or image, so neither can be mistaken for the missing channel.
+/* Materialize measurement's intentionally ignored stderr channel before
+ * allocating a listener or image. Launch requires real inherited channels. */
+static void prepare_launch_channels(int measurement) {
   if (fcntl(3, F_GETFD) < 0) fail();
   if (fcntl(4, F_GETFD) < 0) {
     if (!measurement || errno != EBADF) fail();
@@ -375,6 +372,11 @@ static void launch(unsigned count, int measurement) {
         (receipt.st_mode & 0777) != 0600) fail();
     receipt_fd = 5;
   }
+}
+static void launch(unsigned count, int measurement) {
+  /* launch, epoch, image, cwd, persistent, dev, ino, argc, argv..., envc, env... */
+  if (count < 10 || strlen(fields[1]) != 64) fail();
+  prepare_launch_channels(measurement);
   memcpy(epoch, fields[1], 65);
   int listener = control_socket(epoch, 1);
   image_fd = open(fields[2], O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
