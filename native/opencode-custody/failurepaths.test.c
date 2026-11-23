@@ -58,22 +58,33 @@ static void exercise_fd_layout(unsigned layout) {
       image_fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
       if (vacancy != 5 || listener != 6 || image_fd != 7) _exit(119);
       close(vacancy);
-    } else { /* The inherited receipt owns 5. */
+    } else if (layout == 4) { /* The inherited receipt owns 5. */
       int receipt = open("/dev/null", O_WRONLY | O_CLOEXEC);
       listener = open("/dev/null", O_RDONLY | O_CLOEXEC);
       image_fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
       if (receipt != 5 || listener != 6 || image_fd != 7) _exit(120);
+    } else { /* Failed exec still reports errno over FD 5. */
+      if (dup2(error_write, 5) != 5 || fcntl(5, F_SETFD, FD_CLOEXEC)) _exit(122);
+      close(error_write); error_write = 5;
+      listener = open("/dev/null", O_RDONLY | O_CLOEXEC);
+      image_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+      if (listener != 6 || image_fd != 7) _exit(123);
     }
     char *const argv[] = { "/proc/self/exe", "--fd-exec-probe", NULL };
     char *const env[] = { "PATH=/usr/bin:/bin", NULL };
     exec_private_child(listener, -1, error_write, "/", argv, env);
   }
   close(report[1]);
-  unsigned char status_byte;
-  assert(read(report[0], &status_byte, 1) == 0); /* CLOEXEC, no error. */
+  int exec_errno = 0;
+  ssize_t received = read(report[0], &exec_errno, sizeof(exec_errno));
   close(report[0]);
   int status = 0; assert(waitpid(child, &status, 0) == child);
-  assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  if (layout == 5) {
+    assert(received == sizeof(exec_errno) && (exec_errno == EACCES || exec_errno == ENOEXEC));
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 112);
+  } else {
+    assert(received == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
 }
 
 int main(int argc, char **argv) {
@@ -83,7 +94,7 @@ int main(int argc, char **argv) {
     for (int fd = 3; fd < 64; fd++) { errno = 0; if (fcntl(fd, F_GETFD) != -1 || errno != EBADF) return 121; }
     return 0;
   }
-  for (unsigned layout = 0; layout < 5; layout++) exercise_fd_layout(layout);
+  for (unsigned layout = 0; layout < 6; layout++) exercise_fd_layout(layout);
   int before = descriptor_count();
   // A valid allocated first field followed by truncated length, overflow or NUL.
   const unsigned char truncated[] = {0, 0, 0, 3, 'o', 'n', 'e', 0, 0};
