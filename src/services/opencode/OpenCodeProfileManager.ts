@@ -3583,6 +3583,13 @@ export class OpenCodeProfileManager {
       'profiles',
       profileRootKey,
     )
+    if (process.platform === 'linux') {
+      // Native custody requires a private profile root. Never chmod an existing
+      // root: an active epoch may already have captured its inode and mode.
+      await mkdir(profileRootPath, { recursive: true, mode: 0o700 })
+      const { validateNativeProfileRoot } = await import('./native/OpenCodeLaunchImage.js')
+      await validateNativeProfileRoot(profileRootPath)
+    }
     const { projectBehaviorFingerprint, behaviorSources, behaviorSourceFingerprints } =
       await collectProjectBehaviorMetadata(
         resolvedProjectPath,
