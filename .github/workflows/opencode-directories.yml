@@ -44,6 +44,9 @@ jobs:
         run: bun install --frozen-lockfile --ignore-scripts
       - name: Test directory compatibility
         run: bun test --timeout 30000 src/services/opencode/ensureOpenCodeDirectory.test.ts src/services/opencode/OpenCodePrivateMcpConfig.test.ts
+      - name: Test real Linux native profile preparation under umask 0002
+        if: runner.os == 'Linux'
+        run: bun test --timeout 30000 src/services/opencode/OpenCodeProfileManager.test.ts --test-name-pattern 'Linux native profile root'
       - name: Test foreign ownership refusal in isolated root-owned temporary fixture
         if: runner.os == 'Linux'
         run: sudo env TMPDIR=/tmp "$(command -v bun)" test src/services/opencode/OpenCodePrivateMcpConfig.test.ts --test-name-pattern 'rejects a foreign-owned existing file'

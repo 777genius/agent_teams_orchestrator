@@ -29,6 +29,7 @@ static unsigned char packet[LIMIT + 1];
 static char *fields[MAX_FIELDS];
 static pid_t native_pid = -1;
 static int process_fd = -1, image_fd = -1, dead = 0;
+static int inherited_fd5 = -1, receipt_fd = -1;
 static int native_status = 0;
 static int root_exited = 0, startup_failed = 0;
 static struct stat image_stat;
@@ -163,7 +164,10 @@ static int observe_exit(void) {
     char receipt[256];
     int length = snprintf(receipt, sizeof(receipt), "{\"protocol\":1,\"epoch\":\"%s\",\"pid\":%d,\"birth\":\"%s\",\"status\":%d}\n", epoch, native_pid, native_birth, native_status);
     if (length > 0 && length < (int)sizeof(receipt)) {
-      (void)full_write(5, receipt, (size_t)length); (void)fsync(5);
+      if (receipt_fd >= 0) {
+        (void)full_write(receipt_fd, receipt, (size_t)length);
+        (void)fsync(receipt_fd);
+      }
     }
   }
   return dead;
@@ -200,7 +204,10 @@ static void close_launch_resources(int listener) {
   close(listener);
   if (process_fd >= 0) { close(process_fd); process_fd = -1; }
   if (image_fd >= 0) { close(image_fd); image_fd = -1; }
-  close(5);
+  // FD 5 is not always the inherited receipt: measure may allocate an
+  // image or an internal pipe there. Close only a captured inherited FD.
+  if (inherited_fd5 >= 0) { close(inherited_fd5); inherited_fd5 = -1; }
+  receipt_fd = -1;
   free(image_path); image_path = NULL;
 }
 static void failed_creation(int listener, unsigned count, int signalled_without_pidfd) {
@@ -327,9 +334,49 @@ static void hello(void) {
     getpid(), started, (unsigned long long)image.st_dev, (unsigned long long)image.st_ino, boot_id);
   if (!reply(STDOUT_FILENO, output)) fail();
 }
+/* No numeric FD is implicitly owned by the child. Keep the sealed ELF
+ * image and CLOEXEC error pipe through fexecve, even when image_fd == 5. */
+static void exec_private_child(int listener, int error_read, int error_write,
+    const char *cwd, char *const argv[], char *const env[]) {
+  close(error_read);
+  int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
+  if (input < 0 || chdir(cwd) || dup2(input, STDIN_FILENO) < 0 ||
+      dup2(3, STDOUT_FILENO) < 0 || dup2(4, STDERR_FILENO) < 0) _exit(112);
+  if (input == STDIN_FILENO && fcntl(STDIN_FILENO, F_SETFD, 0) < 0) _exit(112);
+  const int unused[] = { input, listener, 3, 4, 5 };
+  for (unsigned i = 0; i < sizeof(unused) / sizeof(unused[0]); i++) {
+    int fd = unused[i];
+    if (fd <= STDERR_FILENO || fd == image_fd || fd == error_write) continue;
+    int duplicate = 0;
+    for (unsigned j = 0; j < i; j++) if (unused[j] == fd) duplicate = 1;
+    if (!duplicate) close(fd);
+  }
+  fexecve(image_fd, argv, env);
+  int failure = errno; (void)full_write(error_write, &failure, sizeof(failure)); _exit(112);
+}
+
+/* Materialize measurement's intentionally ignored stderr channel before
+ * allocating a listener or image. Launch requires real inherited channels. */
+static void prepare_launch_channels(int measurement) {
+  if (fcntl(3, F_GETFD) < 0) fail();
+  if (fcntl(4, F_GETFD) < 0) {
+    if (!measurement || errno != EBADF) fail();
+    if (open("/dev/null", O_WRONLY | O_CLOEXEC) != 4) fail();
+  }
+  if (fcntl(5, F_GETFD) >= 0) inherited_fd5 = 5;
+  else if (errno != EBADF) fail();
+  if (!measurement) {
+    struct stat receipt;
+    if (inherited_fd5 != 5 || fstat(5, &receipt) ||
+        !S_ISREG(receipt.st_mode) || receipt.st_uid != getuid() || receipt.st_nlink != 1 ||
+        (receipt.st_mode & 0777) != 0600) fail();
+    receipt_fd = 5;
+  }
+}
 static void launch(unsigned count, int measurement) {
   /* launch, epoch, image, cwd, persistent, dev, ino, argc, argv..., envc, env... */
   if (count < 10 || strlen(fields[1]) != 64) fail();
+  prepare_launch_channels(measurement);
   memcpy(epoch, fields[1], 65);
   int listener = control_socket(epoch, 1);
   image_fd = open(fields[2], O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
@@ -351,14 +398,7 @@ static void launch(unsigned count, int measurement) {
   if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)) fail();
   int exec_error[2]; if (pipe2(exec_error, O_CLOEXEC)) fail();
   native_pid = fork(); if (native_pid < 0) fail();
-  if (!native_pid) {
-    close(exec_error[0]);
-    int input = open("/dev/null", O_RDONLY | O_CLOEXEC);
-    if (input < 0 || chdir(fields[3]) || dup2(input, 0) < 0 || dup2(3, 1) < 0 || dup2(4, 2) < 0) _exit(112);
-    close(input); close(listener); close(3); close(4); close(5);
-    fexecve(image_fd, argv, env);
-    int failure = errno; (void)full_write(exec_error[1], &failure, sizeof(failure)); _exit(112);
-  }
+  if (!native_pid) exec_private_child(listener, exec_error[0], exec_error[1], fields[3], argv, env);
   close(exec_error[1]);
   close(3); close(4);
   process_fd = (int)syscall(SYS_pidfd_open, native_pid, 0);
