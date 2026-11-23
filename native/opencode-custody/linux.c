@@ -358,8 +358,14 @@ static void exec_private_child(int listener, int error_read, int error_write,
 static void launch(unsigned count, int measurement) {
   /* launch, epoch, image, cwd, persistent, dev, ino, argc, argv..., envc, env... */
   if (count < 10 || strlen(fields[1]) != 64) fail();
-  // Capture inherited stdio before any open can reuse a missing FD.
-  if (fcntl(3, F_GETFD) < 0 || fcntl(4, F_GETFD) < 0) fail();
+  // Source measurement supplies an output pipe at 3 but deliberately
+  // ignores channel 4. Materialize its stderr sink *before* allocating the
+  // listener or image, so neither can be mistaken for the missing channel.
+  if (fcntl(3, F_GETFD) < 0) fail();
+  if (fcntl(4, F_GETFD) < 0) {
+    if (!measurement || errno != EBADF) fail();
+    if (open("/dev/null", O_WRONLY | O_CLOEXEC) != 4) fail();
+  }
   if (fcntl(5, F_GETFD) >= 0) inherited_fd5 = 5;
   else if (errno != EBADF) fail();
   if (!measurement) {
