@@ -4,6 +4,7 @@ import { importOpenCodeV2ClientModule, resolveOpenCodeV2ClientEntry } from '../t
 import { requireExecutionEndpoint, requireExecutionGraph, registerExecutionDisposer } from './OpenCodeV2ExecutionHost.js'
 import type { OwnedNativeProfile } from './OpenCodeV2ExecutionBinding.js'
 import { readOpenCodeV2SelectedAuth } from './OpenCodeV2ExecutionOAuth.js'
+import { assertOpenCodeV2AuthlessLocalReadback, readOpenCodeV2AuthlessLocalRoute } from './OpenCodeV2AuthlessLocalRoute.js'
 
 type SelectedKeyPort = {
   providers(): Promise<unknown>; integration(id: string): Promise<unknown>
@@ -19,10 +20,11 @@ export async function attachOpenCodeV2SelectedKey(profile: OwnedNativeProfile, p
   executionAssert(!('purpose' in profile.selection), 'execution_selected_auth_required')
   const selectedModel = profile.selection.model
   const providerId = selectedModel.providerID
-  // Both pinned native plugins publish this sentinel only for their anonymous lane.
-  // No caller provider name or absent auth file alone grants anonymous admission.
+  // Missing selected auth requires either the sealed explicit loopback route or
+  // the native public/free route. Absence alone never grants admission.
   if (profile.authSha256 === undefined) {
     executionAssert(typeof port.models === 'function', 'execution_selected_auth_anonymous_unproven')
+    const localRoute = readOpenCodeV2AuthlessLocalRoute(profile)
     const scoped = (value: unknown) => {
       const row = executionRecord(value)
       executionAssert(executionRecord(row.location).directory === profile.directory, 'execution_selected_auth_location_changed')
@@ -32,6 +34,15 @@ export async function attachOpenCodeV2SelectedKey(profile: OwnedNativeProfile, p
     executionAssert(Array.isArray(providers), 'execution_selected_auth_provider_unknown')
     const matches = providers.map(executionRecord).filter(row => row.id === providerId)
     const provider = matches[0]
+    if (localRoute) {
+      executionAssert(matches.length === 1 && provider, 'execution_selected_auth_local_route_unproven')
+      await assertOpenCodeV2AuthlessLocalReadback(profile, localRoute, provider, {
+        integration: async id => scoped(await port.integration(id)),
+        models: async () => scoped(await port.models!()),
+      })
+      return
+    }
+    // Pinned native plugins publish this sentinel only for their anonymous lane.
     executionAssert(matches.length === 1 && provider?.activation === 'enabled' &&
       executionRecord(provider.settings).apiKey === 'public' && typeof provider.integrationID === 'string' &&
       provider.integrationID.length > 0, 'execution_selected_auth_anonymous_unproven')
