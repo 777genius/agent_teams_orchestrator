@@ -3,7 +3,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { mkdir, open, readFile } from 'node:fs/promises'
 import { constants } from 'node:fs'
 import path from 'node:path'
-import { evidence, fact, publicEpoch, readPrivateJson, type ColdInput, type ReadyReceipt } from './fixtures/OpenCodeNativeColdController.js'
+import { evidence, fact, failureDiagnostic, publicEpoch, readPrivateJson, type ColdInput, type ReadyReceipt } from './fixtures/OpenCodeNativeColdController.js'
 import { nativeAuthorityPath, nativeExitConfirmed, readNativeAuthority } from './OpenCodeNativeAuthority.js'
 import type { OpenCodePreparedProfile } from '../types.js'
 
@@ -70,6 +70,7 @@ export async function qualifyNativeColdRecovery(options: {
     options.parentSignal.throwIfAborted()
     // Only the sentinel consumes control input; A/B exit from their finite role.
     let exited = false, exitCode: number | null = null, exitSignal: string | null = null, waitFailed = false
+    let waitFailure: ReturnType<typeof failureDiagnostic> | null = null
     let resolveExit!: (code: number | null) => void
     const exitReceipt = new Promise<number | null>(resolve => { resolveExit = resolve })
     const child = Bun.spawn([process.execPath, '--no-env-file', controllerFile, role, configFile], {
@@ -79,6 +80,7 @@ export async function qualifyNativeColdRecovery(options: {
       // instead of depending on a secondary .exited promise after Stop.
       onExit(_process, code, signal, error) {
         waitFailed = error !== undefined
+        waitFailure = waitFailed ? failureDiagnostic(role === 'A' ? 'A-exit' : role === 'B' ? 'B-exit' : 'sentinel-close', error) : null
         exited = !waitFailed
         exitCode = Number.isSafeInteger(code) ? code : null
         exitSignal = signal == null ? null : ['SIGABRT', 'SIGALRM', 'SIGBUS', 'SIGFPE', 'SIGHUP', 'SIGILL', 'SIGINT',
@@ -99,7 +101,7 @@ export async function qualifyNativeColdRecovery(options: {
     // Keep one observation and one exact original handle. Never rediscover or
     // signal a numeric PID, and never relaunch a controller after uncertainty.
     void observation.catch(() => undefined)
-    const diagnostics = () => ({ exitObserved: exited, exitCode, signal: exitSignal,
+    const diagnostics = () => ({ exitObserved: exited, exitCode, signal: exitSignal, waitFailed, waitFailure,
       stdout: stdoutDrain.snapshot(), stderr: stderrDrain.snapshot(), progress: [...progress] })
     return { role, child, observation, stdoutDrain, stderrDrain, diagnostics, exited: () => exited }
   }
