@@ -93,7 +93,7 @@ function frame(fields: string[]): Buffer {
   const length = Buffer.alloc(4); length.writeUInt32BE(body.length); return Buffer.concat([length, body])
 }
 type HelperWaitPhase = 'unspecified' | 'hello' | 'measure-terminal' | 'launch-started' | 'control-inspect' | 'control-peer' | 'control-stop'
-type HelperTrigger = 'none' | 'invalid-frame' | 'child-error' | 'child-close' | 'stdout-end' | 'stdout-error' | 'stdin-error' | 'timeout'
+type HelperTrigger = 'none' | 'invalid-frame' | 'child-error' | 'child-close' | 'stdout-end' | 'stdout-error' | 'stdin-error' | 'stdio-error' | 'timeout'
 /** Diagnostic facts from the original handle only. Never used as admission or death authority. */
 type HelperDiagnostic = {
   waitPhase: HelperWaitPhase; trigger: HelperTrigger; exitObserved: boolean; closeObserved: boolean
@@ -145,6 +145,9 @@ function frames(child: ChildProcess): { next(phase?: HelperWaitPhase): Promise<R
       } catch { refuse('invalid-frame'); return }
     }
   })
+  // Bun creates extra pipes as sockets, which can fail before HELLO or output consumers attach.
+  // Keep their errors owned while captured-child cleanup is still pending.
+  for (const output of child.stdio.slice(2)) output?.on('error', () => refuse('stdio-error'))
   child.once('error', () => refuse('child-error'))
   child.once('close', () => { closeObserved = true; finish('child-close') })
   child.stdout!.once('end', () => finish('stdout-end')); child.stdout!.once('error', () => refuse('stdout-error'))
