@@ -4,7 +4,7 @@ import path from 'node:path'
 import { readExecutionPlatformBirth } from './OpenCodeV2ExecutionPlatform.js'
 import filesystem, { lstat, open, readFile, readdir } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
-import { hashOpenCodeFile, readOpenCodePackageManifest, readOpenCodeNativePackageMetadata, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
+import { hashOpenCodeFile, hashOpenCodeNativeExecutable, readOpenCodePackageManifest, readOpenCodeNativePackageMetadata, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
 import { assertExecutionSelectedModel, executionAssert, executionHash, executionRecord,
   type ExecutionSelectedModel, type ExecutionBirth } from '../execution/OpenCodeV2ExecutionContracts.js'
 import { verifyOpenCodeV2ServerGraph } from './OpenCodeV2ServerGraph.js'
@@ -300,7 +300,7 @@ export async function validateExecutionNative(native: ValidatedExecutionNative, 
     executionAssert(typeof native.packageName === 'string' && metadata.name === native.packageName && metadata.version === native.version &&
       native.packageName.startsWith(`@opencode/cli-${platform}-${process.arch}`), 'execution_identity_mismatch')
   }
-  executionAssert(await hashOpenCodeFile(native.executablePath, signal) === native.executableSha256, 'execution_identity_mismatch')
+  executionAssert(await hashOpenCodeNativeExecutable(native.executablePath, signal) === native.executableSha256, 'execution_identity_mismatch')
   signal?.throwIfAborted()
   const handle = await open(native.executablePath, 'r')
   try {

@@ -51,13 +51,22 @@ export async function readOpenCodeNativePackageMetadata(executablePath: string):
   return readOpenCodePackageManifest(file)
 }
 
-export async function hashOpenCodeFile(file: string, signal?: AbortSignal): Promise<string> {
+export function hashOpenCodeFile(file: string, signal?: AbortSignal): Promise<string> {
+  return hashOpenCodeFileWithinLimit(file, 256 * 1024 * 1024, signal)
+}
+
+/** Native CLI files share the desktop installer's 350 MiB bound; graph/auth files do not. */
+export function hashOpenCodeNativeExecutable(file: string, signal?: AbortSignal): Promise<string> {
+  return hashOpenCodeFileWithinLimit(file, 350 * 1024 * 1024, signal)
+}
+
+async function hashOpenCodeFileWithinLimit(file: string, maximumBytes: number, signal?: AbortSignal): Promise<string> {
   signal?.throwIfAborted()
   const handle = await open(file, 'r')
   try {
     signal?.throwIfAborted()
     const before = await handle.stat()
-    if (!before.isFile() || before.size > 256 * 1024 * 1024) throw new Error('identity_mismatch')
+    if (!before.isFile() || before.size > maximumBytes) throw new Error('identity_mismatch')
     const hash = createHash('sha256')
     // Keep one explicit handle owner. Bun 1.3.11's streamed FileHandle reads
     // can invalidate later child stdio after hashing a large package graph.
@@ -68,7 +77,7 @@ export async function hashOpenCodeFile(file: string, signal?: AbortSignal): Prom
       signal?.throwIfAborted()
       if (bytesRead === 0) throw new Error('identity_mismatch')
       offset += bytesRead
-      if (offset > 256 * 1024 * 1024) throw new Error('identity_mismatch')
+      if (offset > maximumBytes) throw new Error('identity_mismatch')
       hash.update(bytes.subarray(0, bytesRead))
     }
     signal?.throwIfAborted()
@@ -105,7 +114,7 @@ export async function inspectOpenCodeReadSelection(signal?: AbortSignal, onAcqui
   signal?.throwIfAborted()
   const executablePath = await filesystem.realpath(selected)
   signal?.throwIfAborted()
-  const executableSha256 = await hashOpenCodeFile(executablePath, signal)
+  const executableSha256 = await hashOpenCodeNativeExecutable(executablePath, signal)
   signal?.throwIfAborted()
   const roots = await createOpenCodeVersionReadRoots()
   const output = await readOpenCodeOwnedVersion(executablePath, roots, signal, acquisitionDeadlineMs)
@@ -118,7 +127,7 @@ export async function inspectOpenCodeReadSelection(signal?: AbortSignal, onAcqui
     typeof metadata.name !== 'string' || !/^@opencode\/cli-[a-z0-9-]+$/.test(metadata.name) ||
     metadata.version !== policy.version)) throw new Error('identity_mismatch')
   if (!/^opencode(?:\.exe)?$/.test(path.basename(executablePath)) ||
-    await hashOpenCodeFile(executablePath, signal) !== executableSha256) throw new Error('identity_mismatch')
+    await hashOpenCodeNativeExecutable(executablePath, signal) !== executableSha256) throw new Error('identity_mismatch')
   signal?.throwIfAborted()
   const expectedPlatform = process.platform === 'win32' ? 'windows' : process.platform
   if (metadata !== undefined && !(metadata as { name: string }).name.startsWith(`@opencode/cli-${expectedPlatform}-${process.arch}`)) throw new Error('identity_mismatch')

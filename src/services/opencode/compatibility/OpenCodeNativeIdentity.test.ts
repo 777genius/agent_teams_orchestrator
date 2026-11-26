@@ -155,6 +155,69 @@ test('private V2 version admission preserves an unlisted CLI identity separately
 },15000)
 
 
+test('native identity admits complete installer-sized executables while keeping ordinary files bounded', async () => {
+  const script = `
+    import {mock} from 'bun:test'
+    import assert from 'node:assert/strict'
+    import {createHash} from 'node:crypto'
+    import {createReadStream} from 'node:fs'
+    import {mkdir,mkdtemp,open,realpath,rm,writeFile} from 'node:fs/promises'
+    import {tmpdir} from 'node:os'
+    import path from 'node:path'
+    const root=await realpath(await mkdtemp(path.join(tmpdir(),'TEST-v2-native-size-')))
+    const packageRoot=path.join(root,'package'),bin=path.join(packageRoot,'bin')
+    await mkdir(bin,{recursive:true})
+    const executable=path.join(bin,process.platform==='win32'?'opencode.exe':'opencode')
+    const header=Buffer.from(process.platform==='linux'?'7f454c46':process.platform==='win32'?'4d5a0000':'cffaedfe','hex')
+    process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH=executable
+    await writeFile(path.join(packageRoot,'package.json'),JSON.stringify({
+      name:'@opencode/cli-'+(process.platform==='win32'?'windows':process.platform)+'-'+process.arch,version:'2.4.2'
+    }))
+    let versionCalls=0
+    mock.module(${JSON.stringify(import.meta.resolve('./OpenCodeVersionProbe.ts'))},()=>({readOpenCodeOwnedVersion:async(file,roots)=>{
+      assert.equal(file,executable);versionCalls++;await roots.remove();return 'opencode v2.4.2\\n'
+    }}))
+    const {hashOpenCodeFile,inspectOpenCodeReadSelection}=await import(${JSON.stringify(import.meta.resolve('./OpenCodeNativeIdentity.ts'))})
+    const {validateExecutionNative}=await import(${JSON.stringify(import.meta.resolve('../host/OpenCodeV2ExecutionBinding.ts'))})
+    const digest=async()=>{
+      const hash=createHash('sha256')
+      for await(const bytes of createReadStream(executable)) hash.update(bytes)
+      return hash.digest('hex')
+    }
+    const sparse=async(size)=>{
+      const file=await open(executable,'w')
+      try {await file.truncate(size);await file.write(header,0,header.length,0);await file.write(Buffer.from('TEST-native-tail'),0,16,size-16)}
+      finally {await file.close()}
+    }
+    try {
+      // Actual @opencode/cli-windows-x64 2.4.2 size, then the inclusive installer ceiling.
+      for(const size of [278504840,350*1024*1024]) {
+        await sparse(size)
+        const selected=await inspectOpenCodeReadSelection(),expected=await digest()
+        assert.equal(selected.native.executableSha256,expected)
+        assert.equal(selected.fingerprint,expected)
+        await validateExecutionNative(selected.native)
+        await assert.rejects(hashOpenCodeFile(executable),/identity_mismatch/)
+        const file=await open(executable,'r+')
+        try {await file.write(Buffer.from([0x7f]),0,1,size-1)} finally {await file.close()}
+        await assert.rejects(validateExecutionNative(selected.native),/execution_identity_mismatch/)
+        const changed=await inspectOpenCodeReadSelection()
+        assert.equal(changed.native.executableSha256,await digest())
+        assert.notEqual(changed.fingerprint,selected.fingerprint)
+      }
+      const callsBeforeOversize=versionCalls
+      await sparse(350*1024*1024+1)
+      await assert.rejects(inspectOpenCodeReadSelection(),/identity_mismatch/)
+      assert.equal(versionCalls,callsBeforeOversize)
+      console.log('TEST native 350 MiB admission, complete hashes and ordinary 256 MiB refusal')
+    } finally {await rm(root,{recursive:true,force:true})}
+  `
+  const child=Bun.spawn([process.execPath,'-e',script],{cwd:import.meta.dir,stdout:'pipe',stderr:'pipe'})
+  const [code,stdout,stderr]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()])
+  expect({code,stderr}).toEqual({code:0,stderr:''})
+  expect(stdout.trim()).toBe('TEST native 350 MiB admission, complete hashes and ordinary 256 MiB refusal')
+},15000)
+
 test('standalone identity refuses our Windows console shim across case and slash spellings', async () => {
   for (const file of [
     'C:\\app\\resources\\runtime\\opencode-console\\opencode.exe',

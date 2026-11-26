@@ -5,7 +5,7 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import { realpath } from 'node:fs/promises'
 import { readProcessStartTimeMs } from '../../../utils/processKill.js'
 import type { OpenCodeClientRequestContext } from '../OpenCodeClientRequestContext.js'
-import { hashOpenCodeFile, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
+import { hashOpenCodeFile, hashOpenCodeNativeExecutable, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
 import { createOpenCodeV2ReadRoots } from '../profile/OpenCodeV2ManagedConfig.js'
 import { boundOpenCodeRead, openCodeReadAssert } from '../transport/OpenCodeBoundedFetch.js'
 import { readRecord } from '../catalog/OpenCodeV2ReadStatus.js'
@@ -41,7 +41,7 @@ export async function acquireOpenCodeV2ReadHost(native: OpenCodeV2NativeIdentity
   const canonicalDirectory = await realpath(directory)
   check()
   openCodeReadAssert(canonicalDirectory === directory, 'identity_mismatch')
-  const nativeSha256 = await hashOpenCodeFile(native.executablePath)
+  const nativeSha256 = await hashOpenCodeNativeExecutable(native.executablePath)
   check()
   openCodeReadAssert(nativeSha256 === native.executableSha256, 'identity_mismatch')
   const graph = await verifyOpenCodeV2ServerGraph(openCodeV2EngineVersion(native), delivery.binding)

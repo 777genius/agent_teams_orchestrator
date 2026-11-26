@@ -3,7 +3,7 @@ import { openCodeV2EngineVersion } from '../compatibility/OpenCodeV2Registry.js'
 import type { OpenCodeClientRequestContext } from '../OpenCodeClientRequestContext.js'
 import type { OpenCodeConnectedProvider, OpenCodeInventorySnapshot } from '../types.js'
 import { openCodeV2KeyIntegrations, readOpenCodeV2ConnectedProviders } from './OpenCodeV2KeyIntegrations.js'
-import { hashOpenCodeFile, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
+import { hashOpenCodeNativeExecutable, type OpenCodeV2NativeIdentity } from '../compatibility/OpenCodeNativeIdentity.js'
 import { acquireOpenCodeV2ReadHost } from '../host/OpenCodeHostNativeAdapter.js'
 import { assertOpenCodeV2ExecutionReady } from '../host/OpenCodeV2ExecutionReadiness.js'
 import { createOpenCodeV2ReadClient } from '../transport/OpenCodeV2ClientFactory.js'
@@ -75,7 +75,7 @@ export async function probeOpenCodeV2Inventory(native: OpenCodeV2NativeIdentity,
     const defaultRow = defaultValue === null ? null : readModel(defaultValue)
     if (defaultRow) openCodeReadAssert(models.some(row => row.providerId === defaultRow.providerId && row.catalogId === defaultRow.catalogId))
     openCodeReadAssert(readLocation(await sdk.location(directory), directory) === projectId, 'identity_mismatch')
-    openCodeReadAssert(await hashOpenCodeFile(native.executablePath) === native.executableSha256, 'identity_mismatch')
+    openCodeReadAssert(await hashOpenCodeNativeExecutable(native.executablePath) === native.executableSha256, 'identity_mismatch')
     reader.check()
     status = { ...status, projectId, catalog: 'ready', configuration, integrations, providers, models, agents,
       defaultModel: defaultRow ? { providerId: defaultRow.providerId, catalogId: defaultRow.catalogId } : null }
