@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { classifyOpenCodeReadGeneration } from './OpenCodeGenerationPolicy.js'
-import { assertOpenCodeStandaloneNativePath, hashOpenCodeFile, readOpenCodeNativePackageMetadata, selectedOpenCodeReadPath } from './OpenCodeNativeIdentity.js'
+import { assertOpenCodeStandaloneNativePath, hashOpenCodeFile, hashOpenCodeNativeExecutable, readOpenCodeNativePackageMetadata, selectedOpenCodeReadPath } from './OpenCodeNativeIdentity.js'
 
 test('strict family/dialect classification preserves V1 floor and refuses ambiguous output', () => {
   for (const version of ['1.16.0', '1.18.34']) expect(classifyOpenCodeReadGeneration(version).generation).toBe('v1')
@@ -69,13 +69,64 @@ test('file hashing matches independent SHA for empty, tiny and multiple read chu
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('native executable hashing matches independent SHA across large read chunk boundaries', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'TEST-opencode-native-hash-buffer-'))
+  try {
+    for (const size of [0, 1, 37, 1024 * 1024, 1024 * 1024 + 1, 3 * 1024 * 1024 + 17]) {
+      const content = Buffer.from(Uint8Array.from({ length: size }, (_, index) => index % 251))
+      const file = path.join(root, `bytes-${size}`)
+      await writeFile(file, content)
+      expect(await hashOpenCodeNativeExecutable(file)).toBe(createHash('sha256').update(content).digest('hex'))
+    }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 
 test('cancelled file hashing rejects the caller reason before opening a missing path', async () => {
   const controller = new AbortController()
   const reason = new Error('TEST-hash-cancelled')
   controller.abort(reason)
   await expect(hashOpenCodeFile(path.join(tmpdir(), 'TEST-missing-cancelled-hash'), controller.signal)).rejects.toBe(reason)
+  await expect(hashOpenCodeNativeExecutable(path.join(tmpdir(), 'TEST-missing-cancelled-native-hash'), controller.signal)).rejects.toBe(reason)
 })
+
+test('native executable hashing preserves mid-read abort and closes its original descriptor', async () => {
+  const script = `
+    import {mock} from 'bun:test'
+    import assert from 'node:assert/strict'
+    import {fstatSync} from 'node:fs'
+    import {mkdtemp,realpath,rm,writeFile} from 'node:fs/promises'
+    import {tmpdir} from 'node:os'
+    import path from 'node:path'
+    const root=await realpath(await mkdtemp(path.join(tmpdir(),'TEST-native-hash-abort-')))
+    const file=path.join(root,'opencode')
+    await writeFile(file,Buffer.alloc(1024*1024+17,0x5a))
+    const fs=await import('node:fs/promises'),originalOpen=fs.open
+    const controller=new AbortController(),reason=new Error('TEST-native-mid-read-abort')
+    let reads=0,closes=0,descriptor=null
+    mock.module('node:fs/promises',()=>({...fs,open:async(target,...args)=>{
+      const handle=await originalOpen(target,...args)
+      if(target===file){
+        descriptor=handle.fd
+        const read=handle.read.bind(handle),close=handle.close.bind(handle)
+        handle.read=async(...readArgs)=>{const result=await read(...readArgs);assert(result.bytesRead>0);reads++;controller.abort(reason);return result}
+        handle.close=async()=>{try{return await close()}finally{closes++}}
+      }
+      return handle
+    }}))
+    const {hashOpenCodeNativeExecutable}=await import(${JSON.stringify(import.meta.resolve('./OpenCodeNativeIdentity.ts'))})
+    try{
+      await assert.rejects(hashOpenCodeNativeExecutable(file,controller.signal),error=>error===reason)
+      assert.equal(reads,1);assert.equal(closes,1);assert.notEqual(descriptor,null)
+      assert.throws(()=>fstatSync(descriptor),{code:'EBADF'})
+      console.log('TEST native abort preserves reason and closes original descriptor')
+    }finally{await rm(root,{recursive:true,force:true})}
+  `
+  const child=Bun.spawn([process.execPath,'-e',script],{cwd:import.meta.dir,stdout:'pipe',stderr:'pipe'})
+  const [code,stdout,stderr]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()])
+  expect({code,stderr}).toEqual({code:0,stderr:''})
+  expect(stdout.trim()).toBe('TEST native abort preserves reason and closes original descriptor')
+},15000)
 
 
 test('private V2 version admission preserves an unlisted CLI identity separately from its engine', async () => {
@@ -181,7 +232,7 @@ test('native identity admits complete installer-sized executables while keeping 
     const {validateExecutionNative}=await import(${JSON.stringify(import.meta.resolve('../host/OpenCodeV2ExecutionBinding.ts'))})
     const digest=async()=>{
       const hash=createHash('sha256')
-      for await(const bytes of createReadStream(executable)) hash.update(bytes)
+      for await(const bytes of createReadStream(executable,{highWaterMark:1024*1024})) hash.update(bytes)
       return hash.digest('hex')
     }
     const sparse=async(size)=>{

@@ -52,15 +52,15 @@ export async function readOpenCodeNativePackageMetadata(executablePath: string):
 }
 
 export function hashOpenCodeFile(file: string, signal?: AbortSignal): Promise<string> {
-  return hashOpenCodeFileWithinLimit(file, 256 * 1024 * 1024, signal)
+  return hashOpenCodeFileWithinLimit(file, 256 * 1024 * 1024, 64 * 1024, signal)
 }
 
 /** Native CLI files share the desktop installer's 350 MiB bound; graph/auth files do not. */
 export function hashOpenCodeNativeExecutable(file: string, signal?: AbortSignal): Promise<string> {
-  return hashOpenCodeFileWithinLimit(file, 350 * 1024 * 1024, signal)
+  return hashOpenCodeFileWithinLimit(file, 350 * 1024 * 1024, 1024 * 1024, signal)
 }
 
-async function hashOpenCodeFileWithinLimit(file: string, maximumBytes: number, signal?: AbortSignal): Promise<string> {
+async function hashOpenCodeFileWithinLimit(file: string, maximumBytes: number, readChunkBytes: number, signal?: AbortSignal): Promise<string> {
   signal?.throwIfAborted()
   const handle = await open(file, 'r')
   try {
@@ -70,7 +70,7 @@ async function hashOpenCodeFileWithinLimit(file: string, maximumBytes: number, s
     const hash = createHash('sha256')
     // Keep one explicit handle owner. Bun 1.3.11's streamed FileHandle reads
     // can invalidate later child stdio after hashing a large package graph.
-    const bytes = Buffer.alloc(Math.max(1, Math.min(64 * 1024, before.size)))
+    const bytes = Buffer.alloc(Math.max(1, Math.min(readChunkBytes, before.size)))
     for (let offset = 0; offset < before.size;) {
       signal?.throwIfAborted()
       const { bytesRead } = await handle.read(bytes, 0, Math.min(bytes.length, before.size - offset), offset)
