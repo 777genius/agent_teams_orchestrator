@@ -47,6 +47,9 @@ function startOwnedChild(script: string, args: string[], env: NodeJS.ProcessEnv,
   })
   const entry = { child, state, closed }
   ownedChildren.add(entry)
+  // Fixture children use IPC or argv, never stdin. Retire the unused input
+  // before platform exit handling drains it; EOF is not a retirement receipt.
+  child.stdin!.end()
   return entry
 }
 const ownedChildren = new Set<ReturnType<typeof startOwnedChild>>()
@@ -537,7 +540,6 @@ async function fresh(f: Fixture, env = f.env, purpose = f.purpose, project = f.p
     await checkpoint('receipt-produced');`
   const entry = startOwnedChild(script, [project, purpose], env, `fresh ${role} natural exit`)
   entry.state.checkpointPath = checkpointPath
-  entry.child.stdin!.end()
   await entry.closed
   if (entry.state.cleaning) await stopInterruptedContinuation()
   // Fresh recovery must exit naturally, including closing its imported handles.
