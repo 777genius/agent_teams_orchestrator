@@ -94,9 +94,23 @@ function frame(fields: string[]): Buffer {
 }
 type HelperWaitPhase = 'unspecified' | 'hello' | 'measure-terminal' | 'launch-started' | 'control-inspect' | 'control-peer' | 'control-stop'
 type HelperTrigger = 'none' | 'invalid-frame' | 'child-error' | 'child-close' | 'stdout-end' | 'stdout-error' | 'stdin-error' | 'stdio-error' | 'timeout'
+type HelperOperation = 'unspecified' | 'measure' | 'launch' | 'control-inspect' | 'control-peer' | 'control-stop'
+const helperIoCodes = ['EACCES', 'EAGAIN', 'EBADF', 'ECANCELED', 'ECONNRESET', 'EINTR', 'EINVAL', 'EIO', 'EMFILE',
+  'ENFILE', 'ENOMEM', 'ENOTCONN', 'EPERM', 'EPIPE', 'ERR_STREAM_DESTROYED', 'ERR_STREAM_PREMATURE_CLOSE'] as const
+type HelperIoCode = typeof helperIoCodes[number] | 'unknown'
+function helperIoCode(error: unknown): HelperIoCode {
+  if (error === null || typeof error !== 'object') return 'unknown'
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, 'code')
+    const code: unknown = descriptor && 'value' in descriptor ? descriptor.value : undefined
+    return helperIoCodes.find(candidate => candidate === code) ?? 'unknown'
+  } catch { return 'unknown' }
+}
 /** Diagnostic facts from the original handle only. Never used as admission or death authority. */
 type HelperDiagnostic = {
-  waitPhase: HelperWaitPhase; trigger: HelperTrigger; exitObserved: boolean; closeObserved: boolean
+  waitPhase: HelperWaitPhase; trigger: HelperTrigger; operation: HelperOperation
+  triggerFd: number | null; triggerCode: HelperIoCode | null; exitObservedAtTrigger: boolean; closeObservedAtTrigger: boolean
+  exitObserved: boolean; closeObserved: boolean
   exitCode: number | null; signal: string | null; bufferedBytes: number; queuedFrames: number; waitingReplies: number; bufferedAtTrigger: number; waitingAtTrigger: number
 }
 const helperDiagnostics = new WeakMap<object, () => HelperDiagnostic>()
@@ -104,21 +118,30 @@ export function nativeHelperFailureDiagnostic(error: unknown): HelperDiagnostic 
   // WeakMap identity avoids invoking error getters/toJSON or accepting caller data.
   return error !== null && typeof error === 'object' ? helperDiagnostics.get(error)?.() : undefined
 }
-function frames(child: ChildProcess): { next(phase?: HelperWaitPhase): Promise<Record<string, unknown>>; assertOpen(): void } {
+function frames(child: ChildProcess, operation: HelperOperation): { next(phase?: HelperWaitPhase): Promise<Record<string, unknown>>; assertOpen(): void } {
   let data = Buffer.alloc(0), failure: Error | undefined, ended = false
   let waitPhase: HelperWaitPhase = 'unspecified', trigger: HelperTrigger = 'none', bufferedAtTrigger = 0, waitingAtTrigger = 0
   let exitObserved = false, closeObserved = false, exitCode: number | null = null, signal: string | null = null
+  let triggerFd: number | null = null, triggerCode: HelperIoCode | null = null
+  let exitObservedAtTrigger = false, closeObservedAtTrigger = false
   const queue: Array<Record<string, unknown>> = [], waiting: Array<{ resolve(value: Record<string, unknown>): void; reject(reason: unknown): void }> = []
-  const diagnostic = (): HelperDiagnostic => ({ waitPhase, trigger, exitObserved, closeObserved, exitCode, signal,
+  const diagnostic = (): HelperDiagnostic => ({ waitPhase, trigger, operation, triggerFd, triggerCode,
+    exitObservedAtTrigger, closeObservedAtTrigger, exitObserved, closeObserved, exitCode, signal,
     bufferedBytes: Math.min(data.length, 32769), queuedFrames: Math.min(queue.length, 32769), waitingReplies: Math.min(waiting.length, 32769), bufferedAtTrigger, waitingAtTrigger })
   const problem = (code: 'native_custody_protocol' | 'native_custody_timeout' | 'native_custody_unavailable') => {
     const error = new Error(code); helperDiagnostics.set(error, diagnostic); return error
   }
-  const mark = (cause: HelperTrigger) => { if (trigger === 'none') {
-    trigger = cause; bufferedAtTrigger = Math.min(data.length, 32769); waitingAtTrigger = Math.min(waiting.length, 32769)
+  const mark = (cause: HelperTrigger, fd: number | null = null) => { if (trigger === 'none') {
+    trigger = cause; triggerFd = fd
+    exitObservedAtTrigger = exitObserved; closeObservedAtTrigger = closeObserved
+    bufferedAtTrigger = Math.min(data.length, 32769); waitingAtTrigger = Math.min(waiting.length, 32769)
   } }
-  const refuse = (cause: HelperTrigger) => {
-    mark(cause); failure = problem('native_custody_protocol'); for (const waiter of waiting.splice(0)) waiter.reject(failure)
+  const refuse = (cause: HelperTrigger, fd: number | null = null, error?: unknown) => {
+    const first = trigger === 'none'
+    mark(cause, fd); failure = problem('native_custody_protocol'); for (const waiter of waiting.splice(0)) waiter.reject(failure)
+    // Own the first refusal before inspecting even a data descriptor on an exotic error.
+    if (first && (cause === 'stdio-error' || cause === 'stdin-error' || cause === 'stdout-error' || cause === 'child-error'))
+      triggerCode = helperIoCode(error)
   }
   const finish = (cause: 'child-close' | 'stdout-end') => {
     mark(cause); ended = true
@@ -147,11 +170,13 @@ function frames(child: ChildProcess): { next(phase?: HelperWaitPhase): Promise<R
   })
   // Bun creates extra pipes as sockets, which can fail before HELLO or output consumers attach.
   // Keep their errors owned while captured-child cleanup is still pending.
-  for (const output of child.stdio.slice(2)) output?.on('error', () => refuse('stdio-error'))
-  child.once('error', () => refuse('child-error'))
+  for (const [offset, output] of child.stdio.slice(2).entries())
+    output?.on('error', error => refuse('stdio-error', offset + 2, error))
+  child.once('error', error => refuse('child-error', null, error))
   child.once('close', () => { closeObserved = true; finish('child-close') })
-  child.stdout!.once('end', () => finish('stdout-end')); child.stdout!.once('error', () => refuse('stdout-error'))
-  child.stdin!.on('error', () => refuse('stdin-error'))
+  child.stdout!.once('end', () => finish('stdout-end'))
+  child.stdout!.once('error', error => refuse('stdout-error', 1, error))
+  child.stdin!.on('error', error => refuse('stdin-error', 0, error))
   return { assertOpen: () => { if (failure) throw failure; if (ended) throw problem('native_custody_unavailable') }, next: async (phase = 'unspecified') => {
     waitPhase = phase
     if (failure) throw failure
@@ -168,7 +193,7 @@ function frames(child: ChildProcess): { next(phase?: HelperWaitPhase): Promise<R
 
 /** Attach synchronously in the spawn turn, before receipt closure or any other await.
  * Exported only within the native boundary so lifecycle races can be tested without a native launch. */
-export function observeNativeHelper(child: ChildProcess) {
+export function observeNativeHelper(child: ChildProcess, operation: HelperOperation = 'unspecified') {
   retainedHelpers.add(child)
   let closed = false, exited = false
   const closure = new Promise<void>(resolve => child.once('close', () => {
@@ -191,13 +216,14 @@ export function observeNativeHelper(child: ChildProcess) {
     try { if (!closed && !exited) child.kill('SIGKILL') } catch { /* Unconfirmed handle stays retained. */ }
     return waitForClose(2500)
   }
-  const stream = frames(child)
+  const stream = frames(child, operation)
   const assertLive = () => { stream.assertOpen(); fact(!exited && !closed) }
   return { stream, closeUnadmitted, assertLive }
 }
 
 /** Verify the actual spawned helper image before writing any environment/control packet. */
-async function openHelper(images: NativeEpochImages, launch = false, measure = false) {
+async function openHelper(images: NativeEpochImages, launch = false, measure = false,
+  operation: HelperOperation = launch ? 'launch' : measure ? 'measure' : 'unspecified') {
   await verifyNativeEpochDirectories(images)
   await verifyNativeImage(images.helper, images.helperIdentity)
   let receipt: Awaited<ReturnType<typeof open>> | undefined
@@ -214,7 +240,7 @@ async function openHelper(images: NativeEpochImages, launch = false, measure = f
     }
     launched = spawn(images.helper, [], { env: {}, stdio: ['pipe', 'pipe', 'pipe',
       launch || measure ? 'pipe' : 'ignore', launch ? 'pipe' : 'ignore', receipt?.fd ?? 'ignore'], detached: true })
-    observation = observeNativeHelper(launched)
+    observation = observeNativeHelper(launched, operation)
   } finally {
     try { await receipt?.close() }
     catch {
@@ -289,7 +315,7 @@ async function control(reference: NativeCustodyReference, action: 'inspect' | 'p
   await verifyNativeEpochDirectories(reference.images)
   fact((await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim() === reference.bootId)
   await verifyNativeImage(reference.images.image, reference.images.imageIdentity)
-  const operation = await openHelper(reference.images)
+  const operation = await openHelper(reference.images, false, false, `control-${action}`)
   let packetSent = false
   try {
     const nonce = randomBytes(32).toString('hex')

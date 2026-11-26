@@ -173,6 +173,16 @@ export async function qualifyNativeColdRecovery(options: {
     completed = true
     return { retiredImageRoot: finalAuthority.images.root }
   } catch (error) {
+    // Keep the failure phase and bounded exit/stream observations in the job log.
+    // Raw controller output, error payloads and paths stay private.
+    try {
+      const summary = { protocol: 1, caseId, vendorVersion: options.version,
+        failure: failureDiagnostic(phase, error),
+        controllers: controllers.map(value => ({ role: value.role, observations: value.diagnostics() })) }
+      const line = JSON.stringify(summary)
+      console.error(`TEST_NATIVE_COLD_FAILURE ${Buffer.byteLength(line) <= 16384 ? line :
+        JSON.stringify({ ...summary, controllers: [], controllersOmittedForSize: true })}`)
+    } catch { /* Telemetry cannot change the original failure or preservation. */ }
     await evidence(input, 'result.json', { schemaVersion: 1, caseId, outcome: 'unknown-or-failed', preserve: true,
       replayAllowed: false, numericPidFallbackAllowed: false, privateStatePreserved: true,
       controllers: controllers.map(value => ({ role: value.role, observations: value.diagnostics() })) }, { phase, error }).catch(() => undefined)
