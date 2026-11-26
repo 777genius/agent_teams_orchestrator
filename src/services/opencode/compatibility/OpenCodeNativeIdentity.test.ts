@@ -399,10 +399,17 @@ test('native identity admits complete installer-sized executables while keeping 
       phase('oracle','end')
       return result
     }
+    let previousSize=0
     const sparse=async(size)=>{
       phase('sparse','start')
-      const file=await open(executable,'w')
-      try {await file.truncate(size);await file.write(header,0,header.length,0);await file.write(Buffer.from('TEST-native-tail'),0,16,size-16)}
+      // Cases only grow. Clear the old tail to preserve each fresh fixture's bytes
+      // without zero-truncating and re-extending the whole file on Windows.
+      const file=await open(executable,previousSize?'r+':'w')
+      try {
+        if(previousSize) await file.write(Buffer.alloc(16),0,16,previousSize-16)
+        await file.truncate(size);await file.write(header,0,header.length,0);await file.write(Buffer.from('TEST-native-tail'),0,16,size-16)
+        previousSize=size
+      }
       finally {await file.close()}
       phase('sparse','end')
     }
