@@ -69,9 +69,10 @@ describe('captured native helper pre-packet lifecycle', () => {
     const fixture = helper(), observed = observeNativeHelper(fixture.child, 'launch')
     const pending = observed.stream.next('hello').then(() => null, failure => failure)
     let duringProjection: Promise<Error | null> | undefined, laterReads = 0
+    let duringLiveCheck: unknown
     const later = new Proxy({}, { getOwnPropertyDescriptor() { laterReads++; throw new Error('TEST later projection must not run') } })
     const first = new Proxy({}, { getOwnPropertyDescriptor() {
-      expect(() => observed.assertLive()).toThrow('native_custody_protocol')
+      try { observed.assertLive() } catch (error) { duringLiveCheck = error }
       duringProjection = observed.stream.next('hello').then(() => null, failure => failure)
       fixture.stdio[3].emit('error', later)
       fixture.child.emit('exit', 112, null)
@@ -80,6 +81,8 @@ describe('captured native helper pre-packet lifecycle', () => {
     try {
       expect(() => fixture.stdio[4].emit('error', first)).not.toThrow()
       const failure = await pending
+      expect(duringLiveCheck).toBe(failure)
+      expect(failure.message).toBe('native_custody_protocol')
       expect(await duringProjection).toBe(failure)
       expect(nativeHelperFailureDiagnostic(failure)).toMatchObject({ operation: 'launch', triggerFd: 4, triggerCode: 'EIO',
         exitObservedAtTrigger: false, closeObservedAtTrigger: false, exitObserved: true, closeObserved: false, exitCode: 112 })
