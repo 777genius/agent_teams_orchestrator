@@ -3,6 +3,77 @@ import type { ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import { nativeHelperFailureDiagnostic, observeNativeHelper } from './OpenCodeNativeCustody.js'
+import { observeNativeStartup, type NativeStartupObservation, type NativeStartupPhase } from './OpenCodeNativeStartupDiagnostic.js'
+
+describe('native startup phase observation', () => {
+  test('an absent observer preserves the original Promise and invokes work once', async () => {
+    const value = Object.freeze({ original: true }), original = Promise.resolve(value)
+    let calls = 0
+    const observed = observeNativeStartup(undefined, 'health', () => { calls++; return original })
+    expect(observed).toBe(original)
+    expect(calls).toBe(1)
+    expect(await observed).toBe(value)
+  })
+
+  test('a pending operation reports its begin before settlement without adding an operation', async () => {
+    const observations: NativeStartupObservation[] = []
+    let finish!: (value: object) => void, calls = 0
+    const original = new Promise<object>(resolve => { finish = resolve })
+    const observed = observeNativeStartup(value => observations.push(value), 'measure-stdout', () => { calls++; return original })
+    expect(observations).toEqual([{ phase: 'measure-stdout', event: 'begin' }])
+    expect(calls).toBe(1)
+    const value = Object.freeze({ original: true })
+    finish(value)
+    expect(await observed).toBe(value)
+    expect(observations).toEqual([{ phase: 'measure-stdout', event: 'begin' }, { phase: 'measure-stdout', event: 'settled' }])
+    expect(observations.every(Object.isFrozen)).toBe(true)
+  })
+
+  test('a throwing observer preserves the original asynchronous refusal and its private error', async () => {
+    const failure = new Error('TEST private original refusal'), observations: NativeStartupObservation[] = []
+    const observed = observeNativeStartup(value => { observations.push(value); throw new Error('TEST observer failed') },
+      'launch-reply', () => Promise.reject(failure))
+    const actual = await observed.then(() => null, error => error)
+    expect(actual).toBe(failure)
+    expect(observations).toEqual([{ phase: 'launch-reply', event: 'begin' }, { phase: 'launch-reply', event: 'settled' }])
+    expect(JSON.stringify(observations)).not.toContain('TEST private')
+    expect(JSON.stringify(observations)).not.toContain('observer failed')
+  })
+
+  test('synchronous factory failure stays synchronous and keeps the same original error', () => {
+    const failure = new Error('TEST original synchronous refusal'), observations: NativeStartupObservation[] = []
+    let actual: unknown, calls = 0
+    try {
+      observeNativeStartup(value => { observations.push(value); throw null }, 'image-copy', () => { calls++; throw failure })
+    } catch (error) { actual = error }
+    expect(actual).toBe(failure)
+    expect(calls).toBe(1)
+    expect(observations).toEqual([{ phase: 'image-copy', event: 'begin' }, { phase: 'image-copy', event: 'settled' }])
+  })
+
+  test('nested measurement stages remain visibly pending until their original work returns', async () => {
+    const observations: NativeStartupObservation[] = []
+    let finish!: () => void
+    const original = new Promise<void>(resolve => { finish = resolve })
+    const observer = (value: NativeStartupObservation) => { observations.push(value) }
+    const observed = observeNativeStartup(observer, 'native-measure', () =>
+      observeNativeStartup(observer, 'measure-stdout', () => original))
+    expect(observations).toEqual([{ phase: 'native-measure', event: 'begin' }, { phase: 'measure-stdout', event: 'begin' }])
+    finish(); await observed
+    expect(observations).toEqual([{ phase: 'native-measure', event: 'begin' }, { phase: 'measure-stdout', event: 'begin' },
+      { phase: 'measure-stdout', event: 'settled' }, { phase: 'native-measure', event: 'settled' }])
+  })
+
+  test('unknown phase text is not projected and observation records have only closed fields', async () => {
+    const observations: NativeStartupObservation[] = [], value = { unchanged: true }
+    expect(await observeNativeStartup(item => observations.push(item), 'TEST private path' as NativeStartupPhase,
+      () => Promise.resolve(value))).toBe(value)
+    expect(observations).toEqual([])
+    expect(await observeNativeStartup(item => observations.push(item), 'birth', () => Promise.resolve(value))).toBe(value)
+    expect(observations.map(item => Object.keys(item).sort())).toEqual([['event', 'phase'], ['event', 'phase']])
+    expect(observations.every(Object.isFrozen)).toBe(true)
+  })
+})
 
 // Lifecycle-only synthetic events. These do not count as native custody or cold-recovery proof.
 function helper(onKill?: (signal: NodeJS.Signals, child: ChildProcess) => void) {

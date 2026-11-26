@@ -276,6 +276,7 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
         delete process.env.OPENCODE_BIN_PATH
         await owned.stage('setup', resolveNativeCustodyHelper)
         const manager = new OpenCodeHostManager(), hostKey = `TEST-pinned-native-${version}`
+        let startupObservations = 0
         let capturedCustody: NativeCustody | undefined
         // Capture the exact manager/key before admission; only its returned host can enable cleanup.
         owned.captureCleanup(async () => {
@@ -291,7 +292,10 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
         try {
           const { host, custody } = await owned.stage('host-admission', async () => {
             const host = await manager.ensureHost({ hostKey, preparedProfile: prepared,
-              resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false, abortSignal: owned.signal })
+              resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false, abortSignal: owned.signal,
+              startupObserver: observation => {
+                if (startupObservations++ < 64) console.log('TEST native startup:', JSON.stringify({ version, ...observation }))
+              } })
             const custody = nativeCustodyForEndpoint(host.baseUrl)
             capturedCustody = custody
             epochs.add(custody)

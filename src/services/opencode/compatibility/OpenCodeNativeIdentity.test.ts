@@ -206,15 +206,173 @@ test('private V2 version admission preserves an unlisted CLI identity separately
 },15000)
 
 
+const nativeSizePhasePrefix = 'TEST_NATIVE_SIZE_PHASE '
+const nativeSizePhases = new Set([
+  'setup', 'imports', 'sparse', 'inspect', 'oracle', 'validate', 'ordinary-cap',
+  'tail-write', 'tampered-validate', 'changed-inspect', 'oversize-refusal', 'cleanup',
+])
+const nativeSizeValues = new Set([0, 278504840, 350 * 1024 * 1024, 350 * 1024 * 1024 + 1])
+const nativeSizePhaseLineLimit = 256
+const nativeSizePhaseCountLimit = 64
+const nativeSizePhaseBytesLimit = 16 * 1024
+
+function nativeSizePhaseLine(line: string): string | null {
+  if (line.length > nativeSizePhaseLineLimit || !line.startsWith(nativeSizePhasePrefix)) return null
+  try {
+    const parsed: unknown = JSON.parse(line.slice(nativeSizePhasePrefix.length))
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    const value = parsed as Record<string, unknown>
+    if (Object.keys(value).length !== 5 || value.protocol !== 1 ||
+        typeof value.phase !== 'string' || !nativeSizePhases.has(value.phase) ||
+        (value.edge !== 'start' && value.edge !== 'end') ||
+        typeof value.size !== 'number' || !nativeSizeValues.has(value.size) ||
+        typeof value.elapsedMs !== 'number' || !Number.isInteger(value.elapsedMs) ||
+        value.elapsedMs < 0 || value.elapsedMs > 60000) return null
+    const closed = nativeSizePhasePrefix + JSON.stringify({
+      protocol: 1, phase: value.phase, edge: value.edge, size: value.size, elapsedMs: value.elapsedMs,
+    })
+    return line === closed ? closed : null
+  } catch { return null }
+}
+
+/** One pipe consumer retains all output; only complete, closed records are forwarded live. */
+async function observeNativeSizeStdout(
+  stream: ReadableStream<Uint8Array>, report: (line: string) => void,
+): Promise<{ stdout: string; withoutPhases: string }> {
+  const reader = stream.getReader(), decoder = new TextDecoder()
+  let stdout = '', withoutPhases = '', pending = '', longLine = false, records = 0, recordBytes = 0
+  const consume = (text: string): void => {
+    stdout += text
+    let offset = 0
+    while (offset < text.length) {
+      const newline = text.indexOf('\n', offset)
+      const fragment = text.slice(offset, newline < 0 ? undefined : newline)
+      const complete = newline >= 0
+      if (longLine || pending.length + fragment.length > nativeSizePhaseLineLimit) {
+        withoutPhases += pending + fragment + (complete ? '\n' : '')
+        pending = ''; longLine = !complete
+      } else {
+        pending += fragment
+        if (complete) {
+          const closed = nativeSizePhaseLine(pending), bytes = Buffer.byteLength(pending) + 1
+          if (closed !== null && records < nativeSizePhaseCountLimit &&
+              recordBytes + bytes <= nativeSizePhaseBytesLimit) {
+            records++; recordBytes += bytes
+            try { report(closed) } catch { /* Reporting cannot change the original work. */ }
+          } else withoutPhases += pending + '\n'
+          pending = ''
+        }
+      }
+      offset = complete ? newline + 1 : text.length
+    }
+  }
+  try {
+    for (;;) {
+      const next = await reader.read()
+      if (next.done) break
+      consume(decoder.decode(next.value, { stream: true }))
+    }
+    consume(decoder.decode())
+    // A final unterminated fragment is original output, never an admitted phase.
+    return { stdout, withoutPhases: withoutPhases + pending }
+  } finally { reader.releaseLock() }
+}
+
+test('native size phase observations are live before EOF and retain exact original output', async () => {
+  const line = nativeSizePhasePrefix + JSON.stringify({ protocol: 1, phase: 'inspect', edge: 'start', size: 278504840, elapsedMs: 12 }) + '\n'
+  const success = 'TEST original success\n'
+  const encoder = new TextEncoder()
+  let controller!: ReadableStreamDefaultController<Uint8Array>, seen!: (line: string) => void
+  const phaseSeen = new Promise<string>(resolve => { seen = resolve })
+  const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value } })
+  const observed = observeNativeSizeStdout(stream, seen)
+  controller.enqueue(encoder.encode(line.slice(0, 17)))
+  controller.enqueue(encoder.encode(line.slice(17)))
+  expect(await phaseSeen).toBe(line.trimEnd())
+  expect(stream.locked).toBe(true)
+  controller.enqueue(encoder.encode(success)); controller.close()
+  expect(await observed).toEqual({ stdout: line + success, withoutPhases: success })
+  expect(stream.locked).toBe(false)
+})
+
+test('native size phase observations refuse unknown, private, malformed and incomplete records', async () => {
+  const valid = { protocol: 1, phase: 'oracle', edge: 'end', size: 350 * 1024 * 1024, elapsedMs: 45 }
+  const lines = [
+    { ...valid, phase: '/TEST/private/path' }, { ...valid, edge: 'success' },
+    { ...valid, size: 1 }, { ...valid, elapsedMs: -1 }, { ...valid, elapsedMs: 60001 },
+    { ...valid, elapsedMs: 0.5 }, { ...valid, protocol: 2 }, { ...valid, error: 'private payload' },
+    null, [], {},
+  ].map(value => nativeSizePhasePrefix + JSON.stringify(value) + '\n')
+  lines.push(nativeSizePhasePrefix + '{malformed}\n', nativeSizePhasePrefix + JSON.stringify(valid) + ' \n')
+  const incomplete = nativeSizePhasePrefix + JSON.stringify(valid)
+  const raw = 'ordinary unicode: π\n' + lines.join('') + incomplete
+  const bytes = new TextEncoder().encode(raw), reports: string[] = []
+  const stream = new ReadableStream<Uint8Array>({ start(controller) {
+    for (let offset = 0; offset < bytes.length; offset += 7) controller.enqueue(bytes.slice(offset, offset + 7))
+    controller.close()
+  } })
+  expect(await observeNativeSizeStdout(stream, line => reports.push(line))).toEqual({ stdout: raw, withoutPhases: raw })
+  expect(reports).toEqual([])
+})
+
+test('native size phase observations bound forwarding without discarding excess original output', async () => {
+  const line = nativeSizePhasePrefix + JSON.stringify({ protocol: 1, phase: 'sparse', edge: 'start', size: 350 * 1024 * 1024 + 1, elapsedMs: 60000 }) + '\n'
+  const longPrefix = 'x'.repeat(nativeSizePhaseLineLimit + 1)
+  const raw = longPrefix + line + line.repeat(nativeSizePhaseCountLimit + 1) + 'TEST original success\n'
+  const reports: string[] = [], encoder = new TextEncoder()
+  const stream = new ReadableStream<Uint8Array>({ start(controller) {
+    controller.enqueue(encoder.encode(longPrefix))
+    controller.enqueue(encoder.encode(line))
+    controller.enqueue(encoder.encode(line.repeat(nativeSizePhaseCountLimit + 1) + 'TEST original success\n'))
+    controller.close()
+  } })
+  expect(await observeNativeSizeStdout(stream, line => reports.push(line))).toEqual({
+    stdout: raw, withoutPhases: longPrefix + line + line + 'TEST original success\n',
+  })
+  expect(reports).toHaveLength(nativeSizePhaseCountLimit)
+  expect(reports.reduce((bytes, report) => bytes + Buffer.byteLength(report) + 1, 0)).toBeLessThanOrEqual(nativeSizePhaseBytesLimit)
+})
+
+test('native size phase reporter errors do not change the single drain or original output', async () => {
+  const line = nativeSizePhasePrefix + JSON.stringify({ protocol: 1, phase: 'cleanup', edge: 'end', size: 0, elapsedMs: 8 }) + '\n'
+  const raw = line + 'TEST original success\n'
+  let reports = 0
+  const stream = new ReadableStream<Uint8Array>({ start(controller) {
+    controller.enqueue(new TextEncoder().encode(raw)); controller.close()
+  } })
+  expect(await observeNativeSizeStdout(stream, () => { reports++; throw new Error('TEST reporter failure') })).toEqual({
+    stdout: raw, withoutPhases: 'TEST original success\n',
+  })
+  expect(reports).toBe(1)
+  expect(stream.locked).toBe(false)
+})
+
+test('native size phase observation preserves its original pipe read failure', async () => {
+  const reason = new Error('TEST original pipe failure')
+  const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.error(reason) } })
+  await expect(observeNativeSizeStdout(stream, () => {})).rejects.toBe(reason)
+  expect(stream.locked).toBe(false)
+})
+
 test('native identity admits complete installer-sized executables while keeping ordinary files bounded', async () => {
   const script = `
     import {mock} from 'bun:test'
     import assert from 'node:assert/strict'
     import {createHash} from 'node:crypto'
-    import {createReadStream} from 'node:fs'
+    import {createReadStream,writeSync} from 'node:fs'
     import {mkdir,mkdtemp,open,realpath,rm,writeFile} from 'node:fs/promises'
     import {tmpdir} from 'node:os'
     import path from 'node:path'
+    let phaseStartedAt
+    try {phaseStartedAt=performance.now()} catch {}
+    let phaseSize=0
+    const phase=(name,edge)=>{try{
+      const elapsed=performance.now()-phaseStartedAt
+      if(!Number.isFinite(elapsed)) return
+      writeSync(1,'TEST_NATIVE_SIZE_PHASE '+JSON.stringify({protocol:1,phase:name,edge,size:phaseSize,
+        elapsedMs:Math.min(60000,Math.max(0,Math.floor(elapsed)))})+'\\n')
+    }catch{/* Diagnostic output cannot change the original work. */}}
+    phase('setup','start')
     const root=await realpath(await mkdtemp(path.join(tmpdir(),'TEST-v2-native-size-')))
     const packageRoot=path.join(root,'package'),bin=path.join(packageRoot,'bin')
     await mkdir(bin,{recursive:true})
@@ -228,43 +386,69 @@ test('native identity admits complete installer-sized executables while keeping 
     mock.module(${JSON.stringify(import.meta.resolve('./OpenCodeVersionProbe.ts'))},()=>({readOpenCodeOwnedVersion:async(file,roots)=>{
       assert.equal(file,executable);versionCalls++;await roots.remove();return 'opencode v2.4.2\\n'
     }}))
+    phase('setup','end')
+    phase('imports','start')
     const {hashOpenCodeFile,inspectOpenCodeReadSelection}=await import(${JSON.stringify(import.meta.resolve('./OpenCodeNativeIdentity.ts'))})
     const {validateExecutionNative}=await import(${JSON.stringify(import.meta.resolve('../host/OpenCodeV2ExecutionBinding.ts'))})
+    phase('imports','end')
     const digest=async()=>{
+      phase('oracle','start')
       const hash=createHash('sha256')
       for await(const bytes of createReadStream(executable,{highWaterMark:1024*1024})) hash.update(bytes)
-      return hash.digest('hex')
+      const result=hash.digest('hex')
+      phase('oracle','end')
+      return result
     }
     const sparse=async(size)=>{
+      phase('sparse','start')
       const file=await open(executable,'w')
       try {await file.truncate(size);await file.write(header,0,header.length,0);await file.write(Buffer.from('TEST-native-tail'),0,16,size-16)}
       finally {await file.close()}
+      phase('sparse','end')
     }
     try {
       // Actual @opencode/cli-windows-x64 2.4.2 size, then the inclusive installer ceiling.
       for(const size of [278504840,350*1024*1024]) {
+        phaseSize=size
         await sparse(size)
-        const selected=await inspectOpenCodeReadSelection(),expected=await digest()
+        phase('inspect','start')
+        const selected=await inspectOpenCodeReadSelection()
+        phase('inspect','end')
+        const expected=await digest()
         assert.equal(selected.native.executableSha256,expected)
         assert.equal(selected.fingerprint,expected)
+        phase('validate','start')
         await validateExecutionNative(selected.native)
+        phase('validate','end')
+        phase('ordinary-cap','start')
         await assert.rejects(hashOpenCodeFile(executable),/identity_mismatch/)
+        phase('ordinary-cap','end')
+        phase('tail-write','start')
         const file=await open(executable,'r+')
         try {await file.write(Buffer.from([0x7f]),0,1,size-1)} finally {await file.close()}
+        phase('tail-write','end')
+        phase('tampered-validate','start')
         await assert.rejects(validateExecutionNative(selected.native),/execution_identity_mismatch/)
+        phase('tampered-validate','end')
+        phase('changed-inspect','start')
         const changed=await inspectOpenCodeReadSelection()
+        phase('changed-inspect','end')
         assert.equal(changed.native.executableSha256,await digest())
         assert.notEqual(changed.fingerprint,selected.fingerprint)
       }
       const callsBeforeOversize=versionCalls
+      phaseSize=350*1024*1024+1
       await sparse(350*1024*1024+1)
+      phase('oversize-refusal','start')
       await assert.rejects(inspectOpenCodeReadSelection(),/identity_mismatch/)
+      phase('oversize-refusal','end')
       assert.equal(versionCalls,callsBeforeOversize)
       console.log('TEST native 350 MiB admission, complete hashes and ordinary 256 MiB refusal')
-    } finally {await rm(root,{recursive:true,force:true})}
+    } finally {phaseSize=0;phase('cleanup','start');await rm(root,{recursive:true,force:true});phase('cleanup','end')}
   `
   const child=Bun.spawn([process.execPath,'-e',script],{cwd:import.meta.dir,stdout:'pipe',stderr:'pipe'})
-  const [code,stdout,stderr]=await Promise.all([child.exited,new Response(child.stdout).text(),new Response(child.stderr).text()])
+  const [code,observed,stderr]=await Promise.all([child.exited,observeNativeSizeStdout(child.stdout,line=>console.error(line)),new Response(child.stderr).text()])
+  const stdout=observed.withoutPhases
   expect({code,stderr}).toEqual({code:0,stderr:''})
   expect(stdout.trim()).toBe('TEST native 350 MiB admission, complete hashes and ordinary 256 MiB refusal')
 },15000)
