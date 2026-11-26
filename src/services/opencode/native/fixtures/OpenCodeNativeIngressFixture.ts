@@ -16,6 +16,7 @@ export class NativeIngressFixture {
   private complete = false
   private bodySettled = false
   private acquired = false
+  private admissionStarted = false
   private dispose?: () => Promise<boolean>
   private disposal?: Promise<boolean>
   private cleanupState: CleanupState = 'unavailable'
@@ -45,6 +46,7 @@ export class NativeIngressFixture {
     this.dispose = dispose
   }
   async adopt<T>(resource: T): Promise<T> {
+    this.admissionStarted = true
     if (!this.dispose || this.acquired) throw new Error('TEST_native_ingress_adoption_invalid')
     this.acquired = true
     this.cleanupState = 'ready'
@@ -57,7 +59,11 @@ export class NativeIngressFixture {
     this.assertOpen()
     this.phase = phase
     // Register the actual operation before its factory runs, including synchronous failures.
-    const operation = Promise.resolve().then(() => { this.assertOpen(); return work() })
+    const operation = Promise.resolve().then(() => {
+      this.assertOpen()
+      if (phase === 'host-admission') this.admissionStarted = true
+      return work()
+    })
     this.pending.add(operation)
     this.trace('begin', phase)
     return operation.then(value => { this.assertOpen(); return value }).finally(() => {
@@ -110,8 +116,10 @@ export class NativeIngressFixture {
       if (!failed) failure = new Error('TEST_native_ingress_pending')
       failed = true; this.unknown = true
     }
-    // No restored environment may race a pending factory or an unconfirmed cleanup.
-    if (this.cleanupState === 'confirmed' && this.pending.size === 0 && !this.restored) {
+    // A settled setup failure can restore scope only before any admission factory ran.
+    // A rejected admission without an adopted handle is still unknown, never no-launch proof.
+    const noLaunch = !this.admissionStarted && !this.acquired
+    if ((this.cleanupState === 'confirmed' || noLaunch) && this.pending.size === 0 && !this.restored) {
       this.restored = true
       try { this.restore?.() }
       catch (error) {

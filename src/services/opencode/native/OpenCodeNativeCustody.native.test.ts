@@ -7,7 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { OpenCodeClientFactory } from '../OpenCodeClientFactory.js'
-import { launchNativeCustody, recoverNativeCustody, nativeCustodyForEndpoint, bindNativeRequestOwner, nativeHelperFailureDiagnostic, type NativeCustody } from './OpenCodeNativeCustody.js'
+import { launchNativeCustody, recoverNativeCustody, nativeCustodyForEndpoint, bindNativeRequestOwner, nativeHelperFailureDiagnostic, resolveNativeCustodyHelper, type NativeCustody } from './OpenCodeNativeCustody.js'
 import { OpenCodeHostManager } from '../OpenCodeHostManager.js'
 import type { OpenCodePreparedProfile } from '../types.js'
 import { fetchNativeOpenCode, nativeRequestFailureGate } from './OpenCodeNativeRequestLease.js'
@@ -15,6 +15,7 @@ import { failureDiagnostic } from './fixtures/OpenCodeNativeColdController.js'
 import { qualifyNativeColdRecovery } from './OpenCodeNativeColdRecovery.js'
 import { nativeAuthorityPath, nativeExitConfirmed, readNativeAuthority } from './OpenCodeNativeAuthority.js'
 import { NativeIngressFixtureCases } from './fixtures/OpenCodeNativeIngressFixture.js'
+import { cleanupNativeIngressHost } from './fixtures/OpenCodeNativeIngressCleanup.js'
 
 // Required in the physical Linux qualification lane. Mac/Windows cannot count
 // this as their custody proof; their retained native backends remain separate.
@@ -273,19 +274,28 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
         process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = binary
         process.env.CLAUDE_MULTIMODEL_OPENCODE_CUSTODY_HELPER = helper
         delete process.env.OPENCODE_BIN_PATH
+        await owned.stage('setup', resolveNativeCustodyHelper)
         const manager = new OpenCodeHostManager(), hostKey = `TEST-pinned-native-${version}`
+        let capturedCustody: NativeCustody | undefined
         // Capture the exact manager/key before admission; only its returned host can enable cleanup.
         owned.captureCleanup(async () => {
-          const stopped = await manager.disposeHost(hostKey)
-          await manager.drainPendingLifecycleCleanups()
-          return stopped
+          const custody = capturedCustody
+          if (!custody) throw new Error('TEST_native_ingress_cleanup_without_custody')
+          return cleanupNativeIngressHost({ registryPath: path.join(data, 'opencode', 'host-registry.json'),
+            hostKey, manager, custody, assertDead: async () => {
+              const authority = await readNativeAuthority(nativeAuthorityPath(profileRoot, hostKey))
+              expect(authority.phase).toBe('dead')
+              expect(authority.images.epoch).toBe(custody.reference.epoch)
+            } })
         })
         try {
           const { host, custody } = await owned.stage('host-admission', async () => {
-            const host = await owned.adopt(await manager.ensureHost({ hostKey, preparedProfile: prepared,
-              resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false, abortSignal: owned.signal }))
+            const host = await manager.ensureHost({ hostKey, preparedProfile: prepared,
+              resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false, abortSignal: owned.signal })
             const custody = nativeCustodyForEndpoint(host.baseUrl)
+            capturedCustody = custody
             epochs.add(custody)
+            await owned.adopt(host)
             return { host, custody }
           })
           expect(host.version).toBe(version)

@@ -1,4 +1,8 @@
 import { describe, expect, test } from 'bun:test'
+import { chmod, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { resolveNativeCustodyHelper } from './OpenCodeNativeCustody.js'
 import { NativeIngressFixtureCases, type NativeIngressDiagnostic } from './fixtures/OpenCodeNativeIngressFixture.js'
 
 function deferred<T>() {
@@ -13,6 +17,98 @@ async function started(condition: () => boolean) {
 const resultOf = (promise: Promise<void>) => promise.then(() => null, error => error)
 
 describe('native ingress fixture ownership', () => {
+  test.skipIf(process.platform !== 'linux')('a missing helper manifest before admission restores the actual environment and keeps the failed fence', async () => {
+    const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-ingress-no-launch-')))
+    const keys = ['CLAUDE_MULTIMODEL_DATA_HOME', 'CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH',
+      'OPENCODE_BIN_PATH', 'CLAUDE_MULTIMODEL_OPENCODE_CUSTODY_HELPER']
+    const original = Object.fromEntries(keys.map(key => [key, process.env[key]]))
+    const cases = new NativeIngressFixtureCases(), owner = cases.begin()
+    let admissions = 0, stops = 0, restores = 0
+    try {
+      for (const key of keys) process.env[key] = path.join(root, `prior-${key}`)
+      delete process.env.OPENCODE_BIN_PATH
+      const prior = Object.fromEntries(keys.map(key => [key, process.env[key]]))
+      const helper = path.join(root, 'custodian')
+      await writeFile(helper, 'TEST inert helper; never executed')
+      await chmod(helper, 0o600)
+      const failure = await resultOf(owner.run(async () => {
+        owner.captureScopeRestore(() => {
+          expect(cases.owns(owner)).toBe(true)
+          restores++
+          for (const [key, value] of Object.entries(prior)) {
+            if (value === undefined) delete process.env[key]; else process.env[key] = value
+          }
+        })
+        for (const key of keys) process.env[key] = path.join(root, `owned-${key}`)
+        process.env.CLAUDE_MULTIMODEL_OPENCODE_CUSTODY_HELPER = helper
+        owner.captureCleanup(async () => { stops++; return true })
+        // The production resolver reads the missing manifest without starting a helper or vendor.
+        await owner.stage('setup', resolveNativeCustodyHelper)
+        await owner.stage('host-admission', async () => { admissions++; return owner.adopt({}) })
+      }))
+      expect(failure.message).toBe('native_custody_asset_unavailable')
+      expect([admissions, stops, restores]).toEqual([0, 0, 1])
+      expect(keys.every(key => process.env[key] === prior[key])).toBe(true)
+      expect(await owner.cleanup()).toBe(false)
+      expect(owner.settledSuccessfully).toBe(false)
+      expect(() => cases.beforeEach()).toThrow('TEST_native_ingress_prior_unknown')
+      expect(() => cases.begin()).toThrow('TEST_native_ingress_prior_unknown')
+    } finally {
+      for (const [key, value] of Object.entries(original)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value
+      }
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  test('a rejected admission without an adopted host is not proof of no launch', async () => {
+    const cases = new NativeIngressFixtureCases(), owner = cases.begin()
+    const failure = new Error('TEST admission failed after an unobserved launch')
+    let admissions = 0, stops = 0, restores = 0
+    expect(await resultOf(owner.run(async () => {
+      owner.captureScopeRestore(() => { restores++ })
+      owner.captureCleanup(async () => { stops++; return true })
+      await owner.stage('host-admission', async () => { admissions++; throw failure })
+    }))).toBe(failure)
+    expect([admissions, stops, restores]).toEqual([1, 0, 0])
+    expect(await owner.cleanup()).toBe(false)
+    expect(() => cases.beforeEach()).toThrow('TEST_native_ingress_prior_unknown')
+  })
+
+  test('closure before the admission factory runs restores scope without admitting or stopping a host', async () => {
+    const cases = new NativeIngressFixtureCases(), owner = cases.begin()
+    let admissions = 0, stops = 0, restores = 0
+    const running = resultOf(owner.run(async () => {
+      owner.captureScopeRestore(() => { restores++ })
+      owner.captureCleanup(async () => { stops++; return true })
+      await owner.stage('host-admission', async () => { admissions++; return owner.adopt({}) })
+    }))
+    cases.afterEach()
+    expect((await running).message).toBe('TEST_native_ingress_closed')
+    expect([admissions, stops, restores]).toEqual([0, 0, 1])
+    expect(owner.settledSuccessfully).toBe(false)
+    expect(() => cases.beforeEach()).toThrow('TEST_native_ingress_prior_unknown')
+  })
+
+  test('a pending setup still retains scope when no admission started', async () => {
+    const cases = new NativeIngressFixtureCases(), owner = cases.begin(), pending = deferred<void>(), waiter = deferred<void>()
+    let reading = false, restores = 0
+    const running = resultOf(owner.run(async () => {
+      owner.captureScopeRestore(() => { restores++ })
+      owner.captureCleanup(async () => true)
+      const actual = owner.stage('setup', async () => { reading = true; await pending.promise })
+      await Promise.race([actual, waiter.promise])
+    }))
+    await started(() => reading)
+    waiter.resolve()
+    expect((await running).message).toBe('TEST_native_ingress_cleanup_unconfirmed')
+    expect(restores).toBe(0)
+    pending.resolve()
+    for (let turn = 0; turn < 6; turn++) await Promise.resolve()
+    expect(restores).toBe(0)
+    expect(() => cases.beforeEach()).toThrow('TEST_native_ingress_prior_unknown')
+  })
+
   test('a completed body, one confirmed cleanup and scope restoration admit the next case', async () => {
     const cases = new NativeIngressFixtureCases(), diagnostics: NativeIngressDiagnostic[] = []
     cases.beforeEach()
