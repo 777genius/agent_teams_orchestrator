@@ -34,6 +34,7 @@ import { OPEN_CODE_MANAGED_HOST_CONFIG_GENERATION, buildOpenCodeHostTransportIde
 export { resolveOpenCodeBinaryHostIdentity } from './OpenCodeHostIdentity.js'
 import { resolveOpenCodeBinaryPath } from './OpenCodeBinaryResolver.js'
 import { launchNativeCustody, recoverNativeCustody, nativeCustodyForChild, resolveNativeCustodyHelper, bindNativeRequestOwner, inheritNativeRequestOwner, type NativeCustody } from './native/OpenCodeNativeCustody.js'
+import { observeNativeStartup, type NativeStartupObserver } from './native/OpenCodeNativeStartupDiagnostic.js'
 import { nativeAuthorityPath, readNativeAuthority, nativeExitConfirmed, withNativeAuthorityGate, writeNativeAuthority } from './native/OpenCodeNativeAuthority.js'
 import { productionOpenCodeFetch } from './native/OpenCodeNativeRequestLease.js'
 import { prewarmOpenCodeManagedSubscriptionPlugins } from './OpenCodeInventoryService.js'
@@ -1053,6 +1054,7 @@ export class OpenCodeHostManager {
     hostKey: string,
     callback: () => Promise<T>,
     abortSignal?: AbortSignal,
+    startupObserver?: NativeStartupObserver,
   ): Promise<T> {
     const registryPath = this.persistentRegistryPath
     if (!registryPath) {
@@ -1066,14 +1068,14 @@ export class OpenCodeHostManager {
 
     let release: (() => Promise<void>) | undefined
     try {
-      release = await this.acquirePersistentHostStartupLock(lockPath, abortSignal)
+      release = await observeNativeStartup(startupObserver, 'startup-lock', () => this.acquirePersistentHostStartupLock(lockPath, abortSignal))
       if (abortSignal?.aborted) {
         throwOpenCodeAbortReason(abortSignal)
       }
       return await callback()
     } finally {
       if (release) {
-        await release()
+        await observeNativeStartup(startupObserver, 'startup-unlock', release)
       }
     }
   }
@@ -1728,12 +1730,13 @@ export class OpenCodeHostManager {
     attributionId: string | null,
     hostKey: string,
     abortSignal?: AbortSignal,
+    startupObserver?: NativeStartupObserver,
   ): Promise<ChildProcess> {
     if (this.deps.spawnHostProcess) {
       return this.deps.spawnHostProcess(profile, port)
     }
 
-    const selectedBinary = await resolveOpenCodeBinaryPath(abortSignal)
+    const selectedBinary = await observeNativeStartup(startupObserver, 'native-binary', () => resolveOpenCodeBinaryPath(abortSignal))
     if (this.ownedHostAdmissionClosed) throw new Error('OpenCode host manager is closing')
     abortSignal?.throwIfAborted()
     const spawnOptions = buildOpenCodeHostSpawnOptions(profile, process.platform, {
@@ -1742,13 +1745,13 @@ export class OpenCodeHostManager {
     const args = ['serve', '--hostname', '127.0.0.1', '--port', String(port)]
     if (this.usesNativeCustody) {
       if (!selectedBinary) throw new Error('native_custody_binary_unavailable')
-      const helper = await resolveNativeCustodyHelper()
+      const helper = await observeNativeStartup(startupObserver, 'custody-helper', resolveNativeCustodyHelper)
       if (this.ownedHostAdmissionClosed) throw new Error('OpenCode host manager is closing')
       abortSignal?.throwIfAborted()
       const custody = await launchNativeCustody({ helper, selectedBinary, hostKey,
         profileRoot: profile.profileRootPath, scope: profile,
         cwd: profile.workingDirectoryPath ?? profile.projectPath, baseUrl: `http://127.0.0.1:${port}`,
-        args, env: spawnOptions.env ?? {}, persistent: lifetime === 'persistent', signal: abortSignal,
+        args, env: spawnOptions.env ?? {}, persistent: lifetime === 'persistent', signal: abortSignal, startupObserver,
         minimumVersion: profile.profileScope?.providerId === 'opencode' ||
           (typeof profile.managedConfig.model === 'string' && profile.managedConfig.model.startsWith('opencode/'))
           ? '1.18.0' : '1.16.0' })
@@ -1860,16 +1863,17 @@ export class OpenCodeHostManager {
     lifetime: OpenCodeHostLifetime,
     resolveConfigFingerprint: boolean,
     abortSignal?: AbortSignal,
+    startupObserver?: NativeStartupObserver,
   ): Promise<OpenCodeHostHandle> {
-    const port = await this.allocateLoopbackPort()
+    const port = await observeNativeStartup(startupObserver, 'port-allocate', () => this.allocateLoopbackPort())
     if (this.ownedHostAdmissionClosed) throw new Error('OpenCode host manager is closing')
     const baseUrl = `http://127.0.0.1:${port}`
-    await this.cleanupOpenTuiTempArtifactsIfUnused(profile.tmpPath).catch(() => undefined)
+    await observeNativeStartup(startupObserver, 'temp-cleanup', () => this.cleanupOpenTuiTempArtifactsIfUnused(profile.tmpPath).catch(() => undefined))
     // Minted before the spawn so every process below this host inherits it,
     // including the cursor-agent trees the runtime never sees.
     const attributionId = mintProcessAttributionId()
     if (this.ownedHostAdmissionClosed) throw new Error('OpenCode host manager is closing')
-    const child = await this.spawnHost(profile, port, lifetime, attributionId, hostKey, abortSignal)
+    const child = await this.spawnHost(profile, port, lifetime, attributionId, hostKey, abortSignal, startupObserver)
     const custody = nativeCustodyForChild(child)
 
     const diagnostics: string[] = []
@@ -1918,26 +1922,26 @@ export class OpenCodeHostManager {
     }
 
     try {
-      const health = await this.waitForHealthyHost(
+      const health = await observeNativeStartup(startupObserver, 'health', () => this.waitForHealthyHost(
         baseUrl,
         () => this.pendingHostHealthTimeoutMs.get(hostKey) ?? OPEN_CODE_HOST_HEALTH_TIMEOUT_MS,
         abortSignal,
         handle,
-      )
+      ))
       if (custody && health.version !== custody.reference.measuredVersion) throw new Error('native_custody_version_mismatch')
       handle.version = health.version
       handle.resolvedConfigFingerprint = resolveConfigFingerprint
         ? await this.getResolvedConfigFingerprint(baseUrl, undefined, handle)
         : profile.managedConfigFingerprint
       handle.state = 'healthy'
-      handle.processStartedAtMs = await this.captureProcessStartTimeMs(handle.pid, abortSignal)
+      handle.processStartedAtMs = await observeNativeStartup(startupObserver, 'birth', () => this.captureProcessStartTimeMs(handle.pid, abortSignal))
       if (handle.processStartedAtMs === null && !this.deps.spawnHostProcess) {
         throw new Error(
           `OpenCode host pid ${handle.pid} process identity could not be captured after startup`,
         )
       }
       if (lifetime === 'persistent') {
-        await this.upsertPersistentHost(handle, true)
+        await observeNativeStartup(startupObserver, 'host-publish', () => this.upsertPersistentHost(handle, true))
       }
       return handle
     } catch (error) {
@@ -1945,8 +1949,8 @@ export class OpenCodeHostManager {
       const message = error instanceof Error ? error.message : String(error)
       diagnostics.push(message)
       this.hosts.delete(hostKey)
-      await this.forceKillSpawnedHostProcess(child)
-      await this.cleanupOpenTuiTempArtifactsIfUnused(profile.tmpPath, child.pid)
+      await observeNativeStartup(startupObserver, 'failed-launch-stop', () => this.forceKillSpawnedHostProcess(child))
+      await observeNativeStartup(startupObserver, 'failed-launch-temp', () => this.cleanupOpenTuiTempArtifactsIfUnused(profile.tmpPath, child.pid))
       if (abortSignal?.aborted && abortSignal.reason instanceof Error) {
         throw abortSignal.reason
       }
@@ -2126,13 +2130,15 @@ export class OpenCodeHostManager {
        * a missing registry record whose process is provably gone. */
       expectedRuntimePid?: number
       abortSignal?: AbortSignal
+      /** Closed, non-authoritative TEST progress; does not change startup budgets or operations. */
+      startupObserver?: NativeStartupObserver
     } = {},
   ): Promise<OpenCodeHostHandle> {
     if (this.ownedHostAdmissionClosed) throw new Error('OpenCode host manager is closing')
     if (params.abortSignal?.aborted) {
       throwOpenCodeAbortReason(params.abortSignal)
     }
-    await this.withPersistentRegistryLock('ensure_read', async () => { await this.readPersistentRegistryUnlocked() })
+    await observeNativeStartup(params.startupObserver, 'registry-read', () => this.withPersistentRegistryLock('ensure_read', async () => { await this.readPersistentRegistryUnlocked() }))
     const profile = params.preparedProfile ?? await raceOpenCodeAbortSignal(
       this.prepareProfile(params.projectPath, {
         ...params.profileOptions,
@@ -2140,7 +2146,7 @@ export class OpenCodeHostManager {
       }),
       params.abortSignal,
     )
-    await assertOpenCodePreparedProfileScope(profile, params.projectPath)
+    await observeNativeStartup(params.startupObserver, 'profile-scope', () => assertOpenCodePreparedProfileScope(profile, params.projectPath))
     if (params.existingOnly) {
       const hostKey = params.hostKey?.trim()
       if (!hostKey || (profile.scopeToken && !hostKey.includes(`::scope:${profile.scopeToken}::`))) {
@@ -2148,7 +2154,7 @@ export class OpenCodeHostManager {
       }
       return this.retainExistingHost(hostKey, profile, params.abortSignal, params.expectedRuntimePid)
     }
-    const binaryPath = await resolveOpenCodeBinaryPath(params.abortSignal)
+    const binaryPath = await observeNativeStartup(params.startupObserver, 'binary-resolve', () => resolveOpenCodeBinaryPath(params.abortSignal))
     const preparedBinaryIdentity = profile.env.AGENT_TEAMS_CURSOR_HOST_BINARY_IDENTITY
     const needsBinaryIdentity = Boolean(preparedBinaryIdentity) || !params.hostKey?.trim()
     const binaryHostIdentity = binaryPath && needsBinaryIdentity
@@ -2226,7 +2232,7 @@ export class OpenCodeHostManager {
       return this.withPersistentHostStartupLock(hostKey, async () => {
         const adopted =
           hostLifetime === 'persistent'
-            ? await this.adoptPersistentHost(hostKey, profile, resolveConfigFingerprint)
+            ? await observeNativeStartup(params.startupObserver, 'retained-host', () => this.adoptPersistentHost(hostKey, profile, resolveConfigFingerprint))
             : null
         return adopted ?? this.createHost(
           hostKey,
@@ -2234,8 +2240,9 @@ export class OpenCodeHostManager {
           hostLifetime,
           resolveConfigFingerprint,
           params.abortSignal,
+          params.startupObserver,
         )
-      }, params.abortSignal)
+      }, params.abortSignal, params.startupObserver)
     })().finally(() => {
       this.pendingHosts.delete(hostKey)
       this.pendingRefCounts.delete(hostKey)

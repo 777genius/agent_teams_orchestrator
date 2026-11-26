@@ -4,6 +4,7 @@ import { constants } from 'node:fs'
 import { lstat, open, readFile, realpath } from 'node:fs/promises'
 import path from 'node:path'
 import { createHash, randomBytes } from 'node:crypto'
+import { observeNativeStartup, type NativeStartupObserver } from './OpenCodeNativeStartupDiagnostic.js'
 import { Transform, type Readable } from 'node:stream'
 import {
   createNativeEpochImages, ensureNativeEpochParent, reclaimRetiredNativeImages,
@@ -93,10 +94,24 @@ function frame(fields: string[]): Buffer {
   const length = Buffer.alloc(4); length.writeUInt32BE(body.length); return Buffer.concat([length, body])
 }
 type HelperWaitPhase = 'unspecified' | 'hello' | 'measure-terminal' | 'launch-started' | 'control-inspect' | 'control-peer' | 'control-stop'
-type HelperTrigger = 'none' | 'invalid-frame' | 'child-error' | 'child-close' | 'stdout-end' | 'stdout-error' | 'stdin-error' | 'timeout'
+type HelperTrigger = 'none' | 'invalid-frame' | 'child-error' | 'child-close' | 'stdout-end' | 'stdout-error' | 'stdin-error' | 'stdio-error' | 'timeout'
+type HelperOperation = 'unspecified' | 'measure' | 'launch' | 'control-inspect' | 'control-peer' | 'control-stop'
+const helperIoCodes = ['EACCES', 'EAGAIN', 'EBADF', 'ECANCELED', 'ECONNRESET', 'EINTR', 'EINVAL', 'EIO', 'EMFILE',
+  'ENFILE', 'ENOMEM', 'ENOTCONN', 'EPERM', 'EPIPE', 'ERR_STREAM_DESTROYED', 'ERR_STREAM_PREMATURE_CLOSE'] as const
+type HelperIoCode = typeof helperIoCodes[number] | 'unknown'
+function helperIoCode(error: unknown): HelperIoCode {
+  if (error === null || typeof error !== 'object') return 'unknown'
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, 'code')
+    const code: unknown = descriptor && 'value' in descriptor ? descriptor.value : undefined
+    return helperIoCodes.find(candidate => candidate === code) ?? 'unknown'
+  } catch { return 'unknown' }
+}
 /** Diagnostic facts from the original handle only. Never used as admission or death authority. */
 type HelperDiagnostic = {
-  waitPhase: HelperWaitPhase; trigger: HelperTrigger; exitObserved: boolean; closeObserved: boolean
+  waitPhase: HelperWaitPhase; trigger: HelperTrigger; operation: HelperOperation
+  triggerFd: number | null; triggerCode: HelperIoCode | null; exitObservedAtTrigger: boolean; closeObservedAtTrigger: boolean
+  exitObserved: boolean; closeObserved: boolean
   exitCode: number | null; signal: string | null; bufferedBytes: number; queuedFrames: number; waitingReplies: number; bufferedAtTrigger: number; waitingAtTrigger: number
 }
 const helperDiagnostics = new WeakMap<object, () => HelperDiagnostic>()
@@ -104,21 +119,30 @@ export function nativeHelperFailureDiagnostic(error: unknown): HelperDiagnostic 
   // WeakMap identity avoids invoking error getters/toJSON or accepting caller data.
   return error !== null && typeof error === 'object' ? helperDiagnostics.get(error)?.() : undefined
 }
-function frames(child: ChildProcess): { next(phase?: HelperWaitPhase): Promise<Record<string, unknown>>; assertOpen(): void } {
+function frames(child: ChildProcess, operation: HelperOperation): { next(phase?: HelperWaitPhase): Promise<Record<string, unknown>>; assertOpen(): void } {
   let data = Buffer.alloc(0), failure: Error | undefined, ended = false
   let waitPhase: HelperWaitPhase = 'unspecified', trigger: HelperTrigger = 'none', bufferedAtTrigger = 0, waitingAtTrigger = 0
   let exitObserved = false, closeObserved = false, exitCode: number | null = null, signal: string | null = null
+  let triggerFd: number | null = null, triggerCode: HelperIoCode | null = null
+  let exitObservedAtTrigger = false, closeObservedAtTrigger = false
   const queue: Array<Record<string, unknown>> = [], waiting: Array<{ resolve(value: Record<string, unknown>): void; reject(reason: unknown): void }> = []
-  const diagnostic = (): HelperDiagnostic => ({ waitPhase, trigger, exitObserved, closeObserved, exitCode, signal,
+  const diagnostic = (): HelperDiagnostic => ({ waitPhase, trigger, operation, triggerFd, triggerCode,
+    exitObservedAtTrigger, closeObservedAtTrigger, exitObserved, closeObserved, exitCode, signal,
     bufferedBytes: Math.min(data.length, 32769), queuedFrames: Math.min(queue.length, 32769), waitingReplies: Math.min(waiting.length, 32769), bufferedAtTrigger, waitingAtTrigger })
   const problem = (code: 'native_custody_protocol' | 'native_custody_timeout' | 'native_custody_unavailable') => {
     const error = new Error(code); helperDiagnostics.set(error, diagnostic); return error
   }
-  const mark = (cause: HelperTrigger) => { if (trigger === 'none') {
-    trigger = cause; bufferedAtTrigger = Math.min(data.length, 32769); waitingAtTrigger = Math.min(waiting.length, 32769)
+  const mark = (cause: HelperTrigger, fd: number | null = null) => { if (trigger === 'none') {
+    trigger = cause; triggerFd = fd
+    exitObservedAtTrigger = exitObserved; closeObservedAtTrigger = closeObserved
+    bufferedAtTrigger = Math.min(data.length, 32769); waitingAtTrigger = Math.min(waiting.length, 32769)
   } }
-  const refuse = (cause: HelperTrigger) => {
-    mark(cause); failure = problem('native_custody_protocol'); for (const waiter of waiting.splice(0)) waiter.reject(failure)
+  const refuse = (cause: HelperTrigger, fd: number | null = null, error?: unknown) => {
+    const first = trigger === 'none'
+    mark(cause, fd); failure = problem('native_custody_protocol'); for (const waiter of waiting.splice(0)) waiter.reject(failure)
+    // Own the first refusal before inspecting even a data descriptor on an exotic error.
+    if (first && (cause === 'stdio-error' || cause === 'stdin-error' || cause === 'stdout-error' || cause === 'child-error'))
+      triggerCode = helperIoCode(error)
   }
   const finish = (cause: 'child-close' | 'stdout-end') => {
     mark(cause); ended = true
@@ -145,10 +169,15 @@ function frames(child: ChildProcess): { next(phase?: HelperWaitPhase): Promise<R
       } catch { refuse('invalid-frame'); return }
     }
   })
-  child.once('error', () => refuse('child-error'))
+  // Bun creates extra pipes as sockets, which can fail before HELLO or output consumers attach.
+  // Keep their errors owned while captured-child cleanup is still pending.
+  for (const [offset, output] of child.stdio.slice(2).entries())
+    output?.on('error', error => refuse('stdio-error', offset + 2, error))
+  child.once('error', error => refuse('child-error', null, error))
   child.once('close', () => { closeObserved = true; finish('child-close') })
-  child.stdout!.once('end', () => finish('stdout-end')); child.stdout!.once('error', () => refuse('stdout-error'))
-  child.stdin!.on('error', () => refuse('stdin-error'))
+  child.stdout!.once('end', () => finish('stdout-end'))
+  child.stdout!.once('error', error => refuse('stdout-error', 1, error))
+  child.stdin!.on('error', error => refuse('stdin-error', 0, error))
   return { assertOpen: () => { if (failure) throw failure; if (ended) throw problem('native_custody_unavailable') }, next: async (phase = 'unspecified') => {
     waitPhase = phase
     if (failure) throw failure
@@ -165,7 +194,7 @@ function frames(child: ChildProcess): { next(phase?: HelperWaitPhase): Promise<R
 
 /** Attach synchronously in the spawn turn, before receipt closure or any other await.
  * Exported only within the native boundary so lifecycle races can be tested without a native launch. */
-export function observeNativeHelper(child: ChildProcess) {
+export function observeNativeHelper(child: ChildProcess, operation: HelperOperation = 'unspecified') {
   retainedHelpers.add(child)
   let closed = false, exited = false
   const closure = new Promise<void>(resolve => child.once('close', () => {
@@ -188,13 +217,14 @@ export function observeNativeHelper(child: ChildProcess) {
     try { if (!closed && !exited) child.kill('SIGKILL') } catch { /* Unconfirmed handle stays retained. */ }
     return waitForClose(2500)
   }
-  const stream = frames(child)
+  const stream = frames(child, operation)
   const assertLive = () => { stream.assertOpen(); fact(!exited && !closed) }
   return { stream, closeUnadmitted, assertLive }
 }
 
 /** Verify the actual spawned helper image before writing any environment/control packet. */
-async function openHelper(images: NativeEpochImages, launch = false, measure = false) {
+async function openHelper(images: NativeEpochImages, launch = false, measure = false,
+  operation: HelperOperation = launch ? 'launch' : measure ? 'measure' : 'unspecified', startupObserver?: NativeStartupObserver) {
   await verifyNativeEpochDirectories(images)
   await verifyNativeImage(images.helper, images.helperIdentity)
   let receipt: Awaited<ReturnType<typeof open>> | undefined
@@ -211,7 +241,7 @@ async function openHelper(images: NativeEpochImages, launch = false, measure = f
     }
     launched = spawn(images.helper, [], { env: {}, stdio: ['pipe', 'pipe', 'pipe',
       launch || measure ? 'pipe' : 'ignore', launch ? 'pipe' : 'ignore', receipt?.fd ?? 'ignore'], detached: true })
-    observation = observeNativeHelper(launched)
+    observation = observeNativeHelper(launched, operation)
   } finally {
     try { await receipt?.close() }
     catch {
@@ -224,7 +254,7 @@ async function openHelper(images: NativeEpochImages, launch = false, measure = f
   const { stream, closeUnadmitted, assertLive } = observation
   try {
     fact(!receiptCloseFailed)
-    const hello = await stream.next('hello')
+    const hello = await observeNativeStartup(startupObserver, 'helper-hello', () => stream.next('hello'))
     fact(child.pid && hello.pid === child.pid && decimal(hello.birth) && hello.dev === images.helperIdentity.dev &&
       hello.ino === images.helperIdentity.ino && typeof hello.bootId === 'string')
     const loaded = await lstat(`/proc/${child.pid}/exe`).then(async () => {
@@ -243,8 +273,9 @@ async function openHelper(images: NativeEpochImages, launch = false, measure = f
 }
 
 /** The copied object is measured before the real profile or HTTP key is sent. */
-async function measurePrivateImage(images: NativeEpochImages, minimum: '1.16.0' | '1.18.0', lifetime: { created(): void; closed(): void }, signal?: AbortSignal): Promise<string> {
-  const probe = await openHelper(images, false, true)
+async function measurePrivateImage(images: NativeEpochImages, minimum: '1.16.0' | '1.18.0', lifetime: { created(): void; closed(): void }, signal?: AbortSignal,
+  startupObserver?: NativeStartupObserver): Promise<string> {
+  const probe = await observeNativeStartup(startupObserver, 'measure-helper', () => openHelper(images, false, true, 'measure', startupObserver))
   let output = Buffer.alloc(0), overflow = false
   const stdout = probe.child.stdio[3] as Readable
   const ended = new Promise<void>((resolve, reject) => { stdout.once('end', resolve); stdout.once('error', reject) })
@@ -260,10 +291,10 @@ async function measurePrivateImage(images: NativeEpochImages, minimum: '1.16.0' 
     const packet = frame(['measure', images.epoch, images.image, images.probeRoot, 'ephemeral',
       images.imageIdentity.dev, images.imageIdentity.ino, '2', images.image, '--version', String(env.length), ...env])
     signal?.throwIfAborted(); probe.assertLive(); lifetime.created(); packetSent = true; probe.child.stdin!.end(packet)
-    const terminal = await probe.stream.next('measure-terminal')
+    const terminal = await observeNativeStartup(startupObserver, 'measure-terminal', () => probe.stream.next('measure-terminal'))
     fact(terminal.closed === true); lifetime.closed()
     fact(terminal.status === 0)
-    await ended
+    await observeNativeStartup(startupObserver, 'measure-stdout', () => ended)
     signal?.throwIfAborted()
     fact(!overflow)
     const text = new TextDecoder('utf-8', { fatal: true }).decode(output)
@@ -272,7 +303,7 @@ async function measurePrivateImage(images: NativeEpochImages, minimum: '1.16.0' 
     fact(match?.[0] === text && version && version.startsWith('1.'))
     const comparison = compareOpenCodeNativeVersions(version, minimum)
     fact(comparison !== null && comparison >= 0)
-    await verifyNativeImage(images.image, images.imageIdentity)
+    await observeNativeStartup(startupObserver, 'measure-image', () => verifyNativeImage(images.image, images.imageIdentity))
     return version
   } catch (error) {
     if (!packetSent && !await probe.closeUnadmitted()) throw new Error(HELPER_CLEANUP_UNCONFIRMED)
@@ -286,7 +317,7 @@ async function control(reference: NativeCustodyReference, action: 'inspect' | 'p
   await verifyNativeEpochDirectories(reference.images)
   fact((await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim() === reference.bootId)
   await verifyNativeImage(reference.images.image, reference.images.imageIdentity)
-  const operation = await openHelper(reference.images)
+  const operation = await openHelper(reference.images, false, false, `control-${action}`)
   let packetSent = false
   try {
     const nonce = randomBytes(32).toString('hex')
@@ -376,16 +407,17 @@ export async function launchNativeCustody(input: {
   cwd: string; baseUrl: string; args: string[]; env: NodeJS.ProcessEnv; persistent: boolean
   minimumVersion: '1.16.0' | '1.18.0'
   signal?: AbortSignal
+  startupObserver?: NativeStartupObserver
 }): Promise<NativeCustody> {
   fact(process.platform === 'linux' && /^http:\/\/127\.0\.0\.1:[1-9][0-9]*$/.test(input.baseUrl))
   input.signal?.throwIfAborted()
   // Create only the private gate's parent before checking prior authority.
   // Never copy a replacement native image while the former epoch is live/unknown.
-  await ensureNativeEpochParent(input.profileRoot, input.hostKey)
+  await observeNativeStartup(input.startupObserver, 'authority-parent', () => ensureNativeEpochParent(input.profileRoot, input.hostKey))
   const file = nativeAuthorityPath(input.profileRoot, input.hostKey)
-  return withNativeAuthorityGate(file, async () => {
+  return observeNativeStartup(input.startupObserver, 'authority-gate', () => withNativeAuthorityGate(file, async () => {
     let previous: NativeAuthority | null = null
-    try { previous = await readNativeAuthority(file) }
+    try { previous = await observeNativeStartup(input.startupObserver, 'authority-read', () => readNativeAuthority(file)) }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
     if (previous && previous.phase !== 'dead') {
       let terminal = await nativeExitConfirmed(previous)
@@ -406,7 +438,7 @@ export async function launchNativeCustody(input: {
       if (death) await reclaimRetiredNativeImages(previous.images)
     }
     input.signal?.throwIfAborted()
-    const images = await createNativeEpochImages(input.profileRoot, input.hostKey, input.selectedBinary, input.helper.path)
+    const images = await observeNativeStartup(input.startupObserver, 'image-copy', () => createNativeEpochImages(input.profileRoot, input.hostKey, input.selectedBinary, input.helper.path))
     fact(images.helperIdentity.sha256 === input.helper.sha256)
     input.signal?.throwIfAborted()
     const password = randomBytes(32).toString('hex')
@@ -417,15 +449,15 @@ export async function launchNativeCustody(input: {
     const scopeDigest = createHash('sha256').update(JSON.stringify(scope)).digest('hex')
     let authority: NativeAuthority = { schemaVersion: 1, phase: 'preparing', profileRoot: input.profileRoot,
       hostKeyHash: path.basename(path.dirname(file)), scopeDigest, scope, images, reference: null }
-    await writeNativeAuthority(file, authority, !previous)
+    await observeNativeStartup(input.startupObserver, 'authority-preparing', () => writeNativeAuthority(file, authority, !previous))
     let operation: Awaited<ReturnType<typeof openHelper>> | undefined
     let creationSent = false
     try {
     // A probe owns a captured native creation too; uncertain closure blocks a
     // replacement even though no main-profile credentials have been sent.
-    const measuredVersion = await measurePrivateImage(images, input.minimumVersion,
-      { created: () => { creationSent = true }, closed: () => { creationSent = false } }, input.signal)
-    operation = await openHelper(images, true)
+    const measuredVersion = await observeNativeStartup(input.startupObserver, 'native-measure', () => measurePrivateImage(images, input.minimumVersion,
+      { created: () => { creationSent = true }, closed: () => { creationSent = false } }, input.signal, input.startupObserver))
+    operation = await observeNativeStartup(input.startupObserver, 'launch-helper', () => openHelper(images, true, false, 'launch', input.startupObserver))
     input.signal?.throwIfAborted()
     const args = [images.image, ...input.args]
     const env = Object.entries(nativeEnvironment).filter((entry): entry is [string, string] => entry[1] !== undefined).map(([key, value]) => {
@@ -436,7 +468,7 @@ export async function launchNativeCustody(input: {
       String(args.length), ...args, String(env.length), ...env])
     input.signal?.throwIfAborted(); operation.assertLive(); creationSent = true
     operation.child.stdin!.write(packet)
-    const started = await operation.stream.next('launch-started')
+    const started = await observeNativeStartup(input.startupObserver, 'launch-reply', () => operation!.stream.next('launch-started'))
     fact(Number.isSafeInteger(started.pid) && Number(started.pid) > 0 && decimal(started.birth) &&
       started.custodianPid === operation.child.pid && started.custodianBirth === operation.hello.birth)
     const reference: NativeCustodyReference = Object.freeze({ schemaVersion: 1, platform: 'linux', epoch: images.epoch,
@@ -444,7 +476,7 @@ export async function launchNativeCustody(input: {
       nativeBirth: started.birth, custodianPid: started.custodianPid as number,
       custodianBirth: started.custodianBirth as string, images, profileRoot: input.profileRoot, scopeDigest, authorization, measuredVersion })
     authority = { ...authority, phase: 'published', reference }
-    await writeNativeAuthority(file, authority)
+    await observeNativeStartup(input.startupObserver, 'authority-publish', () => writeNativeAuthority(file, authority))
     const custody = bind(reference, operation.child)
     return custody
   } catch (error) {
@@ -453,11 +485,11 @@ export async function launchNativeCustody(input: {
     let uncertain = creationSent || cleanupUnconfirmed(error)
     if (operation && !creationSent && !await operation.closeUnadmitted()) uncertain = true
     operation?.child.stdin?.end()
-    await writeNativeAuthority(file, { ...authority, phase: uncertain ? 'unknown' : 'dead' })
+    await observeNativeStartup(input.startupObserver, 'authority-refusal', () => writeNativeAuthority(file, { ...authority, phase: uncertain ? 'unknown' : 'dead' }))
     if (uncertain && !creationSent) throw new Error(HELPER_CLEANUP_UNCONFIRMED)
     throw error
   }
-  })
+  }))
 }
 
 export async function recoverNativeCustody(profileRoot: string, hostKey: string, expectedBaseUrl: string): Promise<NativeCustody> {

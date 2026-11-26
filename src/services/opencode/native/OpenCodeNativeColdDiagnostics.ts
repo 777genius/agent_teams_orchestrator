@@ -9,7 +9,7 @@ export const coldFailureCodes = new Set(['TEST_cold_contract', 'TEST_cold_public
 export const coldErrnoCodes = new Set(['EIO', 'ENOSPC', 'ENOENT', 'EACCES', 'EPERM', 'EAGAIN', 'EBUSY', 'EPIPE',
   'EINVAL', 'EBADF', 'EDQUOT', 'ENOMEM', 'EMFILE', 'ENFILE', 'ELOOP', 'ENOTDIR', 'EISDIR', 'EEXIST', 'EROFS',
   'EINTR', 'ENOSYS', 'ENOTSUP', 'EOPNOTSUPP', 'ETIMEDOUT', 'ECONNREFUSED', 'ECONNRESET', 'ENOTEMPTY',
-  'EXDEV', 'EOVERFLOW', 'EINPROGRESS'])
+  'EXDEV', 'EOVERFLOW', 'EINPROGRESS', 'ECHILD', 'ESRCH'])
 export const coldProgressPhases = ['ready-write-start', 'ready-write-complete', 'role-run-returned', 'exit-requested', 'caught-error'] as const
 export type ColdProgressPhase = typeof coldProgressPhases[number]
 export type ColdProgress = { protocol: 1; role: 'A' | 'B' | 'sentinel'; phase: ColdProgressPhase; errorClass: string; code: string }

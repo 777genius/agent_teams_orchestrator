@@ -485,17 +485,18 @@ test('member retirement cleanup records the MAIN exit class and closed frame obs
 })
 
 
-test('anonymous model refusal retains its closed reason without provider payloads', async () => {
+test.each(['execution_selected_auth_anonymous_unproven', 'execution_selected_auth_local_route_unproven'])(
+  'authless model refusal retains its closed reason without provider payloads: %s', async category => {
   const root = await mkdtemp(path.join(tmpdir(), 'TEST-v2-anonymous-diagnostics-'))
   const previous = process.env.CLAUDE_MULTIMODEL_DATA_HOME
   process.env.CLAUDE_MULTIMODEL_DATA_HOME = root
   try {
     await recordOpenCodeV2ProviderFailure('execution-host-startup',
-      new Error('execution_selected_auth_anonymous_unproven'), true)
+      new Error(category), true)
     const directory = path.join(root, 'opencode/v2/provider-diagnostics')
     const rows = await Promise.all((await readdir(directory)).map(async file => JSON.parse(await readFile(path.join(directory, file), 'utf8'))))
     expect(rows).toHaveLength(1)
-    expect(rows[0].category).toBe('execution_selected_auth_anonymous_unproven')
+    expect(rows[0].category).toBe(category)
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_MULTIMODEL_DATA_HOME
     else process.env.CLAUDE_MULTIMODEL_DATA_HOME = previous

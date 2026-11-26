@@ -1,4 +1,5 @@
 import { lstat, mkdtemp, mkdir, readFile, readlink, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import { writeSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import os from 'node:os'
@@ -55,6 +56,31 @@ function normalizePath(value: string): string {
   return value.replace(/\\/g, '/')
 }
 
+const PROFILE_REPAIR_OBSERVATION_PREFIX = 'TEST-profile-repair-phase '
+const PROFILE_REPAIR_OBSERVATION_LIMIT = 8 * 1024
+const PROFILE_REPAIR_STEPS = [
+  'resolve project and scope', 'wait for profile preparation lock',
+  'fingerprint project behavior', 'read preferences and build config',
+  'fingerprint auth sources', 'create profile directories',
+  'repair plugin caches and native bridge', 'coordinate shared node_modules',
+  'wait for node_modules symlink lock', 'wait for shared node_modules migration lock',
+  'merge legacy node_modules directory', 'replace legacy node_modules directory',
+  'reconcile managed auth stores', 'bind native Cursor authority',
+  'probe native provider credentials', 'verify auth and finalize environment',
+]
+const PROFILE_REPAIR_PHASES = new Set([
+  'import-start', 'import-complete', 'barrier-released',
+  'prepare-enter', 'prepare-leave', 'prepared',
+])
+
+function observeProfileRepair(value: Record<string, unknown>): void {
+  try {
+    const line = PROFILE_REPAIR_OBSERVATION_PREFIX + JSON.stringify(value) + '\n'
+    if (line.length <= 512) writeSync(2, line)
+  }
+  catch { /* Observation cannot change the original worker outcome. */ }
+}
+
 async function runBunScript(
   scriptPath: string,
   args: string[],
@@ -67,14 +93,40 @@ async function runBunScript(
     })
     let stdout = ''
     let stderr = ''
+    let phasePending = ''
+    let phaseBytes = 0
     child.stdout.on('data', chunk => {
       stdout += String(chunk)
+      try {
+        phasePending += String(chunk).slice(0, PROFILE_REPAIR_OBSERVATION_LIMIT)
+        let newline: number
+        while ((newline = phasePending.indexOf('\n')) >= 0) {
+          const line = phasePending.slice(0, newline)
+          phasePending = phasePending.slice(newline + 1)
+          if (!line.startsWith(PROFILE_REPAIR_OBSERVATION_PREFIX) || line.length > 512
+            || phaseBytes + line.length + 1 > PROFILE_REPAIR_OBSERVATION_LIMIT) continue
+          try {
+            const value = JSON.parse(line.slice(PROFILE_REPAIR_OBSERVATION_PREFIX.length))
+            if (!value || Object.keys(value).length !== 4 || value.pid !== child.pid
+              || !PROFILE_REPAIR_PHASES.has(value.phase)
+              || (value.step !== null && !PROFILE_REPAIR_STEPS.includes(value.step))
+              || !Number.isSafeInteger(value.elapsedMs) || value.elapsedMs < 0) continue
+            phaseBytes += line.length + 1
+            observeProfileRepair({ pid: value.pid, phase: value.phase, step: value.step, elapsedMs: value.elapsedMs })
+          } catch { /* Ignore non-observation output without changing its capture. */ }
+        }
+        phasePending = phasePending.slice(-512)
+      } catch { /* Observation cannot change the original output handling. */ }
     })
     child.stderr.on('data', chunk => {
       stderr += String(chunk)
     })
-    child.on('error', reject)
-    child.on('close', code => {
+    child.on('error', error => {
+      observeProfileRepair({ pid: child.pid ?? null, phase: 'child-error' })
+      reject(error)
+    })
+    child.on('close', (code, signal) => {
+      observeProfileRepair({ pid: child.pid ?? null, phase: 'child-close', code, signal })
       if (code === 0) {
         resolve()
         return
@@ -3442,12 +3494,37 @@ describe('OpenCodeProfileManager project behavior contract', () => {
       const scriptPath = path.join(tempDir, 'prepare-opencode-profile.mjs')
       await writeFile(
         scriptPath,
-        `const { OpenCodeProfileManager } = await import(${JSON.stringify(profileManagerUrl)});
+        `import { writeSync } from 'node:fs';
+const observationStartedAt = performance.now();
+let observationBytes = 0;
+const steps = ${JSON.stringify(PROFILE_REPAIR_STEPS)};
+const observe = (phase, step = null) => {
+  try {
+    const line = ${JSON.stringify(PROFILE_REPAIR_OBSERVATION_PREFIX)} + JSON.stringify({
+      pid: process.pid, phase, step, elapsedMs: Math.round(performance.now() - observationStartedAt),
+    }) + '\\n';
+    if (observationBytes + line.length > ${PROFILE_REPAIR_OBSERVATION_LIMIT}) return;
+    observationBytes += line.length;
+    writeSync(1, line);
+  } catch { /* Observation cannot change profile preparation. */ }
+};
+const progress = { enterStep(label) {
+  let step = null;
+  try { step = steps.find(value => label === 'prepare managed OpenCode profile: ' + value) ?? null; }
+  catch { /* Unknown labels remain unreported data. */ }
+  observe('prepare-enter', step);
+  return () => observe('prepare-leave', step);
+} };
+observe('import-start');
+const { OpenCodeProfileManager } = await import(${JSON.stringify(profileManagerUrl)});
+observe('import-complete');
 const startAt = Number(process.argv[3]);
 while (Date.now() < startAt) {
   await Bun.sleep(5);
 }
-await new OpenCodeProfileManager().prepareProfile(process.argv[2], { includeAppMcp: false });
+observe('barrier-released');
+await new OpenCodeProfileManager().prepareProfile(process.argv[2], { includeAppMcp: false, progress });
+observe('prepared');
 `,
         'utf8',
       )

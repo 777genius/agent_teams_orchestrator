@@ -569,7 +569,7 @@ jobs:
       - name: Install frozen portable dependencies
         run: bun install --frozen-lockfile --linker hoisted
       - name: Test native compiled delegation and cancellation
-        run: bun test scripts/ci/verify-packaged-delivery.test.ts src/services/opencode/OpenCodeLoadingBudget.test.ts src/services/opencode/host/OpenCodeHostNativeAdapter.loading.test.ts src/services/opencode/transport/OpenCodeBoundedFetch.loading.test.ts src/cli/packagedOpenCodeDelivery.test.ts scripts/opencode-v2/native-video.test.ts scripts/opencode-v2/native-windows-execution-smoke.test.ts scripts/opencode-v2/stage.test.ts scripts/opencode-v2/stage-copy.test.ts scripts/opencode-v2/staged-files.test.ts src/services/opencode/host/OpenCodeV2ExecutionAuth.test.ts src/services/opencode/host/OpenCodeV2ExecutionPlatform.test.ts src/services/opencode/host/OpenCodeV2PlainExecution.test.ts src/services/opencode/profile/OpenCodeV2ExecutionConfig.test.ts src/services/opencode/host/OpenCodeV2ExecutionLifecycle.test.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.test.ts
+        run: bun test scripts/ci/verify-packaged-delivery.test.ts src/services/opencode/OpenCodeLoadingBudget.test.ts src/services/opencode/compatibility/OpenCodeNativeIdentity.test.ts src/services/opencode/host/OpenCodeHostNativeAdapter.loading.test.ts src/services/opencode/transport/OpenCodeBoundedFetch.loading.test.ts src/cli/packagedOpenCodeDelivery.test.ts scripts/opencode-v2/native-video.test.ts scripts/opencode-v2/native-windows-execution-smoke.test.ts scripts/opencode-v2/stage.test.ts scripts/opencode-v2/stage-copy.test.ts scripts/opencode-v2/staged-files.test.ts src/services/opencode/host/OpenCodeV2ExecutionAuth.test.ts src/services/opencode/host/OpenCodeV2ExecutionPlatform.test.ts src/services/opencode/host/OpenCodeV2PlainExecution.test.ts src/services/opencode/profile/OpenCodeV2ExecutionConfig.test.ts src/services/opencode/host/OpenCodeV2ExecutionLifecycle.test.ts src/features/runtimeProviderManagement/adapters/opencode/OpenCodeV2ProviderManagement.test.ts
       - name: Test Windows receipt architecture admission
         if: runner.os == 'Windows'
         run: bun test src/services/opencode/profile/OpenCodeV2ExecutionReceipt.test.ts --test-name-pattern Windows
@@ -827,6 +827,13 @@ jobs:
           TEST_OPENCODE_NODE_BINARY="$(command -v node)" bun test src/services/opencode/transport/OpenCodeV2ExecutionFetch.test.ts --timeout 30000
           bun test src/services/opencode/transport/OpenCodeV2CatalogDiagnostics.test.ts --timeout 30000
           bun test src/services/opencode/execution/OpenCodeV2AdmissionService.test.ts --timeout 30000
+      - name: Test selected V2 auth routes and refusal diagnostics
+        run: >-
+          bun test
+          src/services/opencode/host/OpenCodeV2ExecutionAuth.test.ts
+          src/services/opencode/host/OpenCodeV2ExecutionAuth.local.test.ts
+          src/services/opencode/execution/OpenCodeV2Diagnostics.test.ts
+          --timeout 30000
       # Plain execution and permission tests run in packaged-delivery on Linux and Windows.
       - name: Test readiness, refusal text and activation deadline
         run: bun test src/services/opencode/host/OpenCodeV2ExecutionReadiness.test.ts src/services/opencode/execution/OpenCodeV2RefusalReason.test.ts src/services/opencode/execution/OpenCodeV2ActivationDeadline.test.ts
@@ -1013,7 +1020,7 @@ jobs:
           # Keep synthetic lifecycle tests in their own process; module mocks must not reach physical qualification.
           env -i PATH=/usr/bin:/bin HOME="$fixture/home" USERPROFILE="$fixture/home" TMPDIR="$fixture/tmp" \
             XDG_CONFIG_HOME="$fixture/config" XDG_DATA_HOME="$fixture/data" XDG_CACHE_HOME="$fixture/cache" \
-            "$custody_bun" --no-env-file test src/services/opencode/native/OpenCodeNativeHelperLifecycle.test.ts --timeout 30000 2>&1 | tee native-custody-test.log
+            "$custody_bun" --no-env-file test src/services/opencode/native/OpenCodeNativeHelperLifecycle.test.ts src/services/opencode/native/OpenCodeNativeIngressFixture.test.ts src/services/opencode/native/fixtures/OpenCodeNativeIngressCleanup.test.ts src/services/opencode/native/OpenCodeNativeColdDiagnostics.test.ts --timeout 30000 2>&1 | tee native-custody-test.log
           env -i PATH=/usr/bin:/bin HOME="$fixture/home" USERPROFILE="$fixture/home" TMPDIR="$fixture/tmp" \
             OPENCODE_NATIVE_CUSTODY_SOURCE_SHA="${{ github.event.pull_request.head.sha || github.sha }}" \
             "$custody_bun" --no-env-file scripts/ci/stage-native-custody-vendors.mts "$fixture/vendors" "$fixture/delivery/runtime"

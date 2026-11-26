@@ -27,6 +27,7 @@ mock.module('../../../../utils/processKill.js', () => ({ readProcessStartTimeMs:
 } }))
 mock.module('../../compatibility/OpenCodeNativeIdentity.js', () => ({
   hashOpenCodeFile: async () => scenario === 'tampered' ? 'b'.repeat(64) : digest,
+  hashOpenCodeNativeExecutable: async () => scenario === 'tampered' ? 'b'.repeat(64) : digest,
 }))
 mock.module('../../profile/OpenCodeV2ManagedConfig.js', () => ({
   createOpenCodeV2ReadRoots: async () => ({ root: privateRoot, env: {}, remove: async () => {

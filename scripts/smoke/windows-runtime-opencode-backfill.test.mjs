@@ -753,16 +753,18 @@ function productionIdentityProbe(evidence, flush, bun, env, root, pid, attempt) 
 function nativeOwnershipProbe(evidence, flush, env, root, pid) {
   assert.ok(Number.isSafeInteger(pid) && pid > 0 && pid <= 0x7fffffff, 'Fixture PID required');
   const literal = value => "'" + value.replaceAll("'", "''") + "'";
-  // The real teardown still records every child projection. This observation
-  // needs no diagnostic JSON and must not import Utility just to encode cases.
+  // The real teardown still needs Management for Get-Process and Utility for
+  // diagnostic JSON. This observation uses direct filesystem/WMI reads only.
   let prefix = buildWindowsTeardownCommand(root).split('$stopped = @()')[0];
-  const utilityImport = [
-    "[Console]::Error.WriteLine('teardown: before import Microsoft.PowerShell.Utility')",
-    'Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop',
-    "[Console]::Error.WriteLine('teardown: after import Microsoft.PowerShell.Utility')",
-  ].join('\n');
-  assert.equal(prefix.split(utilityImport).length, 2, 'Exactly one emitted Utility import block required');
-  prefix = prefix.replace(utilityImport, '# Observation-only ownership checks need no Utility module.');
+  for (const name of ['Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Utility']) {
+    const moduleImport = [
+      `[Console]::Error.WriteLine('teardown: before import ${name}')`,
+      `Import-Module ${name} -ErrorAction Stop`,
+      `[Console]::Error.WriteLine('teardown: after import ${name}')`,
+    ].join('\n');
+    assert.equal(prefix.split(moduleImport).length, 2, `Exactly one emitted ${name} import block required`);
+    prefix = prefix.replace(moduleImport, '# Observation-only ownership checks need no ' + name + ' module.');
+  }
   assert.doesNotMatch(prefix, /\.Kill\(/);
   const script = path.join(root, 'fake-opencode.cjs');
   const longScript = realpathSync.native(script);
@@ -1471,10 +1473,11 @@ test('Windows cleanup admits exact fixtures without recursively inspecting porta
       [false, foreign], [false, path.join(root + '-sibling', 'fake-opencode.cjs')]];
     const marker = "[Console]::Error.WriteLine('teardown: before script enumeration')";
     const prefix = buildWindowsTeardownCommand(root).split('$stopped = @()')[0];
-    // A copied dependency graph may be arbitrarily large or unreadable. Force
-    // any directory walk to fail, while actual direct file checks remain live.
+    // A copied dependency graph may be arbitrarily large or unreadable. Refuse
+    // traversal and provider dispatch while actual direct file checks stay live.
     const guarded = prefix.replace(marker,
-      "function Get-ChildItem { throw 'Unexpected fixture directory traversal' }\n" + marker);
+      "function Get-ChildItem { throw 'Unexpected fixture directory traversal' }\n" +
+      "function Test-Path { throw 'Unexpected fixture provider dispatch' }\n" + marker);
     const command = guarded + `
       $cases = ConvertFrom-Json ${literal(JSON.stringify(cases))}
       foreach ($case in $cases) {
@@ -1482,6 +1485,13 @@ test('Windows cleanup admits exact fixtures without recursively inspecting porta
         if ([bool](Is-Owned $entry) -ne $case[0]) { throw 'Fixed fixture inventory ownership mismatch' }
       }
       if ($scripts.Count -ne 5) { throw 'Known fixture inventory is incomplete' }
+      if (Test-OwnershipLeaf $rootPath) { throw 'A directory must not confer script ownership' }
+      if (Test-OwnershipLeaf ($rootPath + 'missing.cjs')) { throw 'An absent file must not confer script ownership' }
+      if (Test-OwnershipLeaf ($rootPath + 'missing-parent/missing.cjs')) { throw 'An absent parent must not confer script ownership' }
+      $nonMissingError = $false
+      try { [void](Test-OwnershipLeaf ($rootPath + [char]0)) }
+      catch [ArgumentException] { $nonMissingError = $true }
+      if (-not $nonMissingError) { throw 'A non-missing filesystem error must propagate' }
       ConvertTo-Json -InputObject @{ cases = $cases.Count; scripts = $scripts.Count } -Compress
     `;
     const invoke = body => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', body], {

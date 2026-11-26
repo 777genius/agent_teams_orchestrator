@@ -16,6 +16,15 @@ afterEach(() => {
   Object.defineProperty(process, 'platform', { value: originalPlatform })
 })
 
+function syntheticPidAllocator() {
+  const protectedPids = new Set([process.pid, process.ppid])
+  let pid = 900_000
+  return () => {
+    do { pid++ } while (protectedPids.has(pid))
+    return pid
+  }
+}
+
 type Mode = 'valid' | 'no-witness' | 'witness-error' | 'after-root' | 'fresh-missing' | 'fresh-reused'
   | 'confirmation-reused' | 'changed-ppid' | 'confirmation-ppid' | 'root-reused' | 'root-missing'
   | 'root-gone' | 'late-reused' | 'late-missing' | 'final-reused' | 'new-after-root' | 'protected' | 'owned-under-foreign' | 'witness-expired' | 'witness-abort' | 'malformed-witness' | 'late-ppid' | 'witness-hung'
@@ -23,7 +32,8 @@ type Mode = 'valid' | 'no-witness' | 'witness-error' | 'after-root' | 'fresh-mis
 
 function fixture(mode: Mode) {
   Object.defineProperty(process, 'platform', { value: 'win32' })
-  const root = 7780, relay = 7552, foreign = 7564, leaf = 900_101, sibling = 900_102, extra = 900_103
+  const nextPid = syntheticPidAllocator()
+  const root = nextPid(), relay = nextPid(), foreign = nextPid(), leaf = nextPid(), sibling = nextPid(), extra = nextPid()
   const rootBirth = 1792533167851, relayBirth = 1792533167894
   const foreignBirth = mode === 'after-root' ? rootBirth + 10 : 1792532409706
   let spawned = false, closed = false, removed = 0, tables = 0, witnessCalls = 0, foreignReads = 0, rootReads = 0
@@ -195,14 +205,15 @@ for (const mode of ['owned-under-foreign', 'owned-under-absent'] as const) {
 function nativeWitness(mode: 'valid' | 'unavailable' | 'changed' | 'duplicate' | 'deadline' | 'oversized') {
   Object.defineProperty(process, 'platform', { value: 'win32' })
   let clock = 1000, calls = 0
-  const reads: number[] = [], a = 900_201, b = 900_202
+  const nextPid = syntheticPidAllocator()
+  const reads: number[] = [], a = nextPid(), b = nextPid(), parentA = nextPid(), parentB = nextPid()
   const date = spyOn(Date, 'now').mockImplementation(() => clock)
   const kernel = spyOn(windows, 'windowsNativeProcess').mockResolvedValue(mode === 'unavailable' ? null : {
     table: () => {
       calls++
-      if (mode === 'oversized') return Array.from({ length: 4097 }, (_, i) => ({ pid: i, ppid: 0 }))
-      return [{ pid: 0, ppid: 0 }, { pid: process.pid, ppid: process.ppid }, { pid: a, ppid: 7 },
-        { pid: mode === 'duplicate' ? a : b, ppid: 8 }]
+      if (mode === 'oversized') return Array.from({ length: 4097 }, () => ({ pid: nextPid(), ppid: 0 }))
+      return [{ pid: 0, ppid: 0 }, { pid: process.pid, ppid: process.ppid }, { pid: a, ppid: parentA },
+        { pid: mode === 'duplicate' ? a : b, ppid: parentB }]
     },
     birth: pid => {
       reads.push(pid)
@@ -211,13 +222,13 @@ function nativeWitness(mode: 'valid' | 'unavailable' | 'changed' | 'duplicate' |
     },
   })
   restore.push(() => date.mockRestore(), () => kernel.mockRestore())
-  return { run: () => native.nativePorts().existingWindows!(1010), reads, a, calls: () => calls }
+  return { run: () => native.nativePorts().existingWindows!(1010), reads, a, b, parentA, calls: () => calls }
 }
 
 test('native pre-spawn witness confirms only exact readable live generations without protected reads', async () => {
   const f = nativeWitness('valid')
-  expect(await f.run()).toEqual([{ pid: f.a, ppid: 7, birth: 10 }])
-  expect(f.calls()).toBe(2); expect(f.reads).toEqual([f.a, 900_202, f.a])
+  expect(await f.run()).toEqual([{ pid: f.a, ppid: f.parentA, birth: 10 }])
+  expect(f.calls()).toBe(2); expect(f.reads).toEqual([f.a, f.b, f.a])
 })
 
 test('native-unavailable witness returns null without a PowerShell fallback', async () => {
@@ -249,10 +260,11 @@ type ProtectedMode = 'valid' | 'no-foreign-witness' | 'no-protected-witness' | '
 function protectedFixture(mode: ProtectedMode) {
   Object.defineProperty(process, 'platform', { value: 'win32' })
   const self = process.pid, parent = process.ppid
-  const root = mode === 'protected-self-root' ? self : mode === 'protected-parent-root' ? parent : 900_001
-  const relay = 900_002, foreign = 900_003, leaf = 900_004, owned = 900_005, candidate = 900_006
+  const nextPid = syntheticPidAllocator(), syntheticRoot = nextPid()
+  const root = mode === 'protected-self-root' ? self : mode === 'protected-parent-root' ? parent : syntheticRoot
+  const relay = nextPid(), foreign = nextPid(), leaf = nextPid(), owned = nextPid(), candidate = nextPid()
   if ([relay, foreign, leaf, owned, candidate].some(pid => pid === self || pid === parent)
-    || root === 900_001 && [self, parent].includes(root)) throw new Error('TEST PID collision')
+    || root === syntheticRoot && [self, parent].includes(root)) throw new Error('TEST PID collision')
   const rootBirth = 5000
   const protectedBirth = mode === 'young-protected' ? 5001 : mode === 'equal-protected' ? rootBirth : 3200
   const protectedRows: NativeGeneration[] = [
@@ -416,14 +428,15 @@ function protectedNativeWitness(mode: ProtectedNativeMode) {
   Object.defineProperty(process, 'platform', { value: 'win32' })
   let clock = 1000, tables = 0
   const reads: number[] = []
+  const nextPid = syntheticPidAllocator(), parentParent = nextPid(), changedParent = nextPid(), unrelated = nextPid()
   const date = spyOn(Date, 'now').mockImplementation(() => clock)
   const kernel = spyOn(windows, 'windowsNativeProcess').mockResolvedValue(mode === 'unavailable' ? null : {
     table: () => {
       tables++
-      if (mode === 'oversized') return Array.from({ length: 4097 }, (_, pid) => ({ pid, ppid: 0 }))
+      if (mode === 'oversized') return Array.from({ length: 4097 }, () => ({ pid: nextPid(), ppid: 0 }))
       return [{ pid: 0, ppid: 0 }, { pid: process.pid, ppid: process.ppid },
-        { pid: mode === 'duplicate' ? process.pid : process.ppid, ppid: mode === 'changed-ppid' && tables > 1 ? 8 : 7 },
-        { pid: 900_201, ppid: 8 }]
+        { pid: mode === 'duplicate' ? process.pid : process.ppid, ppid: mode === 'changed-ppid' && tables > 1 ? changedParent : parentParent },
+        { pid: unrelated, ppid: changedParent }]
     },
     birth: pid => {
       reads.push(pid)
@@ -433,12 +446,12 @@ function protectedNativeWitness(mode: ProtectedNativeMode) {
     },
   })
   restore.push(() => date.mockRestore(), () => kernel.mockRestore())
-  return { run: () => native.nativePorts().protectedWindows!(1010), reads, tables: () => tables }
+  return { run: () => native.nativePorts().protectedWindows!(1010), reads, parentParent, tables: () => tables }
 }
 
 test('protected native witness reads only self/parent metadata and independently confirms their exact generations', async () => {
   const f = protectedNativeWitness('valid')
-  expect(await f.run()).toEqual([{ pid: process.pid, ppid: process.ppid, birth: 20 }, { pid: process.ppid, ppid: 7, birth: 20 }])
+  expect(await f.run()).toEqual([{ pid: process.pid, ppid: process.ppid, birth: 20 }, { pid: process.ppid, ppid: f.parentParent, birth: 20 }])
   expect(f.tables()).toBe(2); expect(f.reads).toEqual([process.pid, process.ppid, process.pid, process.ppid])
 })
 

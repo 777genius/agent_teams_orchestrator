@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, unlink, writeFile } from 'node:fs/promises'
@@ -7,13 +7,15 @@ import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { OpenCodeClientFactory } from '../OpenCodeClientFactory.js'
-import { launchNativeCustody, recoverNativeCustody, nativeCustodyForEndpoint, bindNativeRequestOwner, nativeHelperFailureDiagnostic, type NativeCustody } from './OpenCodeNativeCustody.js'
+import { launchNativeCustody, recoverNativeCustody, nativeCustodyForEndpoint, bindNativeRequestOwner, nativeHelperFailureDiagnostic, resolveNativeCustodyHelper, type NativeCustody } from './OpenCodeNativeCustody.js'
 import { OpenCodeHostManager } from '../OpenCodeHostManager.js'
 import type { OpenCodePreparedProfile } from '../types.js'
 import { fetchNativeOpenCode, nativeRequestFailureGate } from './OpenCodeNativeRequestLease.js'
 import { failureDiagnostic } from './fixtures/OpenCodeNativeColdController.js'
 import { qualifyNativeColdRecovery } from './OpenCodeNativeColdRecovery.js'
 import { nativeAuthorityPath, nativeExitConfirmed, readNativeAuthority } from './OpenCodeNativeAuthority.js'
+import { NativeIngressFixtureCases } from './fixtures/OpenCodeNativeIngressFixture.js'
+import { cleanupNativeIngressHost } from './fixtures/OpenCodeNativeIngressCleanup.js'
 
 // Required in the physical Linux qualification lane. Mac/Windows cannot count
 // this as their custody proof; their retained native backends remain separate.
@@ -25,12 +27,15 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
   const vendors = new Map<string, string>()
   const active = new Set<NativeCustody>()
   const epochs = new Set<NativeCustody>()
+  const ingressCases = new NativeIngressFixtureCases()
   const execute = promisify(execFile)
   // Phase-only diagnostic; never log auth headers, captured helpers or private paths.
   const reportHelperFailure = (error: unknown) => {
     const diagnostic = nativeHelperFailureDiagnostic(error)
     if (diagnostic) console.error('TEST native helper lifecycle:', JSON.stringify(diagnostic))
   }
+  beforeEach(() => ingressCases.beforeEach())
+  afterEach(() => ingressCases.afterEach())
   beforeAll(async () => {
     root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'TEST-opencode-native-custody-')))
     await chmod(root, 0o700)
@@ -89,6 +94,11 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
   afterAll(async () => {
     // Independent of child receipts/epochs: outer timeouts cannot bypass this.
     if (coldPending.size) preserve = true
+    for (const owned of ingressCases.attempts) {
+      owned.close()
+      if (!owned.settledSuccessfully) preserve = true
+      try { if (!await owned.cleanup()) preserve = true } catch { preserve = true }
+    }
     for (const custody of active) {
       try { await custody.stopExact(); active.delete(custody) }
       catch { preserve = true }
@@ -221,67 +231,104 @@ describe.skipIf(process.platform !== 'linux')('physical Linux native custody', (
   }, 30000)
   for (const version of ['1.16.0', '1.18.34']) {
     test.skipIf(!process.env.OPENCODE_NATIVE_CUSTODY_TEST_VENDORS)(`real pinned V1 ${version} protects config ingress through the ordinary production host and client`, async () => {
-      const binary = vendors.get(version)
-      if (!binary) throw new Error('Required verified vendor fixture missing')
-      const keys = ['CLAUDE_MULTIMODEL_DATA_HOME', 'CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH', 'OPENCODE_BIN_PATH', 'CLAUDE_MULTIMODEL_OPENCODE_CUSTODY_HELPER']
-      const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]))
-      const data = path.join(root, `vendor-${version}-data`), project = path.join(root, `TEST-vendor-${version}-project`)
-      const profileRoot = path.join(data, 'opencode', 'profiles', '0123456789abcdef')
-      await mkdir(project, { mode: 0o700 })
-      await mkdir(profileRoot, { mode: 0o700, recursive: true })
-      const sentinel = `Bearer TEST-vendor-${version}-MCP-private`
-      const config = { mcp: { fixture: { type: 'remote', url: 'http://127.0.0.1:1/mcp', enabled: false,
-        headers: { Authorization: sentinel } } } }
-      const prepared: OpenCodePreparedProfile = {
-        projectPath: project, canonicalProjectPath: project, workingDirectoryPath: project, scopeToken: null,
-        profileRootKey: '0123456789abcdef', profileRootPath: profileRoot,
-        projectBehaviorFingerprint: 'neutral-pinned-vendor', behaviorSources: [], managedConfig: config,
-        managedConfigFingerprint: `neutral-pinned-${version}`, homePath: path.join(profileRoot, 'home'),
-        tmpPath: path.join(profileRoot, 'tmp'), xdgConfigHome: path.join(profileRoot, 'config'),
-        xdgDataHome: path.join(profileRoot, 'data'), xdgCacheHome: path.join(profileRoot, 'cache'),
-        managedAuthPath: path.join(profileRoot, 'auth.json'), sourceAuthPath: null,
-        sourceAuthFingerprint: null, managedAuthFingerprint: null, authState: 'missing',
-        env: { HOME: path.join(profileRoot, 'home'), PATH: '/usr/bin:/bin',
-          XDG_CONFIG_HOME: path.join(profileRoot, 'config'), XDG_DATA_HOME: path.join(profileRoot, 'data'),
-          XDG_CACHE_HOME: path.join(profileRoot, 'cache'), XDG_STATE_HOME: path.join(profileRoot, 'state'),
-          TMPDIR: path.join(profileRoot, 'tmp'), NO_COLOR: '1', NODE_ENV: 'production',
-          OPENCODE_CONFIG_CONTENT: JSON.stringify(config) },
-      }
-      for (const folder of [prepared.homePath, prepared.tmpPath, prepared.xdgConfigHome, prepared.xdgDataHome,
-        prepared.xdgCacheHome, path.join(profileRoot, 'state')]) await mkdir(folder, { mode: 0o700 })
-      process.env.CLAUDE_MULTIMODEL_DATA_HOME = data
-      process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = binary
-      process.env.CLAUDE_MULTIMODEL_OPENCODE_CUSTODY_HELPER = helper
-      delete process.env.OPENCODE_BIN_PATH
-      const manager = new OpenCodeHostManager()
-      try {
-        const host = await manager.ensureHost({ hostKey: `TEST-pinned-native-${version}`, preparedProfile: prepared,
-          resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false })
-        const custody = nativeCustodyForEndpoint(host.baseUrl); active.add(custody); epochs.add(custody)
-        expect(host.version).toBe(version)
-        expect(custody.reference.measuredVersion).toBe(version)
-        const authorization = custody.reference.authorization, encoded = authorization.slice('Basic '.length)
-        const password = Buffer.from(encoded, 'base64').toString('utf8').slice('opencode:'.length)
-        const containsPrivateCredential = (value: string) => [password, encoded, authorization].some(secret => value.includes(secret))
-        expect(containsPrivateCredential(JSON.stringify(host))).toBe(false)
-        expect(containsPrivateCredential(JSON.stringify(prepared))).toBe(false)
-        expect(containsPrivateCredential(JSON.stringify(host.diagnostics))).toBe(false)
-        const argv = await Promise.all([host.pid, custody.reference.custodianPid].map(pid => readFile(`/proc/${pid}/cmdline`, 'utf8')))
-        expect(argv.some(containsPrivateCredential)).toBe(false)
-        for (const headers of [new Headers(), new Headers({ authorization: 'Basic TEST-wrong-key' })]) {
-          const response = await globalThis.fetch(`${host.baseUrl}/config`, { headers, redirect: 'error', signal: AbortSignal.timeout(5000) })
-          expect(response.status).toBe(401)
-          expect((await response.text()).includes(sentinel)).toBe(false)
+      // The owner exists before setup, environment mutation, or any launch can begin.
+      const owned = ingressCases.begin(diagnostic => console.log('TEST native ingress:', JSON.stringify({ version, ...diagnostic })))
+      await owned.run(async () => {
+        const binary = vendors.get(version)
+        if (!binary) throw new Error('Required verified vendor fixture missing')
+        const keys = ['CLAUDE_MULTIMODEL_DATA_HOME', 'CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH', 'OPENCODE_BIN_PATH', 'CLAUDE_MULTIMODEL_OPENCODE_CUSTODY_HELPER']
+        const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]))
+        owned.captureScopeRestore(() => {
+          if (!ingressCases.owns(owned)) throw new Error('TEST_native_ingress_scope_owner_changed')
+          for (const [key, value] of Object.entries(saved)) {
+            if (value === undefined) delete process.env[key]; else process.env[key] = value
+          }
+        })
+        const data = path.join(root, `vendor-${version}-data`), project = path.join(root, `TEST-vendor-${version}-project`)
+        const profileRoot = path.join(data, 'opencode', 'profiles', '0123456789abcdef')
+        await owned.stage('setup', () => mkdir(project, { mode: 0o700 }))
+        await owned.stage('setup', () => mkdir(profileRoot, { mode: 0o700, recursive: true }))
+        const sentinel = `Bearer TEST-vendor-${version}-MCP-private`
+        const config = { mcp: { fixture: { type: 'remote', url: 'http://127.0.0.1:1/mcp', enabled: false,
+          headers: { Authorization: sentinel } } } }
+        const prepared: OpenCodePreparedProfile = {
+          projectPath: project, canonicalProjectPath: project, workingDirectoryPath: project, scopeToken: null,
+          profileRootKey: '0123456789abcdef', profileRootPath: profileRoot,
+          projectBehaviorFingerprint: 'neutral-pinned-vendor', behaviorSources: [], managedConfig: config,
+          managedConfigFingerprint: `neutral-pinned-${version}`, homePath: path.join(profileRoot, 'home'),
+          tmpPath: path.join(profileRoot, 'tmp'), xdgConfigHome: path.join(profileRoot, 'config'),
+          xdgDataHome: path.join(profileRoot, 'data'), xdgCacheHome: path.join(profileRoot, 'cache'),
+          managedAuthPath: path.join(profileRoot, 'auth.json'), sourceAuthPath: null,
+          sourceAuthFingerprint: null, managedAuthFingerprint: null, authState: 'missing',
+          env: { HOME: path.join(profileRoot, 'home'), PATH: '/usr/bin:/bin',
+            XDG_CONFIG_HOME: path.join(profileRoot, 'config'), XDG_DATA_HOME: path.join(profileRoot, 'data'),
+            XDG_CACHE_HOME: path.join(profileRoot, 'cache'), XDG_STATE_HOME: path.join(profileRoot, 'state'),
+            TMPDIR: path.join(profileRoot, 'tmp'), NO_COLOR: '1', NODE_ENV: 'production',
+            OPENCODE_CONFIG_CONTENT: JSON.stringify(config) },
         }
-        const admitted = await new OpenCodeClientFactory().create(host.baseUrl, undefined, host).getConfig()
-        expect(admitted).toMatchObject({ mcp: { fixture: { headers: { Authorization: sentinel } } } })
-        expect(containsPrivateCredential(JSON.stringify(admitted))).toBe(false)
-        expect(await manager.disposeHost(host.hostKey)).toBe(true)
-        active.delete(custody)
-        expect((await readNativeAuthority(nativeAuthorityPath(profileRoot, host.hostKey))).phase).toBe('dead')
-        await manager.drainPendingLifecycleCleanups()
-      } catch (error) { reportHelperFailure(error); preserve = true; throw error }
-      finally { for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value } }
+        for (const folder of [prepared.homePath, prepared.tmpPath, prepared.xdgConfigHome, prepared.xdgDataHome,
+          prepared.xdgCacheHome, path.join(profileRoot, 'state')]) {
+          await owned.stage('setup', () => mkdir(folder, { mode: 0o700 }))
+        }
+        process.env.CLAUDE_MULTIMODEL_DATA_HOME = data
+        process.env.CLAUDE_MULTIMODEL_OPENCODE_BIN_PATH = binary
+        process.env.CLAUDE_MULTIMODEL_OPENCODE_CUSTODY_HELPER = helper
+        delete process.env.OPENCODE_BIN_PATH
+        await owned.stage('setup', resolveNativeCustodyHelper)
+        const manager = new OpenCodeHostManager(), hostKey = `TEST-pinned-native-${version}`
+        let startupObservations = 0
+        let capturedCustody: NativeCustody | undefined
+        // Capture the exact manager/key before admission; only its returned host can enable cleanup.
+        owned.captureCleanup(async () => {
+          const custody = capturedCustody
+          if (!custody) throw new Error('TEST_native_ingress_cleanup_without_custody')
+          return cleanupNativeIngressHost({ registryPath: path.join(data, 'opencode', 'host-registry.json'),
+            hostKey, manager, custody, assertDead: async () => {
+              const authority = await readNativeAuthority(nativeAuthorityPath(profileRoot, hostKey))
+              expect(authority.phase).toBe('dead')
+              expect(authority.images.epoch).toBe(custody.reference.epoch)
+            } })
+        })
+        try {
+          const { host, custody } = await owned.stage('host-admission', async () => {
+            const host = await manager.ensureHost({ hostKey, preparedProfile: prepared,
+              resolveConfigFingerprint: false, prewarmManagedSubscriptionPlugins: false, abortSignal: owned.signal,
+              startupObserver: observation => {
+                if (startupObservations++ < 64) console.log('TEST native startup:', JSON.stringify({ version, ...observation }))
+              } })
+            const custody = nativeCustodyForEndpoint(host.baseUrl)
+            capturedCustody = custody
+            epochs.add(custody)
+            await owned.adopt(host)
+            return { host, custody }
+          })
+          expect(host.version).toBe(version)
+          expect(custody.reference.measuredVersion).toBe(version)
+          const authorization = custody.reference.authorization, encoded = authorization.slice('Basic '.length)
+          const password = Buffer.from(encoded, 'base64').toString('utf8').slice('opencode:'.length)
+          const containsPrivateCredential = (value: string) => [password, encoded, authorization].some(secret => value.includes(secret))
+          expect(containsPrivateCredential(JSON.stringify(host))).toBe(false)
+          expect(containsPrivateCredential(JSON.stringify(prepared))).toBe(false)
+          expect(containsPrivateCredential(JSON.stringify(host.diagnostics))).toBe(false)
+          const argv = await owned.stage('private-argv', () => Promise.all(
+            [host.pid, custody.reference.custodianPid].map(pid => readFile(`/proc/${pid}/cmdline`, 'utf8'))))
+          expect(argv.some(containsPrivateCredential)).toBe(false)
+          for (const headers of [new Headers(), new Headers({ authorization: 'Basic TEST-wrong-key' })]) {
+            const response = await owned.stage('unauthorized-config', () => globalThis.fetch(`${host.baseUrl}/config`,
+              { headers, redirect: 'error', signal: AbortSignal.timeout(5000) }))
+            expect(response.status).toBe(401)
+            expect((await owned.stage('unauthorized-body', () => response.text())).includes(sentinel)).toBe(false)
+          }
+          const admitted = await owned.stage('authorized-config',
+            () => new OpenCodeClientFactory().create(host.baseUrl, undefined, host).getConfig())
+          expect(admitted).toMatchObject({ mcp: { fixture: { headers: { Authorization: sentinel } } } })
+          expect(containsPrivateCredential(JSON.stringify(admitted))).toBe(false)
+          expect(await owned.stage('stop', () => owned.cleanup())).toBe(true)
+          expect((await owned.stage('dead-receipt',
+            () => readNativeAuthority(nativeAuthorityPath(profileRoot, host.hostKey)))).phase).toBe('dead')
+          await owned.stage('lifecycle-drain', () => manager.drainPendingLifecycleCleanups())
+        } catch (error) { reportHelperFailure(error); preserve = true; throw error }
+      })
     }, 60000)
   }
   test('retains the actual image across same-path replacement/unlink, recovers and stops only that child', async () => {

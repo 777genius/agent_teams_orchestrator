@@ -237,6 +237,12 @@ function Get-OwnershipPath([string]$value) {
   if ($value -notmatch '^(?:[a-zA-Z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+[\\/])') { return $null }
   try { return [IO.Path]::GetFullPath($value) } catch { return $null }
 }
+function Test-OwnershipLeaf([string]$value) {
+  # Read only this exact file; absence is distinct from access or other I/O failure.
+  try {
+    return (([IO.File]::GetAttributes($value) -band [IO.FileAttributes]::Directory) -eq 0)
+  } catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { return $false }
+}
 $rootPath = Get-OwnershipPath $rootPath
 $nodePath = Get-OwnershipPath $nodePath
 if (-not $rootPath -or -not $nodePath) { throw 'Fixture ownership paths must be absolute' }
@@ -246,7 +252,7 @@ if (-not $rootPath -or -not $nodePath) { throw 'Fixture ownership paths must be 
 $scripts = @(foreach ($candidate in $fixtureScriptCandidates) {
   $script = Get-OwnershipPath $candidate
   if (-not $script -or -not $script.StartsWith($rootPath, [StringComparison]::OrdinalIgnoreCase)) { throw 'Fixture script path escaped root' }
-  if (Test-Path -LiteralPath $script -PathType Leaf) { $script }
+  if (Test-OwnershipLeaf $script) { $script }
 })
 [Console]::Error.WriteLine('teardown: after script enumeration count=' + $scripts.Count)
 function Is-Owned($entry) {
